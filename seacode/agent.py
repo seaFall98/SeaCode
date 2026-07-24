@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from pydantic import ValidationError
@@ -27,8 +28,10 @@ from .conversation import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from .permissions import PermissionChecker, PermissionMode
+from .permissions.rules import Rule, extract_content
 from .prompts import build_environment_context, build_system_prompt
-from .tools import ToolRegistry, partition_tool_calls
+from .tools import ToolRegistry
 from .tools.base import ToolResult
 
 # ---------------------------------------------------------------------------
@@ -107,6 +110,23 @@ class ErrorEvent:
     message: str
 
 
+class PermissionResponse(Enum):
+    """用户对权限请求的三种回复；由 TUI 通过 future.resolve 传回 Agent。"""
+
+    ALLOW = "allow"
+    DENY = "deny"
+    ALLOW_ALWAYS = "allow_always"
+
+
+@dataclass
+class PermissionRequest:
+    """请求用户确认工具执行的事件；携带 future 供 TUI resolve。"""
+
+    tool_name: str
+    description: str
+    future: asyncio.Future[PermissionResponse]
+
+
 type AgentEvent = (
     StreamText
     | ThinkingText
@@ -117,6 +137,7 @@ type AgentEvent = (
     | LoopComplete
     | UsageEvent
     | ErrorEvent
+    | PermissionRequest
 )
 
 
@@ -264,6 +285,7 @@ class Agent:
         protocol: str,
         work_dir: str = ".",
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
+        permission_checker: PermissionChecker | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -272,6 +294,27 @@ class Agent:
         self.max_iterations = max_iterations
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        # 权限检查器；为 None 时跳过权限检查（向后兼容 batch02-04 行为）。
+        self.permission_checker = permission_checker
+        # 当前权限模式；同步 permission_checker.mode 避免 dual source of truth。
+        self.permission_mode: PermissionMode = (
+            permission_checker.mode if permission_checker else PermissionMode.DEFAULT
+        )
+
+    # 切换权限模式；同步更新 permission_checker.mode 保持一致。
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        self.permission_mode = mode
+        if self.permission_checker:
+            self.permission_checker.mode = mode
+
+    # 返回当前是否处于 Plan 模式；供 ExitPlanMode 工具与 TUI 状态查询使用。
+    @property
+    def plan_mode(self) -> bool:
+        return self.permission_mode == PermissionMode.PLAN
+
+    # 为 HITL 确认生成人类可读的工具操作描述。
+    def _build_permission_description(self, tc: ToolCallComplete) -> str:
+        return PermissionChecker.describe_tool_action(tc.tool_name, tc.arguments)
 
     # 执行 Agent 主循环：注入环境 → 每轮 build_system_prompt → 模型流 → 工具执行 → 回灌。
     async def run(
@@ -311,8 +354,17 @@ class Agent:
             async for event in collector.consume(llm_stream):
                 if isinstance(event, ToolUseEvent):
                     tc = collector.response.tool_calls[-1]
-                    # 需交互权限的工具延迟到流后执行；本步无权限系统，始终立即提交。
-                    executor.submit(self._execute_single_tool_direct(tc))
+                    # ask 决策的工具延迟到流后顺序执行（需要 HITL 同步）；
+                    # allow/deny 立即提交，deny 在 _execute_single_tool_direct 内处理。
+                    tool = self.registry.get(tc.tool_name)
+                    needs_ask = False
+                    if tool and self.permission_checker:
+                        decision = self.permission_checker.check(tool, tc.arguments)
+                        needs_ask = decision.effect == "ask"
+                    if needs_ask:
+                        deferred_tool_calls.append(tc)
+                    else:
+                        executor.submit(self._execute_single_tool_direct(tc))
                 yield event
 
             response = collector.response
@@ -407,34 +459,42 @@ class Agent:
                     elapsed=br.elapsed,
                 )
 
-            # 延迟工具（需要交互式权限确认）：按并发安全属性分批执行。
-            # 本步无权限系统，此路径为空但保留 partition_tool_calls 调用结构。
-            for batch in partition_tool_calls(deferred_tool_calls, self.registry):
-                if batch.concurrent:
-                    batch_results = await self._execute_batch_parallel(batch.calls)
-                else:
-                    batch_results = [
-                        await self._execute_single_tool_direct(tc) for tc in batch.calls
-                    ]
-                for br in batch_results:
-                    if br.is_unknown:
-                        consecutive_unknown += 1
+            # 延迟工具（需要交互式权限确认）：顺序执行，yield PermissionRequest 等待 HITL 回复。
+            # ask 工具需要 HITL 同步，不能并发；并发路径在第 06 步 MCP 后启用。
+            for tc in deferred_tool_calls:
+                result: ToolResult | None = None
+                elapsed = 0.0
+                is_unknown = False
+
+                async for item in self._execute_tool_with_permission(tc):
+                    if isinstance(item, PermissionRequest):
+                        yield item
                     else:
-                        consecutive_unknown = 0
-                    tool_results.append(
-                        ToolResultBlock(
-                            tool_use_id=br.tool_id,
-                            content=br.result.content,
-                            is_error=br.result.is_error,
-                        )
+                        result, elapsed, is_unknown = item
+
+                if result is None:
+                    result = ToolResult(
+                        content="Error: no result from tool", is_error=True
                     )
-                    yield ToolResultEvent(
-                        tool_id=br.tool_id,
-                        tool_name=br.tool_name,
-                        output=br.result.content,
-                        is_error=br.result.is_error,
-                        elapsed=br.elapsed,
+
+                if is_unknown:
+                    consecutive_unknown += 1
+                else:
+                    consecutive_unknown = 0
+                tool_results.append(
+                    ToolResultBlock(
+                        tool_use_id=tc.tool_id,
+                        content=result.content,
+                        is_error=result.is_error,
                     )
+                )
+                yield ToolResultEvent(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    output=result.content,
+                    is_error=result.is_error,
+                    elapsed=elapsed,
+                )
 
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
@@ -447,6 +507,7 @@ class Agent:
             yield TurnComplete(turn=iteration)
 
     # 直接执行单个工具调用，返回结构化结果与耗时；未知/禁用工具返回错误结果。
+    # 权限 deny 决策在此处直接转为错误结果；ask 决策由 _execute_tool_with_permission 处理。
     async def _execute_single_tool_direct(
         self, tc: ToolCallComplete
     ) -> _ToolExecResult:
@@ -475,6 +536,22 @@ class Agent:
                 is_unknown=False,
             )
 
+        # 权限检查：deny 直接返回错误结果；allow 继续执行。
+        # ask 决策不应进入此路径（由 run 主循环延迟到 deferred_tool_calls）。
+        if self.permission_checker:
+            decision = self.permission_checker.check(tool, tc.arguments)
+            if decision.effect == "deny":
+                return _ToolExecResult(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    result=ToolResult(
+                        content=f"Permission denied: {decision.reason}",
+                        is_error=True,
+                    ),
+                    elapsed=time.monotonic() - start,
+                    is_unknown=False,
+                )
+
         try:
             params = tool.params_model.model_validate(tc.arguments)
             result = await tool.execute(params)
@@ -493,7 +570,78 @@ class Agent:
             is_unknown=False,
         )
 
-    # 并发执行一批工具调用，用于 partition_tool_calls 切分的并发批次。
+    # 执行需 HITL 确认的工具调用；yield PermissionRequest 等待 TUI 回复后继续。
+    # yield 顺序：PermissionRequest（ask 时）→ (result, elapsed, is_unknown) 元组。
+    async def _execute_tool_with_permission(
+        self, tc: ToolCallComplete
+    ) -> AsyncIterator[PermissionRequest | tuple[ToolResult, float, bool]]:
+        tool = self.registry.get(tc.tool_name)
+        start = time.monotonic()
+
+        if tool is None:
+            yield ToolResult(
+                content=f"Error: unknown tool '{tc.tool_name}'", is_error=True
+            ), time.monotonic() - start, True
+            return
+
+        if not self.registry.is_enabled(tc.tool_name):
+            yield ToolResult(
+                content=f"Error: tool '{tc.tool_name}' is disabled", is_error=True
+            ), time.monotonic() - start, False
+            return
+
+        # 权限检查：deny 直接错误回灌；ask yield PermissionRequest 等待 HITL 回复。
+        if self.permission_checker:
+            decision = self.permission_checker.check(tool, tc.arguments)
+            if decision.effect == "deny":
+                yield ToolResult(
+                    content=f"Permission denied: {decision.reason}", is_error=True
+                ), time.monotonic() - start, False
+                return
+
+            if decision.effect == "ask":
+                loop = asyncio.get_running_loop()
+                future: asyncio.Future[PermissionResponse] = loop.create_future()
+                desc = self._build_permission_description(tc)
+                yield PermissionRequest(
+                    tool_name=tc.tool_name,
+                    description=desc,
+                    future=future,
+                )
+                response = await future
+
+                if response == PermissionResponse.DENY:
+                    yield ToolResult(
+                        content="Permission denied: 用户拒绝了此操作",
+                        is_error=True,
+                    ), time.monotonic() - start, False
+                    return
+
+                # ALLOW_ALWAYS：写入本地规则文件 + 加入会话级放行集合，本轮立即生效。
+                if response == PermissionResponse.ALLOW_ALWAYS:
+                    content = extract_content(tc.tool_name, tc.arguments)
+                    pattern = (
+                        f"{content[:60]}*" if len(content) > 60 else f"{content}*"
+                    )
+                    rule = Rule(
+                        tool_name=tc.tool_name, pattern=pattern, effect="allow"
+                    )
+                    self.permission_checker.rule_engine.append_local_rule(rule)
+                    self.permission_checker.add_session_allow(tc.tool_name, content)
+
+        try:
+            params = tool.params_model.model_validate(tc.arguments)
+            result = await tool.execute(params)
+        except ValidationError as e:
+            result = ToolResult(
+                content=f"Parameter validation error: {e}", is_error=True
+            )
+        except Exception as e:
+            result = ToolResult(content=f"Tool execution error: {e}", is_error=True)
+
+        yield result, time.monotonic() - start, False
+
+    # 并发执行一批工具调用；第 06 步 MCP 延迟工具的并发路径会消费。
     async def _execute_batch_parallel(
         self, calls: list[ToolCallComplete]
     ) -> list[_ToolExecResult]:

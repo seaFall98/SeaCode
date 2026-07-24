@@ -23,6 +23,8 @@ from seacode.client import (
 )
 from seacode.config import ProviderConfig
 from seacode.conversation import Message
+from seacode.permission_dialog import InlinePermissionWidget
+from seacode.permissions import PermissionMode, RuleEngine
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 
@@ -145,7 +147,8 @@ async def test_single_profile_streams_with_enter_and_has_no_send_button() -> Non
         assert os.getcwd() in str(title.render())
         assert isinstance(app.query_one("#status-bar"), Horizontal)
         assert "test-model" in str(app.query_one("#model-label", Static).render())
-        assert not app.query("#mode-label")
+        # batch05 后状态栏新增 mode-label，初始显示 [default]。
+        assert "[default]" in str(app.query_one("#mode-label", Static).render())
         assert not app.query("#teammates-label")
         input_widget.load_text("Hi")
         await pilot.press("enter")
@@ -433,3 +436,222 @@ async def test_loop_complete_mounts_thinking_done_line() -> None:
         text = str(done_lines[0].render())
         assert "✻" in text
         assert " for " in text
+
+
+# ---------------------------------------------------------------------------
+# batch05：TUI 权限对话框与模式切换
+# ---------------------------------------------------------------------------
+
+
+# 权限对话框测试专用的 Mock WriteFile，避免真实文件写入。
+class _PermWriteParams(BaseModel):
+    file_path: str = ""
+    content: str = ""
+
+
+class _MockPermWriteFile(Tool):
+    name = "WriteFile"
+    description = "mock write for TUI permission tests"
+    params_model = _PermWriteParams
+    category = ToolCategory.WRITE
+
+    async def execute(self, params: BaseModel) -> ToolResult:
+        return ToolResult(content=f"wrote {params.file_path}")
+
+
+# 构造单次 WriteFile 工具调用流 + 文本回复流，供权限对话框测试复用。
+def _write_file_call_and_reply(
+    file_path: str = "perm_test.txt",
+) -> list[list[StreamEvent]]:
+    return [
+        [
+            ToolCallStart(tool_name="WriteFile", tool_id="w1"),
+            ToolCallComplete(
+                tool_id="w1",
+                tool_name="WriteFile",
+                arguments={"file_path": file_path},
+            ),
+            StreamComplete(input_tokens=1, output_tokens=1),
+        ],
+        [TextDelta("Done"), StreamComplete(input_tokens=1, output_tokens=1)],
+    ]
+
+
+# 轮询等待权限对话框挂载；通过 _pending_permission 判定。
+async def _wait_for_permission_dialog(app: SeaCodeApp, pilot: Any) -> None:
+    for _ in range(40):
+        await pilot.pause(0.05)
+        if app._pending_permission is not None:
+            return
+    raise AssertionError("权限对话框未出现")
+
+
+# 替换 app 的 rule engine 为空规则引擎，避免本地配置干扰与文件写入。
+def _reset_rule_engine(app: SeaCodeApp) -> None:
+    if app._permission_checker is not None:
+        app._permission_checker.rule_engine = RuleEngine()
+
+
+# 检查权限对话框是否仍挂载在聊天区。
+def _has_permission_dialog(app: SeaCodeApp) -> bool:
+    try:
+        app.query_one("#perm-inline", InlinePermissionWidget)
+        return True
+    except Exception:
+        return False
+
+
+# 验证 Shift+Tab 循环切换四种权限模式，且模式标签同步更新。
+# 从 default 开始按 4 次 Shift+Tab，断言每次模式与标签文本正确。
+@pytest.mark.asyncio
+async def test_shift_tab_cycles_permission_modes() -> None:
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        assert app._permission_mode == PermissionMode.DEFAULT
+        assert "[default]" in str(app.query_one("#mode-label", Static).render())
+
+        await pilot.press("shift+tab")
+        assert app._permission_mode == PermissionMode.ACCEPT_EDITS
+        assert "[accept-edits]" in str(
+            app.query_one("#mode-label", Static).render()
+        )
+
+        await pilot.press("shift+tab")
+        assert app._permission_mode == PermissionMode.PLAN
+        assert "[plan]" in str(app.query_one("#mode-label", Static).render())
+
+        await pilot.press("shift+tab")
+        assert app._permission_mode == PermissionMode.BYPASS
+        assert "[YOLO]" in str(app.query_one("#mode-label", Static).render())
+
+        # 第 4 次循环回 default。
+        await pilot.press("shift+tab")
+        assert app._permission_mode == PermissionMode.DEFAULT
+        assert "[default]" in str(app.query_one("#mode-label", Static).render())
+
+
+# 验证 DEFAULT 模式下 WriteFile 触发内联权限对话框。
+# 提交触发 WriteFile 的文本后，断言 InlinePermissionWidget 挂载且 _pending_permission 非空。
+@pytest.mark.asyncio
+async def test_permission_dialog_appears_for_write_in_default_mode() -> None:
+    client = _FakeClient(_write_file_call_and_reply())
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    app._tool_registry.register(_MockPermWriteFile())
+
+    async with app.run_test() as pilot:
+        _reset_rule_engine(app)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Write file")
+        await pilot.press("enter")
+
+        await _wait_for_permission_dialog(app, pilot)
+        assert app._pending_permission is not None
+        assert app._pending_permission.tool_name == "WriteFile"
+        assert _has_permission_dialog(app)
+
+        # 清理：Esc 拒绝以结束回合。
+        await pilot.press("escape")
+        await _wait_done(app, pilot)
+
+
+# 验证权限对话框 Enter 确认（默认光标在 Yes）放行工具执行。
+# 等待对话框后按 Enter，断言无错误工具块且对话框已移除。
+@pytest.mark.asyncio
+async def test_permission_dialog_enter_allows_tool_execution() -> None:
+    client = _FakeClient(_write_file_call_and_reply())
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    app._tool_registry.register(_MockPermWriteFile())
+
+    async with app.run_test() as pilot:
+        _reset_rule_engine(app)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Write file")
+        await pilot.press("enter")
+
+        await _wait_for_permission_dialog(app, pilot)
+        # 默认光标在第 0 项（Yes = ALLOW），Enter 确认。
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        # 工具执行成功：无错误样式块，对话框已移除。
+        assert not app.query(".tool-block-error")
+        assert not _has_permission_dialog(app)
+
+
+# 验证权限对话框通过键盘导航到 No 选项后 Enter 拒绝工具执行。
+# 等待对话框后按 Down+Down 移到 No，再 Enter 确认，断言挂载错误工具块且对话框已移除。
+@pytest.mark.asyncio
+async def test_permission_dialog_navigate_to_no_and_deny_tool() -> None:
+    client = _FakeClient(_write_file_call_and_reply())
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    app._tool_registry.register(_MockPermWriteFile())
+
+    async with app.run_test() as pilot:
+        _reset_rule_engine(app)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Write file")
+        await pilot.press("enter")
+
+        await _wait_for_permission_dialog(app, pilot)
+        # Down+Down 移到第 3 项（No = DENY），Enter 确认。
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        error_blocks = app.query(".tool-block-error")
+        assert len(error_blocks) == 1
+        assert not _has_permission_dialog(app)
+
+
+# 验证权限对话框方向键导航到第 2 项后 Enter 触发 ALLOW_ALWAYS。
+# 按 Down 移到 "don't ask again" 项后 Enter，断言工具执行成功且对话框移除。
+@pytest.mark.asyncio
+async def test_permission_dialog_down_then_enter_allow_always() -> None:
+    client = _FakeClient(_write_file_call_and_reply())
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    app._tool_registry.register(_MockPermWriteFile())
+
+    async with app.run_test() as pilot:
+        _reset_rule_engine(app)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Write file")
+        await pilot.press("enter")
+
+        await _wait_for_permission_dialog(app, pilot)
+        # Down 移到第 2 项（Yes, and don't ask again = ALLOW_ALWAYS）。
+        await pilot.press("down")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        assert not app.query(".tool-block-error")
+        assert not _has_permission_dialog(app)
+
+
+# 验证 BYPASS 模式下 WriteFile 自动放行，不触发权限对话框。
+# 切换到 BYPASS 后提交触发 WriteFile 的文本，断言无对话框且工具执行成功。
+@pytest.mark.asyncio
+async def test_bypass_mode_skips_permission_dialog() -> None:
+    client = _FakeClient(_write_file_call_and_reply())
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    app._tool_registry.register(_MockPermWriteFile())
+
+    async with app.run_test() as pilot:
+        _reset_rule_engine(app)
+        # 切换到 BYPASS 模式。
+        await pilot.press("shift+tab")
+        await pilot.press("shift+tab")
+        await pilot.press("shift+tab")
+        assert app._permission_mode == PermissionMode.BYPASS
+
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Write file")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        # BYPASS 模式不触发 HITL 对话框。
+        assert app._pending_permission is None
+        assert not _has_permission_dialog(app)
+        assert not app.query(".tool-block-error")

@@ -117,3 +117,10 @@ Screen {
     color: #aebbc0;
     padding: 0 1;
 }
+
+#mode-label {
+    width: auto;
+    height: 1;
+    text-align: right;
+    padding: 0 1;
+}
