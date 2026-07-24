@@ -101,6 +101,23 @@ async def _settle(pilot: Any) -> None:
     await pilot.pause(0.05)
 
 
+# 过滤请求中的环境上下文消息，便于断言用户/助手消息序列。
+# agent.run 会通过 inject_environment 在 position 0 插入会话级环境上下文，
+# 该消息 content 以 "Current working directory" 开头，时间戳会变，故过滤后再断言。
+def _strip_env_context(messages: tuple[Message, ...]) -> tuple[Message, ...]:
+    return tuple(
+        m for m in messages
+        if not m.content.startswith("Current working directory")
+    )
+
+
+# 批量过滤多个请求的环境上下文消息。
+def _strip_env_from_requests(
+    requests: list[tuple[Message, ...]],
+) -> list[tuple[Message, ...]]:
+    return [_strip_env_context(r) for r in requests]
+
+
 # 验证单 Provider 进入既定 TUI 壳层，Enter 提交且没有主要 Send 按钮。
 # 假流同时证明三行标题、横向状态栏、唯一模型位置和流后输入恢复。
 @pytest.mark.asyncio
@@ -135,7 +152,9 @@ async def test_single_profile_streams_with_enter_and_has_no_send_button() -> Non
         await _settle(pilot)
 
         assert input_widget.disabled is False
-        assert client.requests == [(Message(role="user", content="Hi"),)]
+        assert _strip_env_from_requests(client.requests) == [
+            (Message(role="user", content="Hi"),)
+        ]
         assert "Ready" in str(app.query_one("#turn-status").render())
         assert "First thought. Second thought." in str(
             app.query_one(".thinking-message").render()
@@ -162,7 +181,7 @@ async def test_shift_enter_inserts_newline_before_submit() -> None:
         await pilot.press("enter")
         await _settle(pilot)
 
-        assert client.requests == [
+        assert _strip_env_from_requests(client.requests) == [
             (Message(role="user", content="Line one\nLine two"),)
         ]
 
@@ -190,7 +209,7 @@ async def test_stream_error_recovers_without_polluting_conversation_history() ->
         await pilot.press("enter")
         await _settle(pilot)
 
-        assert client.requests == [
+        assert _strip_env_from_requests(client.requests) == [
             (Message(role="user", content="First"),),
             (Message(role="user", content="Second"),),
         ]
@@ -214,7 +233,9 @@ async def test_waiting_turn_prevents_duplicate_submission() -> None:
         input_widget.load_text("Second")
         await pilot.press("enter")
         await pilot.pause()
-        assert client.requests == [(Message(role="user", content="First"),)]
+        assert _strip_env_from_requests(client.requests) == [
+            (Message(role="user", content="First"),)
+        ]
 
         client.release.set()
         await _settle(pilot)
@@ -260,7 +281,7 @@ async def test_end_to_end_history_survives_failure_and_continues() -> None:
             await pilot.press("enter")
             await _settle(pilot)
 
-    assert client.requests == [
+    assert _strip_env_from_requests(client.requests) == [
         (Message("user", "One"),),
         (
             Message("user", "One"),

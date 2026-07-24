@@ -40,9 +40,18 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
+# 提示词段落常量是长文本字符串，行长度限制不适用。
+[tool.ruff.lint.per-file-ignores]
+"seacode/prompts.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.12"
 files = ["seacode"]
 warn_unused_ignores = true
 warn_redundant_casts = true
 check_untyped_defs = true
+
+# 协调者模式延迟 import 的模块由第 14 步创建，在此之前忽略缺失。
+[[tool.mypy.overrides]]
+module = "seacode.teams.*"
+ignore_missing_imports = true

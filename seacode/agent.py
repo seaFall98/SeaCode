@@ -27,6 +27,7 @@ from .conversation import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from .prompts import build_environment_context, build_system_prompt
 from .tools import ToolRegistry, partition_tool_calls
 from .tools.base import ToolResult
 
@@ -261,19 +262,25 @@ class Agent:
         client: LLMClient,
         registry: ToolRegistry,
         protocol: str,
+        work_dir: str = ".",
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
     ) -> None:
         self.client = client
         self.registry = registry
         self.protocol = protocol
+        self.work_dir = work_dir
         self.max_iterations = max_iterations
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
-    # 执行 Agent 主循环：用户消息 → 模型流 → 流式工具执行 → 结果回灌 → 直到停止。
+    # 执行 Agent 主循环：注入环境 → 每轮 build_system_prompt → 模型流 → 工具执行 → 回灌。
     async def run(
-        self, conversation: ConversationManager, system: str
+        self, conversation: ConversationManager
     ) -> AsyncIterator[AgentEvent]:
+        # 会话启动时注入会话级环境上下文（position 0，env_injected 标记只注入一次）。
+        env_context = build_environment_context(self.work_dir)
+        conversation.inject_environment(env_context)
+
         tools = self.registry.get_all_schemas(self.protocol)
         iteration = 0
         consecutive_unknown = 0
@@ -289,6 +296,9 @@ class Agent:
                     message=f"Agent reached maximum iterations ({self.max_iterations})"
                 )
                 break
+
+            # 每轮动态拼装系统提示词，包含 Environment 段落与条件段落。
+            system = build_system_prompt(work_dir=self.work_dir)
 
             collector = StreamCollector()
             executor = StreamingExecutor()

@@ -86,6 +86,7 @@ class _FakeClient(LLMClient):
         self._outcomes = outcomes
         self.requests: list[tuple[Message, ...]] = []
         self.tools_passed: list[list[dict[str, Any]] | None] = []
+        self.systems_passed: list[str] = []
         self.max_output_tokens_calls: list[int] = []
 
     # 记录 max_tokens 升级恢复对上限的调整，供测试断言。
@@ -98,8 +99,8 @@ class _FakeClient(LLMClient):
         system: str,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        del system
         self.requests.append(tuple(messages))
+        self.systems_passed.append(system)
         self.tools_passed.append(tools)
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -160,7 +161,7 @@ async def test_plain_conversation_completes_without_tools() -> None:
     conversation = ConversationManager()
     conversation.add_user_message("Hi")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     event_types = [type(e) for e in events]
     assert StreamText in event_types
@@ -168,7 +169,10 @@ async def test_plain_conversation_completes_without_tools() -> None:
     assert events[-1].total_turns == 1
     assert len(client.requests) == 1
     assert client.tools_passed[0] == []
-    assert [m.role for m in conversation.messages] == ["user", "assistant"]
+    # inject_environment 在 position 0 插入环境上下文，故角色序列为 user/env、user/Hi、assistant。
+    assert [m.role for m in conversation.messages] == ["user", "user", "assistant"]
+    assert "Current working directory" in conversation.messages[0].content
+    assert conversation.messages[1].content == "Hi"
     assert conversation.messages[-1].content == "Hello there"
 
 
@@ -189,7 +193,7 @@ async def test_single_tool_call_round_trip() -> None:
     ]
     conversation.add_user_message("Read the file")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     event_types = [type(e) for e in events]
     assert ToolUseEvent in event_types
@@ -202,10 +206,13 @@ async def test_single_tool_call_round_trip() -> None:
     assert tool_result_event.is_error is False
     assert tool_result_event.output == "file body"
 
-    assert len(conversation.messages) == 4
-    assert conversation.messages[1].tool_uses[0].tool_name == "MockTool"
-    assert conversation.messages[2].tool_results[0].content == "file body"
-    assert conversation.messages[3].content == "Done"
+    # inject_environment 在 position 0 插入环境上下文消息，故用户消息索引为 1。
+    assert len(conversation.messages) == 5
+    assert conversation.messages[0].role == "user"  # 环境上下文
+    assert conversation.messages[1].content == "Read the file"
+    assert conversation.messages[2].tool_uses[0].tool_name == "MockTool"
+    assert conversation.messages[3].tool_results[0].content == "file body"
+    assert conversation.messages[4].content == "Done"
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +249,7 @@ async def test_multiple_tool_calls_execute_in_order() -> None:
     conversation = ConversationManager()
     conversation.add_user_message("Run both")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     result_events = [e for e in events if isinstance(e, ToolResultEvent)]
     assert len(result_events) == 2
@@ -269,7 +276,7 @@ async def test_parameter_validation_failure_does_not_break_turn() -> None:
     ]
     conversation.add_user_message("Run strict")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     result_events = [e for e in events if isinstance(e, ToolResultEvent)]
     assert len(result_events) == 1
@@ -298,7 +305,7 @@ async def test_tool_execution_exception_does_not_break_turn() -> None:
     ]
     conversation.add_user_message("Run failing tool")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     result_events = [e for e in events if isinstance(e, ToolResultEvent)]
     assert len(result_events) == 1
@@ -326,16 +333,18 @@ async def test_second_request_failure_propagates_and_keeps_committed_turn() -> N
     conversation.add_user_message("Run tool then fail")
 
     with pytest.raises(RuntimeError, match="model provider failed"):
-        await _collect(agent.run(conversation, system="sys"))
+        await _collect(agent.run(conversation))
 
     # 第一轮的助手消息与工具结果已提交，第二轮未写入任何消息。
-    assert len(conversation.messages) == 3
-    assert conversation.messages[0].role == "user"
-    assert conversation.messages[0].content == "Run tool then fail"
-    assert conversation.messages[1].role == "assistant"
-    assert conversation.messages[1].tool_uses[0].tool_name == "MockTool"
-    assert conversation.messages[2].role == "user"
-    assert conversation.messages[2].tool_results[0].content == "ok"
+    # inject_environment 在 position 0 插入环境上下文，故用户消息索引为 1。
+    assert len(conversation.messages) == 4
+    assert conversation.messages[0].role == "user"  # 环境上下文
+    assert conversation.messages[1].role == "user"
+    assert conversation.messages[1].content == "Run tool then fail"
+    assert conversation.messages[2].role == "assistant"
+    assert conversation.messages[2].tool_uses[0].tool_name == "MockTool"
+    assert conversation.messages[3].role == "user"
+    assert conversation.messages[3].tool_results[0].content == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +364,7 @@ async def test_unknown_tool_returns_error_result_without_breaking() -> None:
     ]
     conversation.add_user_message("Call unknown")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     result_events = [e for e in events if isinstance(e, ToolResultEvent)]
     assert len(result_events) == 1
@@ -388,7 +397,7 @@ async def test_max_iterations_limit_emits_error_event() -> None:
     conversation = ConversationManager()
     conversation.add_user_message("Loop forever")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     error_events = [e for e in events if isinstance(e, ErrorEvent)]
     assert len(error_events) == 1
@@ -420,7 +429,7 @@ async def test_consecutive_unknown_tools_stops_loop() -> None:
     conversation = ConversationManager()
     conversation.add_user_message("Call unknowns")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     error_events = [e for e in events if isinstance(e, ErrorEvent)]
     assert len(error_events) == 1
@@ -448,15 +457,16 @@ async def test_max_tokens_escalation_first_stage() -> None:
     ]
     conversation.add_user_message("Hit limit")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     retry_events = [e for e in events if isinstance(e, RetryEvent)]
     assert len(retry_events) == 1
     assert retry_events[0].reason == "max_tokens escalation"
     assert client.max_output_tokens_calls == [64000]
     # 续写指令作为新用户消息注入，且位于截断助手消息之后。
-    assert "Resume" in conversation.messages[2].content
-    assert conversation.messages[1].content == "Partial answer"
+    # inject_environment 在 position 0 插入环境上下文，故助手消息索引为 2、续写指令为 3。
+    assert "Resume" in conversation.messages[3].content
+    assert conversation.messages[2].content == "Partial answer"
     assert isinstance(events[-1], LoopComplete)
 
 
@@ -476,7 +486,7 @@ async def test_max_tokens_recovery_branch_injects_break_instruction() -> None:
     ]
     conversation.add_user_message("Hit limit twice")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     retry_events = [e for e in events if isinstance(e, RetryEvent)]
     assert [r.reason for r in retry_events] == [
@@ -484,8 +494,9 @@ async def test_max_tokens_recovery_branch_injects_break_instruction() -> None:
         "max_tokens recovery 1/3",
     ]
     # recovery 注入的拆小指令位于第二轮截断助手消息之后。
-    assert "Break" in conversation.messages[2].content
-    assert conversation.messages[1].content == "Partial two"
+    # inject_environment 在 position 0 插入环境上下文，故 Partial two 索引为 2、Break 指令为 3。
+    assert "Break" in conversation.messages[3].content
+    assert conversation.messages[2].content == "Partial two"
     assert isinstance(events[-1], LoopComplete)
 
 
@@ -591,7 +602,7 @@ async def test_usage_event_accumulates_tokens_across_turns() -> None:
     ]
     conversation.add_user_message("Run")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     usage_events = [e for e in events if isinstance(e, UsageEvent)]
     assert len(usage_events) == 2
@@ -623,7 +634,7 @@ async def test_thinking_text_event_forwarded() -> None:
     conversation = ConversationManager()
     conversation.add_user_message("Think")
 
-    events = await _collect(agent.run(conversation, system="sys"))
+    events = await _collect(agent.run(conversation))
 
     thinking_events = [e for e in events if isinstance(e, ThinkingText)]
     assert "".join(e.text for e in thinking_events) == "Hello world."
@@ -660,8 +671,102 @@ async def test_cancellation_exits_generator() -> None:
     conversation = ConversationManager()
     conversation.add_user_message("Block then cancel")
 
-    task = asyncio.create_task(_collect(agent.run(conversation, system="sys")))
+    task = asyncio.create_task(_collect(agent.run(conversation)))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# ---------------------------------------------------------------------------
+# batch04：build_system_prompt 与 inject_environment 集成
+# ---------------------------------------------------------------------------
+
+
+# 验证会话启动时 inject_environment 在 position 0 注入环境上下文。
+# 假客户端返回纯文本流，断言首条消息为 user 角色且含 "Current working directory"。
+@pytest.mark.asyncio
+async def test_inject_environment_inserts_context_at_head() -> None:
+    registry = ToolRegistry()
+    client = _FakeClient([_text_stream("Hello")])
+    agent = Agent(client=client, registry=registry, protocol="anthropic", work_dir="/custom")
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+
+    await _collect(agent.run(conversation))
+
+    assert len(conversation.messages) >= 2
+    assert conversation.messages[0].role == "user"
+    assert "Current working directory: /custom" in conversation.messages[0].content
+    assert conversation.env_injected is True
+
+
+# 验证每轮 build_system_prompt 被调用且返回包含 Environment 段落。
+# 假客户端记录 system 参数，断言 system 含 "# Environment" 与工作目录。
+@pytest.mark.asyncio
+async def test_build_system_prompt_called_each_turn_with_environment() -> None:
+    tool = _MockTool(name="MockTool", result=ToolResult(content="ok"))
+    agent, conversation, client = _setup(tool)
+    agent.work_dir = "/custom-workdir"
+    client._outcomes = [
+        _tool_call_stream("c1", "MockTool", {"input": "x"}),
+        _text_stream("Done"),
+    ]
+    conversation.add_user_message("Run")
+
+    await _collect(agent.run(conversation))
+
+    # 两轮流均调用 build_system_prompt，system 含 Environment 段落与工作目录。
+    assert len(client.systems_passed) == 2
+    for system in client.systems_passed:
+        assert "# Environment" in system
+        assert "Working directory: /custom-workdir" in system
+        assert "You are SeaCode" in system
+
+
+# 验证 inject_environment 只注入一次。
+# 连续两次 agent.run 复用同一 conversation，断言 env_injected 标记后不再插入。
+@pytest.mark.asyncio
+async def test_inject_environment_only_once_across_runs() -> None:
+    registry = ToolRegistry()
+    client = _FakeClient(
+        [_text_stream("First"), _text_stream("Second")]
+    )
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("First")
+
+    await _collect(agent.run(conversation))
+    first_count = len(conversation.messages)
+    # 第二次 run 时 env_injected 已为 True，不再重复注入。
+    conversation.add_user_message("Second")
+    await _collect(agent.run(conversation))
+    # 第二次 run 只新增助手消息与用户消息，不再插入环境上下文。
+    assert conversation.env_injected is True
+    # 第一次 run 后 3 条；第二次 run 后 5 条（env 已注入不再重复）。
+    assert len(conversation.messages) == first_count + 2
+
+
+# 验证 replace_history 重置 env_injected 允许重新注入。
+# 注入环境后 replace_history，断言 env_injected 为 False 且可再次注入。
+@pytest.mark.asyncio
+async def test_replace_history_resets_env_injected() -> None:
+    from seacode.conversation import Message as ConvMessage
+
+    registry = ToolRegistry()
+    client = _FakeClient([_text_stream("Hello")])
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+    await _collect(agent.run(conversation))
+    assert conversation.env_injected is True
+
+    # 模拟第 07 步压缩后 replace_history，env_injected 应重置。
+    conversation.replace_history([ConvMessage(role="user", content="summarized")])
+    assert conversation.env_injected is False
+
+    # 再次 run 时应重新注入环境上下文。
+    client._outcomes = [_text_stream("After compact")]
+    await _collect(agent.run(conversation))
+    assert conversation.env_injected is True
+    assert "Current working directory" in conversation.messages[0].content
