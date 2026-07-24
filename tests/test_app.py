@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import pytest
-from textual.widgets import Button, OptionList
+from textual.containers import Horizontal
+from textual.widgets import Button, OptionList, Static
 
 from seacode.app import ChatInput, SeaCodeApp
 from seacode.client import (
@@ -93,8 +95,8 @@ async def _settle(pilot: Any) -> None:
     await pilot.pause(0.05)
 
 
-# 验证单 Provider 直接进入对话，Enter 提交且没有主要 Send 按钮。
-# 假流返回文本与完成事件，确保输入在回合结束后恢复。
+# 验证单 Provider 进入既定 TUI 壳层，Enter 提交且没有主要 Send 按钮。
+# 假流同时证明三行标题、横向状态栏、唯一模型位置和流后输入恢复。
 @pytest.mark.asyncio
 async def test_single_profile_streams_with_enter_and_has_no_send_button() -> None:
     client = _FakeClient(
@@ -113,7 +115,15 @@ async def test_single_profile_streams_with_enter_and_has_no_send_button() -> Non
         input_widget = app.query_one(ChatInput)
         assert input_widget.disabled is False
         assert not app.query(Button)
-        assert "[=^.^=]" in str(app.query_one("#title-bar").render())
+        title = app.query_one("#title-bar", Static)
+        assert str(title.styles.height) == "3"
+        assert str(title.render()).count("\n") == 2
+        assert "SeaCode" in str(title.render())
+        assert os.getcwd() in str(title.render())
+        assert isinstance(app.query_one("#status-bar"), Horizontal)
+        assert "test-model" in str(app.query_one("#model-label", Static).render())
+        assert not app.query("#mode-label")
+        assert not app.query("#teammates-label")
         input_widget.load_text("Hi")
         await pilot.press("enter")
         await _settle(pilot)

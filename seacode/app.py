@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Callable
 
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message as TextualMessage
 from textual.widgets import Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
@@ -82,15 +83,26 @@ class SeaCodeApp(App[None]):
         self._selected_provider: ProviderConfig | None = None
         self._streaming = False
 
-    # 构造最小的选择、对话、输入和状态区域。
+    # 生成三行品牌标题，保留终端对话的既定信息层级。
+    @staticmethod
+    def _make_banner(work_dir: str = "") -> Text:
+        banner = Text()
+        banner.append(" /\\___/\\   ", style="bold #d9a441")
+        banner.append("SeaCode\n", style="#c7d2d5")
+        banner.append("( =o.o= )  ", style="bold #d9a441")
+        banner.append(f"{work_dir}\n" if work_dir else "\n", style="#9fb2b6")
+        banner.append(" /| ||| |\\ ", style="bold #d9a441")
+        return banner
+
+    # 构造标题、选择、聊天、输入和横向状态栏五个既定区域。
     def compose(self) -> ComposeResult:
-        yield Static("SeaCode [=^.^=]", id="title-bar")
+        yield Static(self._make_banner(), id="title-bar")
         if len(self._providers) > 1:
             with Vertical(id="provider-select"):
-                yield Static("Choose a model profile", id="select-label")
+                yield Static("Select a model profile", id="select-label")
                 yield OptionList(
                     *[
-                        Option(f"{provider.name}  {provider.model}", id=provider.name)
+                        Option(f"{provider.name}  [{provider.model}]", id=provider.name)
                         for provider in self._providers
                     ],
                     id="provider-list",
@@ -98,7 +110,9 @@ class SeaCodeApp(App[None]):
         yield VerticalScroll(id="chat-area")
         with Vertical(id="input-area"):
             yield ChatInput(id="chat-input")
-            yield Static("Preparing configuration", id="turn-status")
+            with Horizontal(id="status-bar"):
+                yield Static("Preparing configuration", id="turn-status")
+                yield Static("", id="model-label")
 
     # 根据 Provider 数量进入选择状态或直接准备单一配置。
     def on_mount(self) -> None:
@@ -132,9 +146,8 @@ class SeaCodeApp(App[None]):
         self.query_one("#input-area").display = True
         if len(self._providers) > 1:
             self.query_one("#provider-select").display = False
-        self.query_one("#title-bar", Static).update(
-            Text(f"SeaCode [=^.^=]  {provider.name} / {provider.model}")
-        )
+        self.query_one("#title-bar", Static).update(self._make_banner(os.getcwd()))
+        self.query_one("#model-label", Static).update(Text(provider.model))
         self._set_status("Ready")
         input_widget = self.query_one(ChatInput)
         input_widget.disabled = False
@@ -163,8 +176,11 @@ class SeaCodeApp(App[None]):
         input_widget = self.query_one(ChatInput)
         input_widget.disabled = True
         self._conversation.begin_turn(text)
-        await self._append_static(Text(f"You\n{text}"), "user-message")
-        live_answer = Static(Text(""), classes="assistant-message")
+        user_message = Text()
+        user_message.append("❯ ", style="bold #71b8bc")
+        user_message.append(text, style="bold #f2f5f5")
+        await self._append_static(user_message, "message user-message")
+        live_answer = Static(Text(""), classes="message assistant-message")
         await self.query_one("#chat-area", VerticalScroll).mount(live_answer)
         started = time.monotonic()
         answer = ""
@@ -177,12 +193,17 @@ class SeaCodeApp(App[None]):
             async for event in client.stream(request_messages, SYSTEM_PROMPT):
                 if isinstance(event, TextDelta):
                     answer += event.text
-                    live_answer.update(Text(answer))
+                    live_text = Text()
+                    live_text.append("● ", style="bold #d9a441")
+                    live_text.append(answer)
+                    live_answer.update(live_text)
                     self.query_one("#chat-area", VerticalScroll).scroll_end(animate=False)
                 elif isinstance(event, ThinkingDelta):
                     thinking += event.text
                     if thinking_widget is None:
-                        thinking_widget = Static(Text("Thinking"), classes="thinking-message")
+                        thinking_widget = Static(
+                            Text("Thinking"), classes="message thinking-message"
+                        )
                         await self.query_one("#chat-area", VerticalScroll).mount(thinking_widget)
                     thinking_widget.update(Text(f"Thinking\n{thinking}"))
                 elif isinstance(event, StreamComplete):
@@ -194,7 +215,7 @@ class SeaCodeApp(App[None]):
             await live_answer.remove()
             final_answer = answer or "*(The provider completed without text.)*"
             await self.query_one("#chat-area", VerticalScroll).mount(
-                Markdown(final_answer, classes="assistant-markdown")
+                Markdown(final_answer, classes="message assistant-markdown")
             )
             elapsed = time.monotonic() - started
             self._set_status(
@@ -232,7 +253,7 @@ class SeaCodeApp(App[None]):
 
     # 在对话区追加不包含原始异常内容的错误消息。
     async def _append_error(self, message: str) -> None:
-        await self._append_static(Text(f"Error\n{message}"), "error-message")
+        await self._append_static(Text(f"✖ {message}"), "message error-message")
 
     # 将有限错误类别映射成可行动但不泄露细节的文本。
     def _error_message(self, error: LLMError) -> str:
