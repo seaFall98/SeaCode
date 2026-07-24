@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
-from typing import Any
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 from seacode.tools.base import Tool, ToolCategory, ToolResult
+
+if TYPE_CHECKING:
+    # 仅用于类型注解；运行时由 app.py 在装配时注入实例，避免循环导入。
+    from seacode.sandbox import Sandbox, SandboxConfig
 
 # 超时上限（秒），用户传入值会被截断到此值。
 MAX_TIMEOUT: int = 600
@@ -104,14 +108,14 @@ class Bash(Tool):
     # 工作目录，为 None 时使用当前进程的工作目录。
     work_dir: str | None = None
 
-    # OS 级沙箱实例和配置（第 05 步注入，为 None 时不启用沙箱）。
-    sandbox: Any = None
-    sandbox_config: Any = None
+    # OS 级沙箱实例和配置（由 app.py 在装配时注入，为 None 时不启用沙箱）。
+    sandbox: Sandbox | None = None
+    sandbox_config: SandboxConfig | None = None
 
     async def execute(self, params: Params) -> ToolResult:  # type: ignore[override]
         timeout = min(params.timeout, MAX_TIMEOUT)
 
-        # 第 05 步会启用沙箱包装；本步直接执行原命令。
+        # 三条件守卫：sandbox / sandbox_config / available 任一为 None/False 时直接执行原命令。
         actual_command = params.command
         if self.sandbox and self.sandbox_config and self.sandbox.available():
             actual_command = self.sandbox.wrap(params.command, self.sandbox_config)

@@ -1,12 +1,14 @@
-"""SeaCode 第 03 步的紧凑 Textual 对话界面，支持 Agent Loop 与工具调用展示。"""
+"""SeaCode 第 05 步的紧凑 Textual 对话界面，支持 Agent Loop、工具调用与权限确认。"""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import random
+import tempfile
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from rich.markup import escape
@@ -22,6 +24,7 @@ from .agent import (
     Agent,
     ErrorEvent,
     LoopComplete,
+    PermissionRequest,
     RetryEvent,
     StreamText,
     ThinkingText,
@@ -38,10 +41,20 @@ from .client import (
     RateLimitError,
     create_client,
 )
-from .config import ProviderConfig
+from .config import ProviderConfig, SandboxAppConfig
 from .conversation import ConversationManager
+from .permission_dialog import InlinePermissionWidget
+from .permissions import (
+    DangerousCommandDetector,
+    PathSandbox,
+    PermissionChecker,
+    PermissionMode,
+    RuleEngine,
+)
+from .sandbox import SandboxConfig, create_sandbox
 from .tools import create_default_registry
 from .tools.base import ToolResult
+from .tools.bash import Bash
 
 # 工具调用详情展示的最大行数，超过则截断并提示剩余行数。
 MAX_TRUNCATED_LINES: int = 20
@@ -68,6 +81,30 @@ THINKING_VERBS: list[str] = [
     "Unfurling", "Unravelling", "Wandering", "Whisking", "Working",
     "Wrangling",
 ]
+
+# Shift+Tab 循环切换的权限模式顺序：default → acceptEdits → plan → YOLO。
+_MODE_CYCLE: list[PermissionMode] = [
+    PermissionMode.DEFAULT,
+    PermissionMode.ACCEPT_EDITS,
+    PermissionMode.PLAN,
+    PermissionMode.BYPASS,
+]
+
+# 各权限模式在状态栏的显示名；BYPASS 显示为 YOLO 以突出风险。
+_MODE_DISPLAY: dict[PermissionMode, str] = {
+    PermissionMode.DEFAULT: "default",
+    PermissionMode.ACCEPT_EDITS: "accept-edits",
+    PermissionMode.PLAN: "plan",
+    PermissionMode.BYPASS: "YOLO",
+}
+
+# 各权限模式在状态栏的颜色；YOLO 用红色警示风险。
+_MODE_COLORS: dict[PermissionMode, str] = {
+    PermissionMode.DEFAULT: "#aebbc0",
+    PermissionMode.ACCEPT_EDITS: "#a3be8c",
+    PermissionMode.PLAN: "#d9a441",
+    PermissionMode.BYPASS: "#ff9c9c",
+}
 
 
 # 把现在进行时动词转换为过去式，用于 thinking-done 行。
@@ -283,6 +320,7 @@ class SeaCodeApp(App[None]):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("ctrl+o", "toggle_tool_blocks", "Toggle tools", priority=True),
+        Binding("shift+tab", "cycle_mode", "Cycle mode", priority=True),
     ]
 
     # 初始化当前配置、客户端、工具注册中心和单回合状态。
@@ -292,6 +330,7 @@ class SeaCodeApp(App[None]):
         *,
         client_factory: Callable[[ProviderConfig], LLMClient] = create_client,
         max_steps: int = 100,
+        sandbox_cfg: SandboxAppConfig | None = None,
     ) -> None:
         super().__init__()
         self._providers = tuple(providers)
@@ -303,6 +342,14 @@ class SeaCodeApp(App[None]):
         self._streaming = False
         self._agent_task: asyncio.Task[None] | None = None
         self._max_steps = max_steps
+        # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，默认全关闭。
+        self._sandbox_cfg = sandbox_cfg or SandboxAppConfig()
+        # 权限检查器；在 _select_provider 中装配，为 None 时跳过权限检查。
+        self._permission_checker: PermissionChecker | None = None
+        # 当前权限模式；与 permission_checker.mode 同步，供 TUI 状态栏展示。
+        self._permission_mode: PermissionMode | None = None
+        # 待回复的权限请求；HITL 弹窗期间持有，回复后清空。
+        self._pending_permission: PermissionRequest | None = None
 
     # 生成三行品牌标题，保留终端对话的既定信息层级。
     @staticmethod
@@ -334,6 +381,7 @@ class SeaCodeApp(App[None]):
             with Horizontal(id="status-bar"):
                 yield Static("Preparing configuration", id="turn-status")
                 yield Static("", id="model-label")
+                yield Static("", id="mode-label")
 
     # 根据 Provider 数量进入选择状态或直接准备单一配置。
     def on_mount(self) -> None:
@@ -363,6 +411,7 @@ class SeaCodeApp(App[None]):
             return
 
         self._selected_provider = provider
+        self._assemble_permission_system()
         self.query_one("#chat-area").display = True
         self.query_one("#input-area").display = True
         if len(self._providers) > 1:
@@ -370,9 +419,59 @@ class SeaCodeApp(App[None]):
         self.query_one("#title-bar", Static).update(self._make_banner(os.getcwd()))
         self.query_one("#model-label", Static).update(Text(provider.model))
         self._set_status("Ready")
+        self._update_mode_label()
         input_widget = self.query_one(ChatInput)
         input_widget.disabled = False
         input_widget.focus()
+
+    # 装配权限检查器与 OS 级沙箱：三层规则文件 + 危险命令检测 + 路径沙箱 + 模式 + 沙箱挂载。
+    def _assemble_permission_system(self) -> None:
+        work_dir = os.getcwd()
+        home = Path.home()
+
+        # 三层规则文件路径：用户级 > 项目级 > 本地级（可写入）。
+        rule_engine = RuleEngine(
+            user_rules_path=home / ".seacode" / "permissions.yaml",
+            project_rules_path=Path(work_dir) / ".seacode" / "permissions.yaml",
+            local_rules_path=Path(work_dir) / ".seacode" / "permissions.local.yaml",
+        )
+
+        # OS 级沙箱：配置启用时尝试创建，Windows 等不支持平台返回 None 优雅降级。
+        sandbox_cfg = self._sandbox_cfg
+        os_sandbox = create_sandbox() if sandbox_cfg.enabled else None
+        checker_sandbox_enabled = False
+
+        if sandbox_cfg.enabled and os_sandbox is not None and os_sandbox.available():
+            # 挂载 OS 沙箱到 Bash 工具，实现应用层 + 内核层双重防护。
+            bash_tool = self._tool_registry.get("Bash")
+            if isinstance(bash_tool, Bash):
+                bash_tool.sandbox = os_sandbox
+                bash_tool.sandbox_config = SandboxConfig(
+                    allow_write=[work_dir, tempfile.gettempdir()],
+                    deny_write=[
+                        os.path.join(work_dir, ".seacode", "config.yaml"),
+                        os.path.join(work_dir, ".seacode", "permissions.local.yaml"),
+                    ],
+                    network_enabled=sandbox_cfg.network_enabled,
+                )
+            # 内核兜底存在时，auto_allow 才能触发 Layer 1c 自动放行。
+            checker_sandbox_enabled = sandbox_cfg.auto_allow
+        elif sandbox_cfg.enabled and os_sandbox is None:
+            # 不支持沙箱的平台：提示用户已降级为应用层路径检查。
+            self.call_after_refresh(
+                self._show_system_message,
+                "当前系统不支持 OS 沙箱，已降级为应用层路径检查",
+            )
+
+        # 装配五层防御链权限检查器。
+        self._permission_checker = PermissionChecker(
+            detector=DangerousCommandDetector(),
+            sandbox=PathSandbox(project_root=work_dir),
+            rule_engine=rule_engine,
+            mode=PermissionMode.DEFAULT,
+            sandbox_enabled=checker_sandbox_enabled,
+        )
+        self._permission_mode = PermissionMode.DEFAULT
 
     # 在客户端创建失败时展示脱敏启动错误。
     def _show_startup_error(self, error: LLMError) -> None:
@@ -388,8 +487,10 @@ class SeaCodeApp(App[None]):
         self._streaming = True
         self._agent_task = asyncio.create_task(self._run_turn(event.text))
 
-    # ESC 取消正在进行的回合；非流式状态下不响应，避免抢占其它语义。
+    # ESC 取消正在进行的回合；权限对话框活动时由对话框处理（拒绝），不取消整个回合。
     def action_cancel(self) -> None:
+        if self._pending_permission is not None:
+            return
         if self._streaming and self._agent_task is not None:
             self._agent_task.cancel()
 
@@ -404,6 +505,40 @@ class SeaCodeApp(App[None]):
             for block in parent.query(ToolCallBlock):
                 if block.tool_name in COLLAPSIBLE_TOOLS:
                     block.display = expanded
+
+    # Shift+Tab 循环切换权限模式：default → acceptEdits → plan → YOLO → default。
+    def action_cycle_mode(self) -> None:
+        if self._permission_mode is None:
+            return
+        current_idx = _MODE_CYCLE.index(self._permission_mode)
+        next_mode = _MODE_CYCLE[(current_idx + 1) % len(_MODE_CYCLE)]
+        self._permission_mode = next_mode
+        if self._permission_checker is not None:
+            self._permission_checker.mode = next_mode
+        self._update_mode_label()
+
+    # 更新状态栏右侧的模式标签，显示当前模式名与对应颜色。
+    def _update_mode_label(self) -> None:
+        if self._permission_mode is None:
+            return
+        display = _MODE_DISPLAY.get(self._permission_mode, self._permission_mode.value)
+        color = _MODE_COLORS.get(self._permission_mode, "#aebbc0")
+        self.query_one("#mode-label", Static).update(Text(f"[{display}]", style=color))
+
+    # HITL 权限确认回复：resolve future 让 Agent 继续，移除对话框，输入框保持禁用直到回合结束。
+    async def on_inline_permission_widget_responded(
+        self, event: InlinePermissionWidget.Responded
+    ) -> None:
+        if self._pending_permission is None:
+            return
+        if not self._pending_permission.future.done():
+            self._pending_permission.future.set_result(event.response)
+        self._pending_permission = None
+        try:
+            widget = self.query_one("#perm-inline", InlinePermissionWidget)
+            await widget.remove()
+        except Exception:
+            pass
 
     # 执行一条完整 Agent Loop 回合，消费 AgentEvent 流并管理 TUI 展示与取消。
     async def _run_turn(self, text: str) -> None:
@@ -445,6 +580,7 @@ class SeaCodeApp(App[None]):
                 protocol=provider.protocol,
                 work_dir=os.getcwd(),
                 max_iterations=self._max_steps,
+                permission_checker=self._permission_checker,
             )
             async for event in agent.run(self._conversation):
                 if isinstance(event, StreamText):
@@ -481,6 +617,13 @@ class SeaCodeApp(App[None]):
                 elif isinstance(event, UsageEvent):
                     total_input = event.input_tokens
                     total_output = event.output_tokens
+                elif isinstance(event, PermissionRequest):
+                    # HITL 权限确认：挂载内联对话框并禁用输入框，等待用户回复。
+                    self._pending_permission = event
+                    widget = InlinePermissionWidget(event.tool_name, event.description)
+                    await chat.mount(widget)
+                    chat.scroll_end(animate=False)
+                    input_widget.disabled = True
                 elif isinstance(event, ErrorEvent):
                     await self._append_error(event.message)
                 elif isinstance(event, TurnComplete):

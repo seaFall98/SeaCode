@@ -41,10 +41,26 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
+class SandboxAppConfig:
+    """OS 级沙箱启用配置：enabled 控制挂载，auto_allow 控制 Layer 1c 联动。
+
+    - enabled：是否在装配时调用 create_sandbox() 挂载到 Bash
+    - auto_allow：是否在 Layer 1c 自动放行命令类工具（需 enabled + 平台支持）
+    - network_enabled：沙箱内是否允许网络访问
+    """
+
+    enabled: bool = False
+    auto_allow: bool = False
+    network_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """保存启动本批次对话应用所需的已校验配置。"""
 
     providers: tuple[ProviderConfig, ...]
+    # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，三层合并任一层开启即开启。
+    sandbox: SandboxAppConfig = SandboxAppConfig()
 
 
 # 返回 SeaCode 用户级与项目级配置的固定发现顺序。
@@ -81,7 +97,25 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
     names = [provider.name for provider in providers]
     if len(names) != len(set(names)):
         raise ConfigError(f"Provider names must be unique: {path}")
-    return AppConfig(providers=providers)
+    sandbox = _parse_sandbox(raw.get("sandbox"), path)
+    return AppConfig(providers=providers, sandbox=sandbox)
+
+
+# 解析 sandbox 段；非 dict 或字段缺失时返回默认（全部关闭）。
+def _parse_sandbox(raw: Any, path: Path) -> SandboxAppConfig:
+    if not isinstance(raw, dict):
+        return SandboxAppConfig()
+    enabled = raw.get("enabled", False)
+    auto_allow = raw.get("auto_allow", False)
+    network_enabled = raw.get("network_enabled", False)
+    if not isinstance(enabled, bool) or not isinstance(auto_allow, bool) \
+            or not isinstance(network_enabled, bool):
+        raise ConfigError(f"sandbox section requires boolean fields: {path}")
+    return SandboxAppConfig(
+        enabled=enabled,
+        auto_allow=auto_allow,
+        network_enabled=network_enabled,
+    )
 
 
 # 校验单个 Provider 的公开字段与协议边界。
@@ -121,7 +155,7 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
     )
 
 
-# 按固定层级合并配置，后层完整替换 Provider 列表。
+# 按固定层级合并配置；后层完整替换 Provider 列表，sandbox 各字段任一层开启即开启。
 def load_config(
     path: Path | None = None,
     *,
@@ -134,12 +168,29 @@ def load_config(
         return _load_file(path)
 
     loaded: AppConfig | None = None
+    sandbox_enabled = False
+    sandbox_auto_allow = False
+    sandbox_network = False
     for candidate in config_candidates(cwd, home):
-        if candidate.is_file():
-            loaded = _load_file(candidate)
+        if not candidate.is_file():
+            continue
+        layer = _load_file(candidate)
+        loaded = layer
+        # sandbox 字段三层合并：任一层开启即开启（与 Provider 列表的"后层替换"语义不同）。
+        sandbox_enabled = sandbox_enabled or layer.sandbox.enabled
+        sandbox_auto_allow = sandbox_auto_allow or layer.sandbox.auto_allow
+        sandbox_network = sandbox_network or layer.sandbox.network_enabled
+
     if loaded is None:
         raise ConfigError(
             "No configuration found. Add .seacode/config.local.yaml to the project "
             "or ~/.seacode/config.yaml for a user default."
         )
-    return loaded
+    return AppConfig(
+        providers=loaded.providers,
+        sandbox=SandboxAppConfig(
+            enabled=sandbox_enabled,
+            auto_allow=sandbox_auto_allow,
+            network_enabled=sandbox_network,
+        ),
+    )

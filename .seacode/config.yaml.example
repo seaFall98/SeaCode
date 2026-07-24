@@ -6,3 +6,10 @@ providers:
     base_url: https://api.example.com
     api_key: replace-with-your-key
     thinking: false
+
+# OS 级沙箱配置（可选）；enabled 开启内核隔离，auto_allow 联动权限 Layer 1c 自动放行。
+# 仅 macOS（seatbelt）与 Linux（bubblewrap）支持；Windows 自动降级为应用层路径检查。
+sandbox:
+  enabled: false
+  auto_allow: false
+  network_enabled: false

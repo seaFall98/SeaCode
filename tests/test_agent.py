@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -11,6 +12,8 @@ from seacode.agent import (
     Agent,
     ErrorEvent,
     LoopComplete,
+    PermissionRequest,
+    PermissionResponse,
     RetryEvent,
     StreamingExecutor,
     StreamText,
@@ -31,6 +34,13 @@ from seacode.client import (
     ToolCallStart,
 )
 from seacode.conversation import ConversationManager, Message
+from seacode.permissions import (
+    DangerousCommandDetector,
+    PathSandbox,
+    PermissionChecker,
+    PermissionMode,
+    RuleEngine,
+)
 from seacode.tools import ToolRegistry, partition_tool_calls
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
@@ -770,3 +780,326 @@ async def test_replace_history_resets_env_injected() -> None:
     await _collect(agent.run(conversation))
     assert conversation.env_injected is True
     assert "Current working directory" in conversation.messages[0].content
+
+
+# ---------------------------------------------------------------------------
+# batch05：权限系统集成测试
+# ---------------------------------------------------------------------------
+
+
+# 权限测试专用的写工具 Mock，参数模型含 file_path 以通过校验。
+class _WriteFileParams(BaseModel):
+    file_path: str = ""
+    content: str = ""
+
+
+class _MockWriteFile(Tool):
+    name = "WriteFile"
+    description = "mock write for permission tests"
+    params_model = _WriteFileParams
+    category = ToolCategory.WRITE
+
+    async def execute(self, params: BaseModel) -> ToolResult:
+        return ToolResult(content=f"wrote {params.file_path}")
+
+
+# 权限测试专用的 Bash 工具 Mock，参数模型含 command 以通过校验。
+class _BashParams(BaseModel):
+    command: str = ""
+    timeout: int = 120
+
+
+class _MockBash(Tool):
+    name = "Bash"
+    description = "mock bash for permission tests"
+    params_model = _BashParams
+    category = ToolCategory.SYSTEM
+
+    async def execute(self, params: BaseModel) -> ToolResult:
+        return ToolResult(content=f"ran {params.command}")
+
+
+# 构造含 detector / sandbox / rule_engine 的 PermissionChecker，供权限测试复用。
+def _make_test_checker(
+    mode: PermissionMode = PermissionMode.DEFAULT,
+    project_root: str = ".",
+    rule_engine: RuleEngine | None = None,
+    sandbox_enabled: bool = False,
+) -> PermissionChecker:
+    return PermissionChecker(
+        detector=DangerousCommandDetector(),
+        sandbox=PathSandbox(project_root=project_root),
+        rule_engine=rule_engine or RuleEngine(),
+        mode=mode,
+        sandbox_enabled=sandbox_enabled,
+    )
+
+
+# 消费 agent.run 事件流，遇到 PermissionRequest 时立即用指定回复 resolve future。
+async def _collect_with_permissions(
+    agent_run: Any, response: PermissionResponse = PermissionResponse.ALLOW
+) -> list[Any]:
+    events: list[Any] = []
+    async for event in agent_run:
+        events.append(event)
+        if isinstance(event, PermissionRequest):
+            event.future.set_result(response)
+    return events
+
+
+# 验证权限 deny 决策返回 is_error=True 的 ToolResult 且不中断回合。
+# 构造 deny 规则的 checker，工具调用后断言 ToolResultEvent 为错误并继续到最终回复。
+@pytest.mark.asyncio
+async def test_permission_deny_returns_error_result(tmp_path: Path) -> None:
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        '- {rule: "Bash(rm *)", effect: "deny"}\n', encoding="utf-8"
+    )
+    rule_engine = RuleEngine(local_rules_path=rules_path)
+    checker = _make_test_checker(rule_engine=rule_engine)
+
+    tool = _MockBash()
+    registry = ToolRegistry()
+    registry.register(tool)
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "Bash", {"command": "rm file"}),
+            _text_stream("Recovered"),
+        ]
+    )
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic",
+        permission_checker=checker,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Run denied command")
+
+    events = await _collect(agent.run(conversation))
+
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+    assert result_events[0].is_error is True
+    assert "Permission denied" in result_events[0].output
+    assert isinstance(events[-1], LoopComplete)
+
+
+# 验证权限 ask 决策通过 PermissionRequest + future 同步，ALLOW 后工具正常执行。
+# 构造 DEFAULT 模式 checker，WriteFile 触发 ask，resolve ALLOW 后断言工具执行成功。
+@pytest.mark.asyncio
+async def test_permission_ask_allow_executes_tool(tmp_path: Path) -> None:
+    checker = _make_test_checker(project_root=str(tmp_path))
+    tool = _MockWriteFile()
+    registry = ToolRegistry()
+    registry.register(tool)
+    file_path = str(tmp_path / "test.txt")
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "WriteFile", {"file_path": file_path}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic",
+        permission_checker=checker,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Write file")
+
+    events = await _collect_with_permissions(agent.run(conversation))
+
+    assert any(isinstance(e, PermissionRequest) for e in events)
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+    assert result_events[0].is_error is False
+    assert "wrote" in result_events[0].output
+    assert isinstance(events[-1], LoopComplete)
+
+
+# 验证权限 ask + DENY 回复返回 is_error=True 的 ToolResult。
+# 构造 DEFAULT 模式 checker，WriteFile 触发 ask，resolve DENY 后断言工具不执行。
+@pytest.mark.asyncio
+async def test_permission_ask_deny_returns_error(tmp_path: Path) -> None:
+    checker = _make_test_checker(project_root=str(tmp_path))
+    tool = _MockWriteFile()
+    registry = ToolRegistry()
+    registry.register(tool)
+    file_path = str(tmp_path / "test.txt")
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "WriteFile", {"file_path": file_path}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic",
+        permission_checker=checker,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Write file")
+
+    events = await _collect_with_permissions(
+        agent.run(conversation), PermissionResponse.DENY
+    )
+
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+    assert result_events[0].is_error is True
+    assert "Permission denied" in result_events[0].output
+    assert isinstance(events[-1], LoopComplete)
+
+
+# 验证 ALLOW_ALWAYS 写入本地规则文件并加入会话级放行集合。
+# resolve ALLOW_ALWAYS 后断言 local rules 文件含规则且 _session_allowed 非空。
+@pytest.mark.asyncio
+async def test_permission_allow_always_writes_rule_and_session_allow(
+    tmp_path: Path,
+) -> None:
+    local_path = tmp_path / "permissions.local.yaml"
+    rule_engine = RuleEngine(local_rules_path=local_path)
+    checker = _make_test_checker(
+        project_root=str(tmp_path), rule_engine=rule_engine
+    )
+    tool = _MockWriteFile()
+    registry = ToolRegistry()
+    registry.register(tool)
+    file_path = str(tmp_path / "test.txt")
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "WriteFile", {"file_path": file_path}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic",
+        permission_checker=checker,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Write file")
+
+    events = await _collect_with_permissions(
+        agent.run(conversation), PermissionResponse.ALLOW_ALWAYS
+    )
+
+    # 工具执行成功。
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+    assert result_events[0].is_error is False
+
+    # 本地规则文件已写入。
+    assert local_path.is_file()
+    content = local_path.read_text(encoding="utf-8")
+    assert "WriteFile" in content
+    assert "allow" in content
+
+    # 会话级放行集合已加入。
+    assert len(checker._session_allowed) > 0
+    assert any(k.startswith("WriteFile:") for k in checker._session_allowed)
+
+
+# 验证 BYPASS 模式下写工具自动放行，不触发 HITL 弹窗。
+# 构造 BYPASS 模式 checker，WriteFile 调用后断言无 PermissionRequest 且工具执行成功。
+@pytest.mark.asyncio
+async def test_bypass_mode_auto_approves_write_tools(tmp_path: Path) -> None:
+    checker = _make_test_checker(
+        mode=PermissionMode.BYPASS, project_root=str(tmp_path)
+    )
+    tool = _MockWriteFile()
+    registry = ToolRegistry()
+    registry.register(tool)
+    file_path = str(tmp_path / "test.txt")
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "WriteFile", {"file_path": file_path}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic",
+        permission_checker=checker,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Write file")
+
+    events = await _collect(agent.run(conversation))
+
+    # BYPASS 模式不触发 HITL。
+    assert not any(isinstance(e, PermissionRequest) for e in events)
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+    assert result_events[0].is_error is False
+    assert isinstance(events[-1], LoopComplete)
+
+
+# 验证危险命令黑名单在 Agent 集成中硬拦截，不触发 HITL。
+# 构造 DEFAULT 模式 checker，Bash 调用 rm -rf / 后断言无 PermissionRequest 且结果为错误。
+@pytest.mark.asyncio
+async def test_dangerous_command_blocks_in_agent_integration(tmp_path: Path) -> None:
+    checker = _make_test_checker(project_root=str(tmp_path))
+    tool = _MockBash()
+    registry = ToolRegistry()
+    registry.register(tool)
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "Bash", {"command": "rm -rf /"}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic",
+        permission_checker=checker,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Run dangerous")
+
+    events = await _collect(agent.run(conversation))
+
+    # 危险命令被 Layer 1b 硬拦截，不进入 HITL。
+    assert not any(isinstance(e, PermissionRequest) for e in events)
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+    assert result_events[0].is_error is True
+    assert "危险命令" in result_events[0].output
+    assert isinstance(events[-1], LoopComplete)
+
+
+# 验证 set_permission_mode 同步更新 checker.mode。
+# 构造 DEFAULT 模式 agent，切换到 BYPASS 后断言 checker.mode 同步。
+def test_set_permission_mode_syncs_checker_mode() -> None:
+    checker = _make_test_checker(mode=PermissionMode.DEFAULT)
+    registry = ToolRegistry()
+    agent = Agent(
+        client=_FakeClient([]), registry=registry, protocol="anthropic",
+        permission_checker=checker,
+    )
+    assert agent.permission_mode == PermissionMode.DEFAULT
+    assert checker.mode == PermissionMode.DEFAULT
+
+    agent.set_permission_mode(PermissionMode.BYPASS)
+    assert agent.permission_mode == PermissionMode.BYPASS
+    assert checker.mode == PermissionMode.BYPASS
+
+
+# 验证无 permission_checker 时工具直接执行，保持向后兼容。
+# 构造无 checker 的 agent，工具调用后断言无 PermissionRequest 且工具执行成功。
+@pytest.mark.asyncio
+async def test_no_permission_checker_preserves_backward_compat() -> None:
+    tool = _MockWriteFile()
+    registry = ToolRegistry()
+    registry.register(tool)
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "WriteFile", {"file_path": "x"}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("Write file")
+
+    events = await _collect(agent.run(conversation))
+
+    assert not any(isinstance(e, PermissionRequest) for e in events)
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+    assert result_events[0].is_error is False
+    assert isinstance(events[-1], LoopComplete)
