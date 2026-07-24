@@ -1,0 +1,89 @@
+Screen {
+    background: #101719;
+    color: #d9e2e3;
+}
+
+#title-bar {
+    dock: top;
+    height: 1;
+    padding: 0 1;
+    background: #1b2c2f;
+    color: #f0c674;
+    text-style: bold;
+}
+
+#provider-select {
+    width: 100%;
+    height: 1fr;
+    align: center middle;
+}
+
+#select-label {
+    width: 100%;
+    text-align: center;
+    text-style: bold;
+}
+
+#provider-list {
+    width: 64;
+    height: auto;
+    max-height: 12;
+    margin: 1 2;
+}
+
+#chat-area {
+    height: 1fr;
+    padding: 1 2;
+}
+
+.user-message,
+.assistant-message,
+.assistant-markdown,
+.thinking-message,
+.error-message {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1;
+}
+
+.user-message {
+    border-left: solid #79c2c9;
+}
+
+.assistant-message,
+.assistant-markdown {
+    border-left: solid #c786a6;
+}
+
+.thinking-message {
+    color: #aebbc0;
+    border-left: solid #f0c674;
+}
+
+.error-message {
+    color: #ff9c9c;
+    border-left: solid #e36d6d;
+}
+
+#input-area {
+    dock: bottom;
+    height: auto;
+    max-height: 16;
+    padding: 0 1;
+    border-top: solid #335154;
+}
+
+#chat-input {
+    height: auto;
+    min-height: 3;
+    max-height: 9;
+    border: none;
+}
+
+#turn-status {
+    height: 1;
+    padding: 0 1;
+    color: #aebbc0;
+    border-top: solid #335154;
+}

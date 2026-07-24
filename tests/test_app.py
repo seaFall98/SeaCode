@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
+
+import pytest
+from textual.widgets import Button, OptionList
+
+from seacode.app import ChatInput, SeaCodeApp
+from seacode.client import (
+    LLMClient,
+    NetworkError,
+    StreamComplete,
+    StreamEvent,
+    TextDelta,
+    ThinkingDelta,
+)
+from seacode.config import ProviderConfig
+from seacode.conversation import Message
+
+
+# 提供可按回合返回事件或抛出错误的本地假客户端。
+class _FakeClient(LLMClient):
+    # 保存每个测试回合的预设结果。
+    def __init__(self, outcomes: list[list[StreamEvent] | Exception | _PartialFailure]) -> None:
+        self._outcomes = outcomes
+        self.requests: list[tuple[Message, ...]] = []
+
+    # 记录请求历史并交付预设事件，不连接真实 Provider。
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        del system
+        self.requests.append(tuple(messages))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if isinstance(outcome, _PartialFailure):
+            for event in outcome.events:
+                yield event
+            raise outcome.error
+        for event in outcome:
+            yield event
+
+
+# 表示已产生部分流事件后才失败的 Provider 回合。
+class _PartialFailure:
+    # 保存失败前事件和随后抛出的错误。
+    def __init__(self, events: list[StreamEvent], error: Exception) -> None:
+        self.events = events
+        self.error = error
+
+
+# 模拟在首字节前持续等待的 Provider 流。
+class _BlockingClient(LLMClient):
+    # 初始化用于控制等待状态的异步信号。
+    def __init__(self) -> None:
+        self.requests: list[tuple[Message, ...]] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    # 在测试释放前保持回合活动，用于验证输入锁定。
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        del system
+        self.requests.append(tuple(messages))
+        self.started.set()
+        await self.release.wait()
+        yield TextDelta("Done")
+        yield StreamComplete()
+
+
+# 创建用于 TUI 交互测试的无密钥 Provider 配置。
+def _provider(name: str = "test") -> ProviderConfig:
+    return ProviderConfig(
+        name=name,
+        protocol="openai-compat",
+        model="test-model",
+        base_url="https://api.example.test",
+        api_key="test-key",
+    )
+
+
+# 等待异步 Textual 事件处理器完成当前回合。
+async def _settle(pilot: Any) -> None:
+    await pilot.pause(0.05)
+    await pilot.pause(0.05)
+
+
+# 验证单 Provider 直接进入对话，Enter 提交且没有主要 Send 按钮。
+# 假流返回文本与完成事件，确保输入在回合结束后恢复。
+@pytest.mark.asyncio
+async def test_single_profile_streams_with_enter_and_has_no_send_button() -> None:
+    client = _FakeClient(
+        [
+            [
+                ThinkingDelta("First thought. "),
+                ThinkingDelta("Second thought."),
+                TextDelta("Hello"),
+                StreamComplete(input_tokens=2, output_tokens=1),
+            ]
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        assert input_widget.disabled is False
+        assert not app.query(Button)
+        assert "[=^.^=]" in str(app.query_one("#title-bar").render())
+        input_widget.load_text("Hi")
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert input_widget.disabled is False
+        assert client.requests == [(Message(role="user", content="Hi"),)]
+        assert "Ready" in str(app.query_one("#turn-status").render())
+        assert "First thought. Second thought." in str(
+            app.query_one(".thinking-message").render()
+        )
+
+
+# 验证 Shift+Enter 在输入框插入换行而不会提前发送。
+# 随后 Enter 应发送保留换行的同一条完整文本。
+@pytest.mark.asyncio
+async def test_shift_enter_inserts_newline_before_submit() -> None:
+    client = _FakeClient([[StreamComplete()]])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Line one")
+        input_widget.cursor_location = (0, len("Line one"))
+        await pilot.press("shift+enter")
+        input_widget.insert("Line two")
+
+        assert "\n" in input_widget.text
+        assert client.requests == []
+
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert client.requests == [
+            (Message(role="user", content="Line one\nLine two"),)
+        ]
+
+
+# 验证流失败后不完整回答不会进入下一次模型请求历史。
+# 第二次成功回合应可发送，并只携带新的用户输入。
+@pytest.mark.asyncio
+async def test_stream_error_recovers_without_polluting_conversation_history() -> None:
+    client = _FakeClient(
+        [
+            _PartialFailure([TextDelta("Partial answer")], NetworkError("network failure")),
+            [TextDelta("Recovered"), StreamComplete(input_tokens=1, output_tokens=1)],
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("First")
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert input_widget.disabled is False
+        input_widget.load_text("Second")
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert client.requests == [
+            (Message(role="user", content="First"),),
+            (Message(role="user", content="Second"),),
+        ]
+        assert "Ready" in str(app.query_one("#turn-status").render())
+
+
+# 验证等待首字节期间输入被锁定，不能建立第二个并发回合。
+# 阻塞流释放后恢复输入，证明状态机不会永久卡住。
+@pytest.mark.asyncio
+async def test_waiting_turn_prevents_duplicate_submission() -> None:
+    client = _BlockingClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("First")
+        await pilot.press("enter")
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+
+        assert input_widget.disabled is True
+        input_widget.load_text("Second")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert client.requests == [(Message(role="user", content="First"),)]
+
+        client.release.set()
+        await _settle(pilot)
+        assert input_widget.disabled is False
+
+
+# 验证多个配置先显示键盘可操作的选择控件。
+# 对话和输入区域在选择前保持隐藏，避免误用未选定的模型。
+@pytest.mark.asyncio
+async def test_multiple_profiles_begin_with_keyboard_selection() -> None:
+    client = _FakeClient([])
+    app = SeaCodeApp(
+        [_provider("first"), _provider("second")],
+        client_factory=lambda _: client,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert app.query_one(OptionList).display is True
+        assert app.query_one("#chat-area").display is False
+        assert app.query_one("#input-area").display is False
+
+
+# 验证连续成功和失败回合后的请求历史只包含完整回合。
+# 顺序覆盖两轮成功、一轮失败与下一轮成功的完整用户路径。
+@pytest.mark.asyncio
+async def test_end_to_end_history_survives_failure_and_continues() -> None:
+    client = _FakeClient(
+        [
+            [TextDelta("Answer one"), StreamComplete()],
+            [TextDelta("Answer two"), StreamComplete()],
+            NetworkError("network failure"),
+            [TextDelta("Answer four"), StreamComplete()],
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        for message in ("One", "Two", "Three", "Four"):
+            input_widget.load_text(message)
+            await pilot.press("enter")
+            await _settle(pilot)
+
+    assert client.requests == [
+        (Message("user", "One"),),
+        (
+            Message("user", "One"),
+            Message("assistant", "Answer one"),
+            Message("user", "Two"),
+        ),
+        (
+            Message("user", "One"),
+            Message("assistant", "Answer one"),
+            Message("user", "Two"),
+            Message("assistant", "Answer two"),
+            Message("user", "Three"),
+        ),
+        (
+            Message("user", "One"),
+            Message("assistant", "Answer one"),
+            Message("user", "Two"),
+            Message("assistant", "Answer two"),
+            Message("user", "Four"),
+        ),
+    ]

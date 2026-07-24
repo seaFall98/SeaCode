@@ -1,0 +1,8 @@
+# Copy this file to .seacode/config.local.yaml in a project directory.
+providers:
+  - name: primary
+    protocol: openai-compat
+    model: your-model-name
+    base_url: https://api.example.com
+    api_key: replace-with-your-key
+    thinking: false

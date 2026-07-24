@@ -1,0 +1,10 @@
+# 本地模型配置允许保存凭据，但绝不能进入版本控制。
+/.seacode/config.yaml
+/.seacode/config.local.yaml
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
