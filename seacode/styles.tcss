@@ -62,6 +62,14 @@ Screen {
     color: #ff9c9c;
 }
 
+.tool-block-loading {
+    color: #d9a441;
+}
+
+.tool-block-error {
+    color: #ff9c9c;
+}
+
 #input-area {
     dock: bottom;
     height: auto;

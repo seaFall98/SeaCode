@@ -34,8 +34,9 @@ class _FakeClient(LLMClient):
         self,
         messages: Sequence[Message],
         system: str,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        del system
+        del system, tools
         self.requests.append(tuple(messages))
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -69,8 +70,9 @@ class _BlockingClient(LLMClient):
         self,
         messages: Sequence[Message],
         system: str,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        del system
+        del system, tools
         self.requests.append(tuple(messages))
         self.started.set()
         await self.release.wait()
