@@ -46,10 +46,11 @@ class Message:
 class ConversationManager:
     """维护已完成回合的历史并支持单活动回合的暂存与回滚。"""
 
-    # 初始化完成历史和当前暂存回合。
+    # 初始化完成历史和当前暂存回合；env_injected 标记会话级上下文是否已注入。
     def __init__(self) -> None:
         self._messages: list[Message] = []
         self._pending_user: Message | None = None
+        self.env_injected: bool = False
 
     # 返回已经完成的消息，供测试和界面读取。
     @property
@@ -103,6 +104,26 @@ class ConversationManager:
     # 追加一条携带工具结果的用户消息，回灌给模型。
     def add_tool_results_message(self, tool_results: list[ToolResultBlock]) -> None:
         self._messages.append(Message(role="user", content="", tool_results=tool_results))
+
+    # 追加一条 system-reminder 包裹的 user 消息，用于轮次级提醒（Plan Mode/Hook/Mailbox）。
+    def add_system_reminder(self, content: str) -> None:
+        self._messages.append(
+            Message(
+                role="user",
+                content=f"<system-reminder>\n{content}\n</system-reminder>",
+            )
+        )
+
+    # 在历史头部插入会话级环境上下文；env_injected 标记确保只注入一次。
+    def inject_environment(self, context: str) -> None:
+        if not self.env_injected:
+            self._messages.insert(0, Message(role="user", content=context))
+            self.env_injected = True
+
+    # 替换整个历史并重置 env_injected，支持第 07 步压缩后重新注入环境上下文。
+    def replace_history(self, new_messages: list[Message]) -> None:
+        self._messages = new_messages
+        self.env_injected = False
 
     # 返回当前完整历史，供调度器发起请求使用。
     def get_messages(self) -> list[Message]:

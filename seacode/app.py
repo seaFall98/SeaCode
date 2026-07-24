@@ -40,7 +40,6 @@ from .client import (
 )
 from .config import ProviderConfig
 from .conversation import ConversationManager
-from .prompts import SYSTEM_PROMPT
 from .tools import create_default_registry
 from .tools.base import ToolResult
 
@@ -444,9 +443,10 @@ class SeaCodeApp(App[None]):
                 client=client,
                 registry=self._tool_registry,
                 protocol=provider.protocol,
+                work_dir=os.getcwd(),
                 max_iterations=self._max_steps,
             )
-            async for event in agent.run(self._conversation, SYSTEM_PROMPT):
+            async for event in agent.run(self._conversation):
                 if isinstance(event, StreamText):
                     answer += event.text
                     live_text = Text()
