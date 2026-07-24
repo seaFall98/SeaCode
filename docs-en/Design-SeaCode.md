@@ -1,202 +1,164 @@
 # SeaCode - Design Document
 
-## 1. Design Goals
+## 1. Design Scope
 
-SeaCode keeps model inference, tool side effects, user interface, and persistent state behind clear boundaries. The runtime should explain why a tool was executed, how its result shaped the next turn, and what recovery path remains after a failure.
+SeaCode is a terminal AI coding assistant that runs on the developer's machine. v1 uses one Python process: `sea` starts the application, loads configuration, and enters the Textual interface. Capabilities are added to one explicit module tree as the roadmap progresses.
 
-## 2. System Architecture
+This document records the stable v1 module ownership and behavior boundaries. It does not describe the TUI, CLI, or runtime as separate daemons, and it does not substitute a preselected layering framework for concrete code responsibilities.
+
+## 2. Runtime Model
 
 ```mermaid
 flowchart TB
-    User[Developer] --> TUI[sea-tui\nTextual TUI]
-    User --> CLI[sea\nCLI]
-    TUI --> Core[sea-core\nCore Runtime]
-    CLI --> Core
-    Core --> Session[Sessions and State]
-    Core --> Prompt[Prompt Pipeline]
-    Core --> Agent[Agent Loop]
-    Agent --> Provider[Provider Adapter]
-    Agent --> Registry[Tool Registry]
-    Agent --> Policy[Policy Engine]
-    Registry --> Builtin[Built-in Tools]
-    Registry --> Connectors[External Connections]
-    Policy --> Workspace[Workspace Boundary]
-    Session --> Disk[Local Persistence]
+    User[Developer] --> Sea[sea]
+    Sea --> Config[Configuration loading]
+    Sea --> App[SeaCodeApp]
+    App --> Conversation[ConversationManager]
+    App --> Client[LLMClient]
+    Client --> Provider[Model Provider]
+    App --> Agent[Agent]
+    Agent --> Tools[Tools and commands]
+    Agent --> Permissions[Permissions and sandbox]
+    Agent --> Context[Prompts, context, and memory]
+    Tools --> Workspace[Project workspace]
+    Context --> Storage[Local records]
 ```
 
-### 2.1 Component Responsibilities
+Milestone 01 enables only configuration, conversation, clients, and the TUI. Tools, the Agent Loop, permissions, persistence, and collaboration enter the established modules in later milestones; unfinished capabilities must not appear in the startup path or interface.
 
-| Component | Owns | Does not own |
-| --- | --- | --- |
-| `sea-core` | Lifecycle, Agent Loop, events, state coordination, and runtime assembly. | Terminal layout details. |
-| `sea-tui` | Input, streaming output, tool rows, permission dialogs, status, and scrollback. | Provider request construction or unchecked tool execution. |
-| `sea` | Startup, diagnostics, scripts, and non-interactive entry points. | Long-lived session state. |
-| Provider Adapter | Converts model protocols into unified messages and events. | Tool permission or workspace policy. |
-| Tool Registry | Registers tools, exports Schemas, resolves names, and exposes execution entry points. | Deciding whether a tool may run. |
-| Policy Engine | Dangerous commands, paths, rules, modes, and human approval. | Running tools directly. |
-| Session Store | Appended records, recovery state, compaction boundaries, and runtime metadata. | Interpreting the user's task. |
-
-## 3. Layers And Dependencies
-
-```mermaid
-graph LR
-    Interface[Interface Layer\nTUI / CLI] --> Application[Application Layer\nTurn / Task / Command]
-    Application --> Domain[Domain Layer\nAgent / Tool / Policy / Session]
-    Domain --> Ports[Ports\nProvider / Storage / Process / Connector]
-    Ports --> Adapters[Adapters\nSDK / Filesystem / Subprocess / MCP]
-```
-
-Dependencies flow from interface to application and domain layers, then reach external systems through ports. The domain layer does not directly depend on terminal widgets, model SDKs, or operating-system-specific APIs.
-
-### 3.1 Target Layout
+## 3. Module Layout
 
 ```text
 SeaCode/
-├── src/seacode/
-│   ├── agent/          # Agent Loop, events, task state
-│   ├── providers/      # Model protocol adapters
-│   ├── tools/          # Tool abstraction, registry, built-ins
-│   ├── policy/         # Permissions, rules, path protection
-│   ├── context/        # Prompts, result governance, compaction
-│   ├── sessions/       # Sessions and memory
-│   ├── extensions/     # Commands, skills, hooks
-│   ├── worktree/       # Git workspaces
-│   ├── teams/          # Subtasks and coordination
-│   ├── tui/            # Textual interface
-│   └── cli/            # sea command entry point
+├── .seacode/
+│   └── config.yaml.example
+├── seacode/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── agent.py
+│   ├── app.py
+│   ├── askuser_dialog.py
+│   ├── client.py
+│   ├── config.py
+│   ├── conversation.py
+│   ├── driver.py
+│   ├── permission_dialog.py
+│   ├── plan_dialog.py
+│   ├── prompts.py
+│   ├── remote.py
+│   ├── serialization.py
+│   ├── session_dialog.py
+│   ├── styles.tcss
+│   ├── teammate_tree.py
+│   ├── validator.py
+│   ├── web_content.py
+│   ├── agents/
+│   ├── commands/
+│   ├── context/
+│   ├── filehistory/
+│   ├── hooks/
+│   ├── mcp/
+│   ├── memory/
+│   ├── permissions/
+│   ├── sandbox/
+│   ├── skills/
+│   ├── teams/
+│   ├── tools/
+│   └── worktree/
 ├── tests/
 ├── pyproject.toml
+├── uv.lock
 └── .github/workflows/
 ```
 
-## 4. Core Models
+| Module | Responsibility |
+| --- | --- |
+| `__main__.py` | Command entry point, configuration loading, and application startup. |
+| `app.py` | Textual interface, input, conversation rendering, selectors, and screen state. |
+| `client.py` | Model protocols, streaming requests, unified events, usage, and error classification. |
+| `config.py` | Discovery, parsing, and validation of user, project, and local YAML configuration. |
+| `conversation.py` | Logical message history before protocol serialization. |
+| `agent.py` | Model turns, tool calls, stopping conditions, and Agent events. |
+| `tools/` | Built-in tools, registry, argument validation, and execution entry points. |
+| `permissions/`, `sandbox/` | Permission modes, rules, dangerous commands, and path boundaries. |
+| `context/`, `memory/`, `filehistory/` | System prompts, context governance, session memory, and file state. |
+| `commands/`, `skills/`, `hooks/` | Local commands, Markdown capability packages, and lifecycle extensions. |
+| `agents/`, `teams/`, `worktree/` | Subtasks, team coordination, and isolated Git workspaces. |
 
-### 4.1 One Agent Turn
+The layout defines long-term ownership; it does not imply that every file exists in every release. New capabilities first enter these established modules. Moving responsibility requires evidence that the existing boundary cannot carry the intended behavior.
 
-A turn contains user input, model events, tool calls, and a final result. Every tool call carries a stable identifier and every result references that identifier so retries, cancellation, recovery, and inspection can preserve pairing.
+## 4. Core Flows
+
+### 4.1 Conversation Turn
 
 ```mermaid
 sequenceDiagram
-    participant U as User
-    participant L as Agent Loop
+    participant U as Developer
+    participant A as SeaCodeApp
+    participant C as ConversationManager
+    participant L as LLMClient
     participant P as Provider
-    participant R as Tool Registry
-    participant G as Policy Engine
 
-    U->>L: Submit task
-    L->>P: Send system context, history, and tool Schemas
-    P-->>L: Text, tool, and usage events
-    L->>G: Check tool call
-    G-->>L: Allow, deny, or ask
-    L->>R: Execute approved tool
-    R-->>L: Structured result
-    L->>P: Feed tool call and result back
-    P-->>L: Final text or next tool calls
-    L-->>U: Events, state, result, and duration
+    U->>A: Enter and submit a message
+    A->>C: Record user message
+    A->>L: Request streaming response
+    L->>P: Protocol request
+    P-->>L: Text deltas, usage, or error
+    L-->>A: Unified stream events
+    A-->>U: Continuously render response
+    alt Successful completion
+        A->>C: Commit complete assistant message
+    else Request failure
+        A-->>U: Show sanitized error and restore input
+    end
 ```
 
-### 4.2 Event Model
+Errors and partial text may remain in the screen record, but they never become a complete assistant message for the next model request. One application instance has at most one active turn. It rejects duplicate submissions while streaming and restores input after completion.
 
-The interface consumes events without knowing how many provider requests the loop needed. Events cover at least:
+### 4.2 Tool Turn
 
-- text deltas and thinking state;
-- tool start, completion, result summaries, and errors;
-- iteration, input/output usage, and cache information;
-- approval, denial, cancellation, compaction, and session recovery;
-- turn completion, loop completion, and non-recoverable errors.
+Later Agent Loop milestones identify tool calls in a model response, request permission, execute approved tools, and feed structured results back to the model. Tool calls and results use stable identifiers. Cancellation, denial, and failure finish a call with an explainable result instead of removing the interface's recovery path.
 
-Events may carry session, turn, and tool-call correlation data, but never API keys or unsanitized sensitive configuration.
+## 5. Providers And Configuration
 
-## 5. Provider Adapters
+SeaCode supports two protocol families through three explicit paths:
 
-The Provider layer exposes a unified interface for model configuration, messages, tool Schemas, streaming events, and usage. An adapter owns protocol differences such as:
-
-- serializing system instructions and message roles;
-- encoding tool Schemas and tool results;
-- parsing text, thinking, and tool-call fragments;
-- classifying authentication, rate-limit, network, and context errors;
-- optional prompt-cache markers and context-window discovery.
-
-The Agent Loop must not branch on Provider names. Adding a Provider means implementing the adapter contract and adding protocol-level tests.
-
-## 6. Tools And Policy
-
-### 6.1 Tool Boundaries
-
-Tools are categorized as read-only, file-writing, or command execution. A tool entry point validates arguments and performs the actual work; the Policy Engine decides whether it may run before the entry point is reached.
-
-### 6.2 Policy Order
-
-```mermaid
-flowchart LR
-    Call[Tool call] --> Dangerous[Dangerous operation check]
-    Dangerous -->|Pass| Sandbox[Path and workspace check]
-    Sandbox -->|Pass| Rules[Rule matching]
-    Rules -->|No match| Mode[Permission mode]
-    Mode -->|Ask| Human[Human approval]
-    Rules -->|Allow| Execute[Execute]
-    Mode -->|Allow| Execute
-    Human -->|Allow| Execute
-    Dangerous -->|Deny| Deny[Structured denial result]
-    Sandbox -->|Deny| Deny
-    Rules -->|Deny| Deny
-    Human -->|Deny| Deny
-```
-
-Dangerous operations and explicit denials take precedence. Every denial becomes a tool result for the model and keeps the reason visible in the interface. Path checks resolve symbolic links; for new files they check the nearest existing ancestor to avoid false decisions.
-
-## 7. Context And Persistence
-
-### 7.1 Request Assembly
-
-Requests are assembled from stable and changing parts:
-
-1. Stable system instructions and tool descriptions.
-2. Current project environment, workspace state, and runtime information.
-3. Session history, tool results, and dynamic reminders.
-
-Stable content should remain byte-for-byte consistent. Changing content must not pollute cache prefixes or message roles. Reminders use a dedicated system-context channel instead of pretending to be user questions.
-
-### 7.2 Output Governance
-
-When a tool result exceeds a per-item or per-turn budget, the runtime saves the full content and keeps a fixed preview in the message. The preview includes original size, storage location, and the way to read it again. Once a decision is made, later turns reuse the same preview so history does not drift.
-
-### 7.3 Session Model
-
-Sessions use an append-friendly format for user messages, assistant messages, tool calls, tool results, and compaction boundaries. Recovery validates the message chain; damaged lines, unmatched calls, or over-limit records are skipped or rebuilt according to recovery rules rather than being pushed into the TUI as an unhandled exception.
-
-## 8. Extension System
-
-| Extension | Entry | Isolation |
+| `protocol` | Protocol path | Use |
 | --- | --- | --- |
-| Commands | `/help`, `/status`, `/plan`, and more | Local execution or fixed prompt injection |
-| Skills | Markdown capability packages | Main session or isolated task |
-| Hooks | Lifecycle events | Synchronous interception or asynchronous action |
-| External tools | Discovery and adaptation | Independent connection lifecycle |
-| Subagents | Task tools | Independent messages, permissions, and usage |
-| Worktrees | Git workspace management | Independent directory and branch |
-| Teams | Members, tasks, and messages | In-process or terminal backend |
+| `anthropic` | Messages API | Native or compatible Anthropic endpoints. |
+| `openai` | Responses API | Native OpenAI endpoints. |
+| `openai-compat` | Chat Completions API | Endpoints explicitly compatible with that format. |
 
-Extensions enter through stable registration and event interfaces; they do not directly alter the Agent Loop's core stopping conditions.
+Configuration is loaded in this order:
 
-## 9. Key Failure Boundaries
+1. `~/.seacode/config.yaml`
+2. `<project>/.seacode/config.yaml`
+3. `<project>/.seacode/config.local.yaml`
 
-| Failure | Handling |
+Later layers can replace the earlier Provider list. A profile uses `name`, `protocol`, `model`, `base_url`, `api_key`, and optional `thinking`. Real keys live only in untracked local configuration and never appear in the interface, logs, test data, or conversation body.
+
+## 6. TUI Constraints
+
+- Conversation is the primary surface; each status fact has one stable display location.
+- `Enter` submits and `Shift+Enter` inserts a newline; multiline editing does not depend on a Send button.
+- Streaming appends raw text first and applies Markdown after completion to avoid constant reflow.
+- Configuration errors are reported as sanitized startup messages; request errors preserve the application and restore input.
+- SeaCode uses its own name, copy, visual style, and original American Shorthair tabby mark. Brand assets must not displace the conversation area or change the interaction path.
+
+## 7. Safety And Failure Boundaries
+
+| Scenario | Behavior |
 | --- | --- |
-| Provider request fails | Emit an error event, preserve the session, and allow another submission. |
-| Tool arguments or execution fail | Produce a structured result and let the loop decide whether to continue. |
-| Tool times out | Stop the tool, record the timeout, then continue or stop according to loop policy. |
-| User cancels | Cancel the current task, complete unfinished call records, and return to idle. |
-| Permission denied | Return the reason as a result so the model can adjust. |
-| External connection fails | Isolate one connection while preserving other tools and the main session. |
-| Context is too large | Govern large results first, then summarize old messages while retaining recent text. |
-| Workspace has changes | Refuse cleanup and keep the directory and branch available for inspection. |
+| Missing or invalid configuration | Startup fails with a repairable error that contains no credentials. |
+| Provider authentication, rate-limit, network, or protocol error | Classified into an understandable interface event; the session remains usable. |
+| Tool arguments, execution, or permission failure | Produces a structured result for the Agent instead of crashing the process. |
+| Context or storage error | Handled with the recovery rule introduced by the relevant milestone and kept observable. |
+| Workspace with uncommitted changes | Cleanup preserves the workspace and changes by default. |
 
-## 10. Design Principles
+## 8. Design Principles
 
-- Make behavior verifiable before increasing automation.
-- Route side effects through explicit tool and policy boundaries.
-- Treat events as the contract between runtime and interface.
-- Treat persistence formats as product interfaces and provide compatibility handling when they change.
-- Make enhanced capabilities degradable so external services are never the source of core truth.
-- Use small, clear ports to isolate SDKs, terminals, filesystems, and process management.
+- Preserve observable user behavior before pursuing local optimization.
+- Keep module ownership clear without adding layers for their own sake.
+- Give configuration, protocols, conversation, interface, and side effects explicit homes.
+- Treat tests and recovery behavior as part of every new capability.
+- Make platform and Provider differences explainable, verifiable, and safely degradable.

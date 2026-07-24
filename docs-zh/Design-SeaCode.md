@@ -1,202 +1,164 @@
 # SeaCode - 设计文档
 
-## 1. 设计目标
+## 1. 设计范围
 
-SeaCode 的核心设计是把模型推理、工具副作用、用户界面和持久化状态放在清晰的边界内。运行时应该能够解释“为什么执行了这个工具”“工具结果如何影响下一轮”“发生失败后还能怎样继续”。
+SeaCode 是运行在开发者本机的终端 AI 编程助手。v1 采用单个 Python 进程：`sea` 负责启动、读取配置并进入 Textual 界面；功能随路线逐步加入同一个明确的模块树。
 
-## 2. 系统架构
+本设计记录 v1 的稳定模块归属和行为边界。它不把 TUI、CLI 或运行时描述为独立 daemon，也不以预设的分层框架替代实际代码职责。
+
+## 2. 运行模型
 
 ```mermaid
 flowchart TB
-    User[开发者] --> TUI[sea-tui\nTextual TUI]
-    User --> CLI[sea\nCLI]
-    TUI --> Core[sea-core\nCore Runtime]
-    CLI --> Core
-    Core --> Session[会话与状态]
-    Core --> Prompt[提示词管线]
-    Core --> Agent[Agent Loop]
-    Agent --> Provider[Provider Adapter]
-    Agent --> Registry[Tool Registry]
-    Agent --> Policy[Policy Engine]
-    Registry --> Builtin[内置工具]
-    Registry --> Connectors[外部工具连接]
-    Policy --> Workspace[工作区边界]
-    Session --> Disk[本地持久化]
+    User[开发者] --> Sea[sea]
+    Sea --> Config[配置加载]
+    Sea --> App[SeaCodeApp]
+    App --> Conversation[ConversationManager]
+    App --> Client[LLMClient]
+    Client --> Provider[模型 Provider]
+    App --> Agent[Agent]
+    Agent --> Tools[工具与命令]
+    Agent --> Permissions[权限与沙箱]
+    Agent --> Context[提示词、上下文与记忆]
+    Tools --> Workspace[项目工作区]
+    Context --> Storage[本地记录]
 ```
 
-### 2.1 组件职责
+第 01 步只启用配置、对话、客户端和 TUI。工具、Agent Loop、权限、持久化和协作能力在后续步骤进入图中的既定模块；尚未实现的能力不能出现在启动路径或界面中。
 
-| 组件 | 职责 | 不负责 |
-| --- | --- | --- |
-| `sea-core` | 生命周期、Agent Loop、事件、状态协调和运行时装配。 | 终端布局细节。 |
-| `sea-tui` | 输入、流式输出、工具行、权限对话框、状态栏和滚动历史。 | 直接构造 Provider 请求或执行未经策略检查的工具。 |
-| `sea` | 启动、诊断、脚本入口和非交互命令。 | 持有长期会话状态。 |
-| Provider Adapter | 将不同模型协议转换为统一消息和事件。 | 工具权限和工作区策略。 |
-| Tool Registry | 注册工具、导出 Schema、按名称查找和执行入口。 | 决定工具是否有权执行。 |
-| Policy Engine | 危险命令、路径边界、规则、权限模式和人工确认。 | 直接运行工具。 |
-| Session Store | 追加会话记录、恢复状态、压缩边界和运行元数据。 | 解释业务任务。 |
-
-## 3. 分层与依赖
-
-```mermaid
-graph LR
-    Interface[Interface Layer\nTUI / CLI] --> Application[Application Layer\nTurn / Task / Command]
-    Application --> Domain[Domain Layer\nAgent / Tool / Policy / Session]
-    Domain --> Ports[Ports\nProvider / Storage / Process / Connector]
-    Ports --> Adapters[Adapters\nSDK / Filesystem / Subprocess / MCP]
-```
-
-依赖方向从界面流向应用和领域，再通过端口连接外部系统。领域层不直接依赖终端控件、模型 SDK 或特定操作系统 API。
-
-### 3.1 目标目录
+## 3. 模块结构
 
 ```text
 SeaCode/
-├── src/seacode/
-│   ├── agent/          # Agent Loop、事件和任务状态
-│   ├── providers/      # 模型协议适配
-│   ├── tools/          # 工具抽象、注册和内置工具
-│   ├── policy/         # 权限、规则和路径保护
-│   ├── context/        # 提示词、结果治理和上下文压缩
-│   ├── sessions/       # 会话记录与记忆
-│   ├── extensions/     # 命令、技能和 Hook
-│   ├── worktree/       # Git 隔离工作区
-│   ├── teams/          # 子任务与团队协作
-│   ├── tui/            # Textual 界面
-│   └── cli/            # sea 命令入口
+├── .seacode/
+│   └── config.yaml.example
+├── seacode/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── agent.py
+│   ├── app.py
+│   ├── askuser_dialog.py
+│   ├── client.py
+│   ├── config.py
+│   ├── conversation.py
+│   ├── driver.py
+│   ├── permission_dialog.py
+│   ├── plan_dialog.py
+│   ├── prompts.py
+│   ├── remote.py
+│   ├── serialization.py
+│   ├── session_dialog.py
+│   ├── styles.tcss
+│   ├── teammate_tree.py
+│   ├── validator.py
+│   ├── web_content.py
+│   ├── agents/
+│   ├── commands/
+│   ├── context/
+│   ├── filehistory/
+│   ├── hooks/
+│   ├── mcp/
+│   ├── memory/
+│   ├── permissions/
+│   ├── sandbox/
+│   ├── skills/
+│   ├── teams/
+│   ├── tools/
+│   └── worktree/
 ├── tests/
 ├── pyproject.toml
+├── uv.lock
 └── .github/workflows/
 ```
 
-## 4. 核心模型
+| 模块 | 职责 |
+| --- | --- |
+| `__main__.py` | 命令行入口、配置加载和应用启动。 |
+| `app.py` | Textual 界面、输入、对话呈现、选择器和屏幕状态。 |
+| `client.py` | 模型协议、流式请求、统一事件、用量和错误分类。 |
+| `config.py` | 用户级、项目级和 local YAML 配置的发现、解析与校验。 |
+| `conversation.py` | 逻辑消息历史及其序列化前状态。 |
+| `agent.py` | 模型回合、工具调用、停止条件和 Agent 事件。 |
+| `tools/` | 内置工具、注册表、参数校验和执行入口。 |
+| `permissions/`、`sandbox/` | 权限模式、规则、危险命令与路径边界。 |
+| `context/`、`memory/`、`filehistory/` | 系统提示词、上下文治理、会话记忆和文件状态。 |
+| `commands/`、`skills/`、`hooks/` | 本地命令、Markdown 能力包和生命周期扩展。 |
+| `agents/`、`teams/`、`worktree/` | 子任务、团队协作与 Git 隔离工作区。 |
 
-### 4.1 一轮 Agent 工作
+目录表示长期职责，不表示每个版本都已实现全部文件。新增能力首先落入这里的既定模块；需要改变模块归属时必须先证明现有边界不足以承载行为。
 
-一轮工作由用户输入、模型事件、工具调用和最终结果组成。工具调用必须携带稳定的调用标识，工具结果必须引用该标识，确保重试、取消、恢复和审计时可以配对。
+## 4. 核心流程
+
+### 4.1 对话回合
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户
-    participant L as Agent Loop
+    participant U as 开发者
+    participant A as SeaCodeApp
+    participant C as ConversationManager
+    participant L as LLMClient
     participant P as Provider
-    participant R as Tool Registry
-    participant G as Policy Engine
 
-    U->>L: 提交任务
-    L->>P: 发送系统上下文、历史和工具 Schema
-    P-->>L: 文本/工具/用量事件
-    L->>G: 检查工具调用
-    G-->>L: 允许、拒绝或请求确认
-    L->>R: 执行已批准工具
-    R-->>L: 结构化结果
-    L->>P: 回灌工具调用与结果
-    P-->>L: 最终文本或下一组工具调用
-    L-->>U: 事件、状态、结果和耗时
+    U->>A: 输入消息并提交
+    A->>C: 记录用户消息
+    A->>L: 请求流式回复
+    L->>P: 协议请求
+    P-->>L: 文本增量、用量或错误
+    L-->>A: 统一流事件
+    A-->>U: 持续呈现回复
+    alt 成功完成
+        A->>C: 提交完整助手消息
+    else 请求失败
+        A-->>U: 显示脱敏错误并恢复输入
+    end
 ```
 
-### 4.2 事件模型
+错误和未完成片段可以保留在屏幕记录中，但不能作为完整助手消息进入下一次模型请求。界面一次只运行一个活动回合，流式期间拒绝重复提交，结束后恢复可输入状态。
 
-界面只消费事件，不需要知道循环实现细节是第几次请求。事件至少包括：
+### 4.2 工具回合
 
-- 文本增量和思考状态；
-- 工具开始、工具完成、结果摘要和错误；
-- 当前迭代、输入/输出用量和缓存信息；
-- 权限询问、拒绝、取消、压缩和会话恢复；
-- 回合完成、循环完成和不可恢复错误。
+后续 Agent Loop 将在一次模型回复中识别工具调用、请求权限、执行已批准工具并将结构化结果回灌模型。工具调用与结果使用稳定标识配对；取消、拒绝和失败都以可解释的结果结束当前调用，不让界面失去恢复路径。
 
-事件应包含会话、回合和工具调用关联信息，但不包含 API 密钥或未经脱敏的敏感配置。
+## 5. Provider 与配置
 
-## 5. Provider 适配
+SeaCode 支持两个协议家族和三条明确路径：
 
-Provider 层对上提供统一接口：配置模型、发送消息、声明工具、消费流式事件和读取用量。适配器负责协议差异，包括：
-
-- 系统提示词与消息角色的序列化；
-- 工具 Schema 和工具结果的协议格式；
-- 文本、思考、工具调用分片的解析；
-- 鉴权、限流、网络和上下文错误的分类；
-- 可选的提示词缓存标记和上下文窗口探测。
-
-Agent Loop 不应根据 Provider 名称分支。新增 Provider 只需要实现适配器契约，并补充协议级测试。
-
-## 6. 工具与策略
-
-### 6.1 工具边界
-
-工具分为只读、文件写入和命令执行三类。每个工具的执行入口只负责参数校验和实际工作；是否可以执行由 Policy Engine 在入口之前决定。
-
-### 6.2 策略顺序
-
-```mermaid
-flowchart LR
-    Call[工具调用] --> Dangerous[危险操作检查]
-    Dangerous -->|通过| Sandbox[路径与工作区检查]
-    Sandbox -->|通过| Rules[规则匹配]
-    Rules -->|未命中| Mode[权限模式]
-    Mode -->|Ask| Human[用户确认]
-    Rules -->|Allow| Execute[执行]
-    Mode -->|Allow| Execute
-    Human -->|允许| Execute
-    Dangerous -->|拒绝| Deny[结构化拒绝结果]
-    Sandbox -->|拒绝| Deny
-    Rules -->|拒绝| Deny
-    Human -->|拒绝| Deny
-```
-
-危险操作和明确拒绝优先；所有拒绝都转化为工具结果回传给模型，并在界面中保留原因。路径检查会解析符号链接，针对新文件检查最近的已存在祖先目录，避免路径不存在时产生错误判断。
-
-## 7. 上下文与持久化
-
-### 7.1 请求组装
-
-请求由稳定部分和变化部分组成：
-
-1. 稳定系统指令和工具描述。
-2. 当前项目环境、工作区状态和运行信息。
-3. 会话历史、工具调用结果和动态提醒。
-
-稳定部分应保持字节级一致，变化部分不得污染缓存或历史角色关系。补充提醒通过独立的系统上下文通道注入，不伪装成用户问题。
-
-### 7.2 输出治理
-
-工具结果超过单条或单轮预算时，运行时保存完整内容，只把固定预览放入消息。预览包含原始大小、保存位置和重新读取方式。一次决策完成后，后续回合复用相同预览，避免历史漂移。
-
-### 7.3 会话模型
-
-会话记录采用可追加格式保存用户消息、助手消息、工具调用、工具结果和压缩边界。恢复时校验消息链；遇到损坏行、未配对调用或超限记录，按可恢复规则跳过或重建，不把异常直接传播到 TUI。
-
-## 8. 扩展系统
-
-| 扩展 | 入口 | 隔离方式 |
+| `protocol` | 协议路径 | 用途 |
 | --- | --- | --- |
-| 命令 | `/help`、`/status`、`/plan` 等 | 本地执行或注入固定提示词 |
-| Skill | Markdown 能力包 | 主会话或独立任务 |
-| Hook | 生命周期事件 | 同步拦截或异步动作 |
-| 外部工具连接 | 工具发现与适配 | 独立连接生命周期 |
-| 子 Agent | 任务工具 | 独立消息、权限和用量状态 |
-| Worktree | Git 工作区管理 | 独立目录和分支 |
-| Team | 成员、任务和消息 | 进程内或终端后端 |
+| `anthropic` | Messages API | Anthropic 原生或兼容端点。 |
+| `openai` | Responses API | OpenAI 原生端点。 |
+| `openai-compat` | Chat Completions API | 明确兼容该格式的端点。 |
 
-扩展通过稳定的注册和事件接口接入，不直接修改 Agent Loop 的核心停止条件。
+配置按以下顺序加载：
 
-## 9. 关键故障边界
+1. `~/.seacode/config.yaml`
+2. `<项目目录>/.seacode/config.yaml`
+3. `<项目目录>/.seacode/config.local.yaml`
 
-| 故障 | 处理 |
+后层可替换前层 Provider 列表。profile 使用 `name`、`protocol`、`model`、`base_url`、`api_key` 和可选 `thinking` 字段。真实 key 只存在于未跟踪的本地配置；它不得出现在界面、日志、测试数据或会话正文中。
+
+## 6. TUI 设计约束
+
+- 对话是主界面，状态信息只在一个稳定位置显示一次。
+- `Enter` 提交，`Shift+Enter` 换行；多行编辑不依赖 Send 按钮。
+- 流式时先追加原始文本，完成后再定型 Markdown，避免不断重排。
+- 配置错误在启动前以脱敏文本报告；请求错误保留当前界面并恢复输入。
+- SeaCode 使用自己的名称、文案、视觉样式和原创美短虎斑猫标识；品牌资源不得挤压对话区或改变交互路径。
+
+## 7. 安全与故障边界
+
+| 场景 | 行为 |
 | --- | --- |
-| Provider 请求失败 | 发送错误事件，保留会话，允许再次提交。 |
-| 工具参数或执行失败 | 生成结构化结果回灌，不让单个工具终止循环。 |
-| 工具超时 | 终止当前工具，记录超时，按循环策略继续或停止。 |
-| 用户取消 | 取消当前任务，补齐未完成调用结果，回到空闲状态。 |
-| 权限拒绝 | 结果包含拒绝原因，模型可以调整方案。 |
-| 外部工具连接失败 | 隔离到单个连接，保留其它工具和主会话。 |
-| 上下文过长 | 先治理大结果，再摘要旧消息并保留近期原文。 |
-| 工作区有未提交变更 | 清理动作失败关闭，保留目录和分支供用户检查。 |
+| 配置缺失或无效 | 启动失败，报告可修复且不含凭据的错误。 |
+| Provider 鉴权、限流、网络或协议错误 | 分类为可理解的界面事件，当前会话保持可继续。 |
+| 工具参数、执行或权限失败 | 形成结构化结果，供 Agent 调整，而不是让进程崩溃。 |
+| 上下文或存储异常 | 在相应步骤按可恢复规则处理，保留可观察原因。 |
+| 工作区存在未提交修改 | 清理动作默认保留工作区与变更，避免丢失用户成果。 |
 
-## 10. 设计原则
+## 8. 设计原则
 
-- 先让行为可验证，再增加自动化程度。
-- 让副作用经过明确的工具和策略边界。
-- 把事件作为运行时与界面之间的契约。
-- 把持久化格式视为产品接口，升级时提供兼容处理。
-- 让增强能力可以降级，不让外部服务成为核心事实来源。
-- 用小而清晰的端口隔离 SDK、终端、文件系统和进程管理。
+- 先保持用户可观察行为，再进行局部优化。
+- 模块职责清晰，但不为抽象而增加中间层。
+- 配置、协议、会话、界面和副作用各有明确归属。
+- 每个新能力以测试和失败恢复作为交付的一部分。
+- 平台或 Provider 差异必须可解释、可验证，并提供安全降级。

@@ -1,48 +1,32 @@
 # SeaCode
 
-SeaCode is a local AI coding agent runtime for software development work. It combines model streaming, project tools, permission controls, context governance, and recoverable sessions in a terminal-first workflow.
+SeaCode is a local, terminal-first AI coding agent for developers who want a controllable path from a prompt to an observable result.
 
-## What It Does
+> Status: v1 is under active development. The public documents describe the stable v1 product and runtime contract; feature availability follows the [engineering roadmap](./docs-en/project_roadmap.md).
 
-- Connects to model Providers through a unified streaming interface.
-- Reads, edits, and verifies project files through structured tools.
-- Runs an event-driven Agent Loop with cancellation and safe stopping conditions.
-- Makes writes and commands visible through permission modes and workspace boundaries.
-- Preserves long-running work with context governance, sessions, and memory.
-- Supports reusable commands, Skills, Hooks, subagents, Git workspaces, and team coordination.
+## Product Direction
 
-## Architecture
+SeaCode starts with a focused conversation workflow and grows into a complete local coding agent:
+
+- Select a model profile from local YAML configuration.
+- Stream multi-turn conversations in a compact terminal interface.
+- Keep a failed request recoverable without losing the conversation.
+- Add project tools, permission checks, context management, sessions, commands, skills, hooks, isolated workspaces, and team coordination in ordered milestones.
+
+## Runtime Shape
 
 ```mermaid
 flowchart LR
-    User[Developer] --> TUI[sea-tui]
-    User --> CLI[sea]
-    TUI --> Core[sea-core]
-    CLI --> Core
-    Core --> Provider[Provider adapters]
-    Core --> Loop[Agent Loop]
-    Loop --> Tools[Tool registry]
-    Loop --> Policy[Permission policy]
-    Loop --> State[Sessions and context]
+    Developer --> Sea[sea]
+    Sea --> App[SeaCode application]
+    App --> Config[Local configuration]
+    App --> Conversation[Conversation state]
+    App --> Client[Protocol client]
+    Client --> Model[Model provider]
+    App -. later milestones .-> Agent[Agent loop and tools]
 ```
 
-## Technology
-
-- Python 3.12+
-- `uv`
-- Textual and Rich for the terminal interface
-- `pytest`, Ruff, and mypy for verification
-
-## Quick Start
-
-The standard runtime entry point is `sea`:
-
-```bash
-uv sync
-uv run sea
-```
-
-Configuration and troubleshooting are documented in the [Manual](./docs-en/Manual-SeaCode.md). The engineering roadmap contains 14 ordered milestones for the complete runtime.
+The runtime is a Python package named `seacode`; `sea` is its terminal entry point. It uses Python 3.12+, `uv`, Textual, Rich, pytest, Ruff, and mypy.
 
 ## Documentation
 
@@ -50,6 +34,7 @@ Configuration and troubleshooting are documented in the [Manual](./docs-en/Manua
 - [中文文档](./docs-zh/README.md)
 - [Product requirements](./docs-en/PRD-SeaCode.md)
 - [Design](./docs-en/Design-SeaCode.md)
+- [Manual](./docs-en/Manual-SeaCode.md)
 - [Engineering roadmap](./docs-en/project_roadmap.md)
 
 ## License

@@ -5,65 +5,84 @@
 | Item | Content |
 | --- | --- |
 | Product | SeaCode |
-| Roadmap scope | From a minimal conversation loop to a collaborative local coding runtime |
-| Delivery order | Fourteen bounded engineering milestones |
-| Technical baseline | Python 3.12, `uv`, Textual, pytest, Ruff, mypy |
-| Document role | Stable engineering map for maintainers and reviewers |
+| Scope | From multi-Provider conversation to a collaborative local AI coding assistant |
+| Delivery | Fourteen ordered, verifiable engineering milestones |
+| Technology | Python 3.12, `uv`, Textual, pytest, Ruff, mypy |
+| Document role | v1 module ownership, capability order, and quality gates |
 
-## 1. Engineering Goals
+## 1. Engineering Principles
 
-SeaCode is delivered by establishing a runnable loop first, then adding side effects, governance, and parallel execution. Every milestone needs a testable behavior boundary; later capabilities must not weaken the already verified contracts for conversation, tools, permissions, and persistence.
+SeaCode establishes a runnable conversation loop first, then adds tools, side-effect control, context governance, and collaboration in order. Each milestone adds one bounded capability and must not weaken already accepted configuration, conversation, permission, or recovery behavior.
 
-### 1.1 Definition Of Done
-
-- A clean environment installs dependencies and starts `sea`.
-- A user can configure a model and complete a multi-turn streaming conversation.
-- The Agent can execute tools, process results, request approval, and complete a real development task.
-- Context growth, tool failures, network errors, cancellation, and restart recovery have verifiable behavior.
-- Key capabilities have automated tests, static checks, and reproducible acceptance evidence.
-- TUI, CLI, and Core Runtime communicate through stable interfaces with clear extension boundaries.
+v1 uses one stable Python package layout. Directories define module ownership; they are not a checklist that every milestone must populate immediately.
 
 ## 2. Engineering Layout
 
 ```text
 SeaCode/
-├── src/seacode/
-│   ├── agent/          # Loop, events, task state
-│   ├── providers/      # Provider adapters
-│   ├── tools/          # Tool abstraction and executors
-│   ├── policy/         # Permissions and safety policy
-│   ├── context/        # Prompts and context governance
-│   ├── sessions/       # Sessions and memory
-│   ├── extensions/     # Commands, skills, hooks
-│   ├── worktree/       # Git workspaces
-│   ├── teams/          # Subtasks and teams
-│   ├── tui/            # Textual interface
-│   └── cli/            # sea entry point
+├── .seacode/
+│   └── config.yaml.example
+├── seacode/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── agent.py
+│   ├── app.py
+│   ├── askuser_dialog.py
+│   ├── client.py
+│   ├── config.py
+│   ├── conversation.py
+│   ├── driver.py
+│   ├── permission_dialog.py
+│   ├── plan_dialog.py
+│   ├── prompts.py
+│   ├── remote.py
+│   ├── serialization.py
+│   ├── session_dialog.py
+│   ├── styles.tcss
+│   ├── teammate_tree.py
+│   ├── validator.py
+│   ├── web_content.py
+│   ├── agents/
+│   ├── commands/
+│   ├── context/
+│   ├── filehistory/
+│   ├── hooks/
+│   ├── mcp/
+│   ├── memory/
+│   ├── permissions/
+│   ├── sandbox/
+│   ├── skills/
+│   ├── teams/
+│   ├── tools/
+│   └── worktree/
 ├── tests/
 ├── pyproject.toml
+├── uv.lock
 ├── .github/workflows/
 ├── docs-zh/
 └── docs-en/
 ```
 
-## 3. Fourteen Delivery Milestones
+New functionality first uses these established modules. v1 does not split the same responsibility into extra runtime layers or parallel subpackages. A structural change requires behavior tests and an explicit design reason.
 
-| No. | Milestone | Delivery focus | Primary acceptance |
-| --- | --- | --- | --- |
-| 01 | Multi-Provider conversation | Configuration, protocol adapters, streaming, TUI, multi-turn history | Stable text exchange, recoverable errors, live and final duration. |
-| 02 | Tool system | Tool abstraction, registry, file operations, commands, search | Correct Schema injection, structured results, feed-back of failures. |
-| 03 | Agent Loop | ReAct loop, stopping conditions, events, cancellation, grouped execution | Continuous tool use until completion with valid history. |
-| 04 | System prompt pipeline | Modular instructions, environment context, dynamic reminders, cache stability | Stable and changing content are separated; mode reminders work by turn. |
-| 05 | Permissions and sandbox | Dangerous commands, paths, rules, modes, human approval | Explainable denial, blocked escapes, approval without session loss. |
-| 06 | External tool connections | Discovery, stdio/HTTP connections, adaptation, lifecycle | One failed connection does not affect others; existing policy is reused. |
-| 07 | Context governance | Large-result storage, stable previews, summaries, emergency recovery | Long tasks survive oversized results and a single context overflow. |
-| 08 | Sessions and memory | Recoverable records, project instructions, automatic memory, session management | History resumes, instruction priority is clear, damaged records degrade safely. |
-| 09 | Command framework | Registry, aliases, completion, status, and session commands | Local commands are predictable and do not consume model calls. |
-| 10 | Skill system | Markdown packages, progressive loading, main and isolated execution | Skills are discoverable, load on demand, accept arguments, and reload. |
-| 11 | Lifecycle hooks | Events, conditions, actions, interception, asynchronous execution | Configuration errors are visible; side failures do not block the main flow by default. |
-| 12 | Subagents | Role definitions, independent context, foreground/background tasks, notifications | Subtasks run, can be queried and stopped, and cannot expand tools without bounds. |
-| 13 | Git workspaces | Create, enter, exit, cleanup, setup, change protection | Changed workspaces are kept and runtime state can be recovered. |
-| 14 | Agent teams | Members, tasks, mailboxes, coordination backends, coordinator mode | Agents communicate safely, synchronize state, and produce inspectable work. |
+## 3. Fourteen Milestones
+
+| No. | Milestone | Primary modules | Delivery focus | Primary acceptance |
+| --- | --- | --- | --- | --- |
+| 01 | Multi-Provider conversation | `config.py`, `client.py`, `conversation.py`, `app.py` | Configuration, streaming, TUI, multi-turn history | Stable text exchange, recoverable errors, and current-turn duration. |
+| 02 | Tool system | `tools/` | Tool abstraction, registry, file operations, commands, and search | Correct Schema injection, structured results, and failure feedback. |
+| 03 | Agent Loop | `agent.py` | Turns, stopping conditions, events, and cancellation | Continuous tool use until completion with valid history. |
+| 04 | System prompt pipeline | `prompts.py`, `context/` | Modular instructions, environment facts, and dynamic reminders | Stable and changing content remain separate. |
+| 05 | Permissions and sandbox | `permissions/`, `sandbox/` | Dangerous commands, paths, rules, modes, and approval | Explainable denial, blocked escapes, and approval without session loss. |
+| 06 | External tool connections | `mcp/` | Discovery, stdio/HTTP connections, and lifecycle | One failed connection does not affect other tools. |
+| 07 | Context governance | `context/` | Large-result storage, stable previews, summaries, and recovery | Long tasks handle large results and context limits. |
+| 08 | Sessions and memory | `memory/`, `serialization.py`, `filehistory/` | Recoverable records, project instructions, and memory | History resumes and damaged records degrade safely. |
+| 09 | Command framework | `commands/` | Registry, aliases, completion, status, and session commands | Local commands are predictable and do not consume model calls. |
+| 10 | Skill system | `skills/` | Markdown packages, progressive loading, and isolated execution | Skills are discoverable, load on demand, accept arguments, and reload. |
+| 11 | Lifecycle hooks | `hooks/` | Events, conditions, actions, interception, and async execution | Configuration errors are visible and ordinary failures do not block the main flow. |
+| 12 | Subagents | `agents/` | Roles, independent context, tasks, and notifications | Subtasks can run, be queried, and stopped with bounded permissions. |
+| 13 | Git workspaces | `worktree/` | Create, enter, exit, cleanup, and change protection | Uncommitted changes are not removed automatically. |
+| 14 | Agent teams | `teams/` | Members, tasks, mailboxes, and coordination backends | Agents communicate safely and synchronize state. |
 
 ## 4. Milestone Dependencies
 
@@ -80,69 +99,46 @@ flowchart LR
     M09 --> M10[10 Skills]
     M03 --> M11[11 Hooks]
     M03 --> M12[12 Subagents]
-    M12 --> M13[13 Workspaces]
+    M12 --> M13[13 Worktrees]
     M12 --> M14[14 Teams]
     M13 --> M14
 ```
 
-Dependencies describe capability prerequisites, not a limit on preparing tests early. Every milestone adds behavior tests before integrating a new module; cross-milestone changes must show that existing events, history, and permission semantics still hold.
+Dependencies describe capability prerequisites. Each milestone first adds behavior tests for its capability; cross-milestone changes must show that existing user paths have not regressed.
 
-## 5. Architecture Evolution
-
-### 5.1 Foundational Runtime
-
-Milestones 01 through 03 establish Core Runtime, Provider adapters, the tool registry, and an event-driven Agent Loop. The result is a complete loop of asking, calling tools, receiving results, requesting again, and answering.
-
-### 5.2 Controlled Runtime
-
-Milestones 04 through 08 address prompt stability, permission safety, external connections, context budgets, sessions, and memory. The goal is a long-running workflow that remains explainable, recoverable, and governable.
-
-### 5.3 Composable Runtime
-
-Milestones 09 through 11 provide commands, Skills, and Hooks. Fixed operations, reusable procedures, and lifecycle automation become extensions with stable surfaces instead of special cases inside the core loop.
-
-### 5.4 Collaborative Runtime
-
-Milestones 12 through 14 add subagents, Git workspaces, and teams. The focus is independent state, narrowed permissions, change protection, reliable messages, and observable task progress.
-
-## 6. Quality Gates
+## 5. Quality Gates
 
 Every milestone should pass:
 
 ```bash
 uv sync
-uv run ruff check src tests
-uv run mypy src
+uv run ruff check seacode tests
+uv run mypy seacode
 uv run pytest tests/ -v
 ```
 
-Add focused verification according to risk:
-
 | Risk | Focused verification |
 | --- | --- |
-| Provider differences | Record request shapes and streaming events; verify error classification per protocol. |
-| Tool side effects | Use a temporary workspace to verify files, commands, timeouts, and truncation. |
-| Permission boundaries | Cover dangerous commands, symbolic links, precedence, and human denial. |
-| Persistence | Simulate interruption, damaged lines, recovery, compaction boundaries, and duplicate writes. |
-| Parallel tasks | Verify cancellation, locks, message order, and workspace change protection. |
-| TUI | Verify narrow terminals, streaming input state, scrollback, and clean exit. |
+| Provider differences | Cover request shape, stream events, usage, and error classification. |
+| Tool side effects | Verify files, commands, timeouts, and result truncation in a temporary workspace. |
+| Permission boundaries | Cover dangerous commands, symbolic links, rule precedence, and human denial. |
+| Persistence | Simulate interruption, damaged records, recovery, compaction boundaries, and duplicate writes. |
+| Parallel work | Verify cancellation, message order, and workspace change protection. |
+| TUI | Verify narrow terminals, Enter submission, streaming input state, scrolling, and clean exit. |
 
-## 7. Risks And Responses
+Live Provider requests are local smoke tests only. Automated tests use credential-free clients or recorded protocol data.
+
+## 6. Risks And Responses
 
 | Risk | Impact | Response |
 | --- | --- | --- |
-| Provider behavior differs | Streaming, tool calls, or usage fields diverge | Isolate differences in adapters and keep protocol-level tests and fallback fields. |
-| Agent loop runs away | Excess time or cost | Iteration limits, unknown-tool circuit breakers, cancellation, usage, and timeouts. |
-| Automated changes exceed scope | Data loss or poor reviewability | Permission modes, workspace boundaries, dangerous-operation protection, and isolation. |
-| Context grows too quickly | Failed requests or cache misses | Large-result governance, stable previews, summaries, and recent-text retention. |
-| External connection is unavailable | Tool discovery or execution fails | Isolated connections, reconnect behavior, clear errors, and capability degradation. |
-| Parallel workspace has changes | Cleanup loses work | Check uncommitted changes and new commits; keep the workspace by default. |
-| Terminal differences | TUI layout or key bindings fail | Capability detection, narrow layout, exit cleanup, and CLI diagnostics. |
+| Provider behavior differs | Stream parsing, tool calls, or usage fields diverge | Isolate differences in `client.py` and retain protocol tests. |
+| Agent Loop runs away | Time or cost becomes unbounded | Use iteration limits, cancellation, unknown-tool protection, and clear state. |
+| Automated changes exceed scope | Data loss or poor reviewability | Use permission modes, path boundaries, dangerous-operation protection, and workspace isolation. |
+| Context grows too quickly | Requests fail or history becomes inaccurate | Use large-result governance, stable previews, summaries, and recent text. |
+| External connection is unavailable | Tool discovery or execution fails | Isolate one connection, show clear errors, and degrade capability. |
+| Terminal differences | Layout or key bindings fail | Test narrow layouts, stable key bindings, and cleanup on exit. |
 
-## 8. Evolution After Completion
+## 7. Evolution After v1
 
-- Richer model capability discovery, cost reporting, and latency analysis.
-- Visual task dependencies, session timelines, and tool-call details.
-- Stronger container and remote-execution isolation.
-- Indexing, retrieval, and change-impact analysis for large codebases.
-- Team policy management, audit trails, and collaboration reports.
+After v1 is complete, SeaCode can evaluate independent architectural work: richer model diagnostics, task timelines, remote execution isolation, large-codebase indexing, and a runtime rewrite using DeepAgents. Any later rewrite must first preserve the accepted v1 user behavior.
