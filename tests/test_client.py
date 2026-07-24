@@ -12,6 +12,7 @@ from seacode.client import (
     OpenAICompatClient,
     StreamComplete,
     TextDelta,
+    ThinkingComplete,
     ThinkingDelta,
     create_client,
 )
@@ -155,7 +156,9 @@ async def test_openai_compat_client_uses_chat_completions_protocol() -> None:
     chunk = SimpleNamespace(
         choices=[
             SimpleNamespace(
-                delta=SimpleNamespace(content="Hello", reasoning_content="Reasoning"),
+                delta=SimpleNamespace(
+                    content="Hello", reasoning_content="Reasoning", tool_calls=None
+                ),
                 finish_reason="stop",
             )
         ],
@@ -166,7 +169,12 @@ async def test_openai_compat_client_uses_chat_completions_protocol() -> None:
 
     events = await _events(client)
 
-    assert [type(event) for event in events] == [TextDelta, ThinkingDelta, StreamComplete]
+    assert [type(event) for event in events] == [
+        TextDelta,
+        ThinkingDelta,
+        ThinkingComplete,
+        StreamComplete,
+    ]
     request = fake.chat.completions.request
     assert request is not None
     assert request["messages"][0] == {"role": "system", "content": "System prompt"}

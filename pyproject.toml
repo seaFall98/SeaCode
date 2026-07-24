@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.47.0",
     "openai>=1.60.0",
+    "pydantic>=2.0",
     "pyyaml>=6.0",
     "rich>=13.0",
     "textual>=2.1.0",
