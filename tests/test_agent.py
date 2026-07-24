@@ -12,6 +12,7 @@ from seacode.agent import (
     Agent,
     ErrorEvent,
     LoopComplete,
+    MCPConnectEvent,
     PermissionRequest,
     PermissionResponse,
     RetryEvent,
@@ -1103,3 +1104,229 @@ async def test_no_permission_checker_preserves_backward_compat() -> None:
     assert len(result_events) == 1
     assert result_events[0].is_error is False
     assert isinstance(events[-1], LoopComplete)
+
+
+# ---------------------------------------------------------------------------
+# batch06：MCP 集成测试
+# ---------------------------------------------------------------------------
+
+
+# 带可控 register_all_tools 的假 MCPManager，返回预设 ConnectResult。
+class _FakeMCPManager:
+    def __init__(
+        self,
+        tools: list[Tool] | None = None,
+        servers: list[Any] | None = None,
+        errors: list[str] | None = None,
+    ) -> None:
+        from seacode.mcp.manager import ConnectResult, ServerInfo
+
+        self._result = ConnectResult(
+            tools=tools or [],
+            servers=servers or [ServerInfo(name="fake-server", instructions="")],
+            errors=errors or [],
+        )
+        self.register_calls = 0
+
+    async def register_all_tools(self, registry: ToolRegistry) -> Any:
+        self.register_calls += 1
+        for tool in self._result.tools:
+            registry.register(tool)
+        return self._result
+
+
+# 带 should_defer=True 的测试工具，用于验证延迟工具 reminder 注入。
+class _DeferredTool(Tool):
+    name = "mcp_fake_search"
+    description = "Deferred MCP tool for agent tests."
+    params_model = _MockParams
+    category = ToolCategory.SYSTEM
+    should_defer = True
+
+    async def execute(self, params: BaseModel) -> ToolResult:
+        return ToolResult(content="deferred ok")
+
+
+# 验证 Agent 装配 mcp_manager 时自动注册 ToolSearchTool。
+def test_agent_with_mcp_registers_tool_search() -> None:
+    registry = ToolRegistry()
+    manager = _FakeMCPManager()
+    Agent(
+        client=_FakeClient([]),
+        registry=registry,
+        protocol="anthropic",
+        mcp_manager=manager,
+    )
+
+    assert registry.get("ToolSearch") is not None
+
+
+# 验证 Agent 无 mcp_manager 时不注册 ToolSearchTool。
+def test_agent_without_mcp_does_not_register_tool_search() -> None:
+    registry = ToolRegistry()
+    Agent(
+        client=_FakeClient([]),
+        registry=registry,
+        protocol="anthropic",
+    )
+
+    assert registry.get("ToolSearch") is None
+
+
+# 验证 run 首轮发射 MCPConnectEvent 携带连接摘要。
+@pytest.mark.asyncio
+async def test_run_emits_mcp_connect_event() -> None:
+    registry = ToolRegistry()
+    manager = _FakeMCPManager(
+        tools=[_DeferredTool()],
+        errors=["MCP server 'broken': connection refused"],
+    )
+    client = _FakeClient([_text_stream("Done")])
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        mcp_manager=manager,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+
+    events = await _collect(agent.run(conversation))
+
+    mcp_events = [e for e in events if isinstance(e, MCPConnectEvent)]
+    assert len(mcp_events) == 1
+    event = mcp_events[0]
+    assert event.server_count == 1
+    assert event.tool_count == 1
+    assert len(event.errors) == 1
+    assert "broken" in event.errors[0]
+
+
+# 验证 MCPConnectEvent 只在首轮发射一次，多轮不重复。
+@pytest.mark.asyncio
+async def test_mcp_connect_event_emitted_only_once() -> None:
+    registry = ToolRegistry()
+    manager = _FakeMCPManager()
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "ToolSearch", {"query": "select:none"}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        mcp_manager=manager,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+
+    events = await _collect(agent.run(conversation))
+
+    mcp_events = [e for e in events if isinstance(e, MCPConnectEvent)]
+    assert len(mcp_events) == 1
+    assert manager.register_calls == 1
+
+
+# 验证延迟工具存在时每轮注入 deferred tool names reminder。
+@pytest.mark.asyncio
+async def test_deferred_tool_reminder_injected() -> None:
+    registry = ToolRegistry()
+    manager = _FakeMCPManager(tools=[_DeferredTool()])
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "ToolSearch", {"query": "select:none"}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        mcp_manager=manager,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+
+    await _collect(agent.run(conversation))
+
+    # reminder 作为 system-reminder 包裹的 user 消息注入对话历史。
+    reminder_msgs = [
+        m for m in conversation.messages
+        if "deferred tools are available" in m.content
+    ]
+    assert len(reminder_msgs) >= 1
+    assert "mcp_fake_search" in reminder_msgs[0].content
+
+
+# 验证系统提示词在 MCP 启用时包含 ToolSearch 段落。
+@pytest.mark.asyncio
+async def test_system_prompt_includes_tool_search_section_when_mcp_enabled() -> None:
+    registry = ToolRegistry()
+    manager = _FakeMCPManager()
+    client = _FakeClient([_text_stream("Done")])
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        mcp_manager=manager,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+
+    await _collect(agent.run(conversation))
+
+    # systems_passed 记录每轮系统提示词；首轮应包含 Deferred tool discovery 段。
+    assert any(
+        "Deferred tool discovery" in s for s in client.systems_passed
+    )
+
+
+# 验证系统提示词在无 MCP 时不包含 ToolSearch 段落。
+@pytest.mark.asyncio
+async def test_system_prompt_excludes_tool_search_section_without_mcp() -> None:
+    registry = ToolRegistry()
+    client = _FakeClient([_text_stream("Done")])
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+
+    await _collect(agent.run(conversation))
+
+    assert all(
+        "Deferred tool discovery" not in s for s in client.systems_passed
+    )
+
+
+# 验证 MCP 服务器 instructions 注入对话历史供模型参考。
+@pytest.mark.asyncio
+async def test_mcp_server_instructions_injected_to_conversation() -> None:
+    from seacode.mcp.manager import ServerInfo
+
+    registry = ToolRegistry()
+    manager = _FakeMCPManager(
+        servers=[ServerInfo(name="fs", instructions="Use UTF-8 paths only")]
+    )
+    client = _FakeClient([_text_stream("Done")])
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        mcp_manager=manager,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Hi")
+
+    await _collect(agent.run(conversation))
+
+    instruction_msgs = [
+        m for m in conversation.messages
+        if "MCP server 'fs' instructions" in m.content
+    ]
+    assert len(instruction_msgs) == 1
+    assert "Use UTF-8 paths only" in instruction_msgs[0].content

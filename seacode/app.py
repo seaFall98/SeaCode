@@ -24,6 +24,7 @@ from .agent import (
     Agent,
     ErrorEvent,
     LoopComplete,
+    MCPConnectEvent,
     PermissionRequest,
     RetryEvent,
     StreamText,
@@ -41,8 +42,9 @@ from .client import (
     RateLimitError,
     create_client,
 )
-from .config import ProviderConfig, SandboxAppConfig
+from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig
 from .conversation import ConversationManager
+from .mcp import MCPManager
 from .permission_dialog import InlinePermissionWidget
 from .permissions import (
     DangerousCommandDetector,
@@ -331,6 +333,7 @@ class SeaCodeApp(App[None]):
         client_factory: Callable[[ProviderConfig], LLMClient] = create_client,
         max_steps: int = 100,
         sandbox_cfg: SandboxAppConfig | None = None,
+        mcp_servers: tuple[MCPServerConfig, ...] | list[MCPServerConfig] | None = None,
     ) -> None:
         super().__init__()
         self._providers = tuple(providers)
@@ -350,6 +353,13 @@ class SeaCodeApp(App[None]):
         self._permission_mode: PermissionMode | None = None
         # 待回复的权限请求；HITL 弹窗期间持有，回复后清空。
         self._pending_permission: PermissionRequest | None = None
+        # MCP 管理器；加载配置后在 Agent.run 首轮批量连接，无配置时为 None。
+        self._mcp_manager: MCPManager | None = None
+        if mcp_servers:
+            self._mcp_manager = MCPManager()
+            self._mcp_manager.load_configs(list(mcp_servers))
+        # MCP 连接摘要；首轮 Agent.run 通过 MCPConnectEvent 回填，供状态栏展示。
+        self._mcp_summary: str = ""
 
     # 生成三行品牌标题，保留终端对话的既定信息层级。
     @staticmethod
@@ -382,6 +392,7 @@ class SeaCodeApp(App[None]):
                 yield Static("Preparing configuration", id="turn-status")
                 yield Static("", id="model-label")
                 yield Static("", id="mode-label")
+                yield Static("", id="mcp-label")
 
     # 根据 Provider 数量进入选择状态或直接准备单一配置。
     def on_mount(self) -> None:
@@ -581,6 +592,7 @@ class SeaCodeApp(App[None]):
                 work_dir=os.getcwd(),
                 max_iterations=self._max_steps,
                 permission_checker=self._permission_checker,
+                mcp_manager=self._mcp_manager,
             )
             async for event in agent.run(self._conversation):
                 if isinstance(event, StreamText):
@@ -624,6 +636,13 @@ class SeaCodeApp(App[None]):
                     await chat.mount(widget)
                     chat.scroll_end(animate=False)
                     input_widget.disabled = True
+                elif isinstance(event, MCPConnectEvent):
+                    # MCP 批量连接完成：刷新状态栏摘要，连接错误以系统消息展示。
+                    self._mcp_summary = self._format_mcp_summary(event)
+                    self._refresh_mcp_status()
+                    if event.errors:
+                        for err in event.errors:
+                            await self._show_system_message(f"MCP: {err}")
                 elif isinstance(event, ErrorEvent):
                     await self._append_error(event.message)
                 elif isinstance(event, TurnComplete):
@@ -727,3 +746,26 @@ class SeaCodeApp(App[None]):
     # 在唯一状态栏位置更新当前回合状态、耗时和用量。
     def _set_status(self, text: str) -> None:
         self.query_one("#turn-status", Static).update(Text(text))
+
+    # 把 MCPConnectEvent 转为状态栏可展示的简短摘要文本。
+    # 连接成功时显示服务器数与工具数；有错误时附加错误数；无配置时返回空串。
+    def _format_mcp_summary(self, event: MCPConnectEvent) -> str:
+        parts: list[str] = []
+        if event.server_count:
+            parts.append(f"{event.server_count} MCP server(s)")
+        if event.tool_count:
+            parts.append(f"{event.tool_count} tool(s)")
+        if event.errors:
+            parts.append(f"{len(event.errors)} error(s)")
+        return " · ".join(parts)
+
+    # 把当前 MCP 摘要刷新到状态栏 mcp-label；无摘要时清空。
+    def _refresh_mcp_status(self) -> None:
+        try:
+            label = self.query_one("#mcp-label", Static)
+        except Exception:
+            return
+        if self._mcp_summary:
+            label.update(Text(f"⟂ {self._mcp_summary}", style="#a3be8c"))
+        else:
+            label.update(Text(""))

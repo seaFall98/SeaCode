@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlsplit
@@ -16,6 +17,9 @@ _ENV_KEY_NAMES: Final = {
     "openai": "OPENAI_API_KEY",
     "openai-compat": "OPENAI_API_KEY",
 }
+
+# ${VAR} 环境变量占位符的正则；未定义变量保留原字面量。
+_ENV_VAR_RE: Final = re.compile(r"\$\{([^}]+)\}")
 
 
 class ConfigError(Exception):
@@ -41,6 +45,27 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
+class MCPServerConfig:
+    """单个 MCP 服务器的连接配置：command/args 走 stdio，url/headers 走 HTTP。
+
+    command 与 url 二选一：有 command 走 stdio 子进程，有 url 走 Streamable HTTP。
+    env 中的 ${VAR} 在连接时展开；headers 中的 ${VAR} 同样展开（用于鉴权令牌）。
+    """
+
+    name: str
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+    # 有 command 走 stdio；否则走 HTTP。
+    @property
+    def is_stdio(self) -> bool:
+        return self.command is not None
+
+
+@dataclass(frozen=True)
 class SandboxAppConfig:
     """OS 级沙箱启用配置：enabled 控制挂载，auto_allow 控制 Layer 1c 联动。
 
@@ -61,6 +86,27 @@ class AppConfig:
     providers: tuple[ProviderConfig, ...]
     # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，三层合并任一层开启即开启。
     sandbox: SandboxAppConfig = SandboxAppConfig()
+    # MCP 服务器配置列表；三层合并按 name 去重覆盖（同 name 替换、新 name 追加）。
+    mcp_servers: tuple[MCPServerConfig, ...] = ()
+
+
+# 展开 ${VAR} 占位符；未定义变量保留原字面量，便于发现配置错误。
+def resolve_env_vars(value: str) -> str:
+    return _ENV_VAR_RE.sub(
+        lambda m: os.environ.get(m.group(1), m.group(0)), value
+    )
+
+
+# 构造子进程环境：只注入 PATH 与显式声明的 env，不继承 SeaCode 全部环境。
+# PATH 注入保证 npx 等命令可发现；不注入 SEA_*、API_KEY 等敏感变量。
+def build_child_env(declared_env: dict[str, str] | None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    path = os.environ.get("PATH", "")
+    if path:
+        env["PATH"] = path
+    for key, value in (declared_env or {}).items():
+        env[key] = resolve_env_vars(value)
+    return env
 
 
 # 返回 SeaCode 用户级与项目级配置的固定发现顺序。
@@ -98,7 +144,71 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
     if len(names) != len(set(names)):
         raise ConfigError(f"Provider names must be unique: {path}")
     sandbox = _parse_sandbox(raw.get("sandbox"), path)
-    return AppConfig(providers=providers, sandbox=sandbox)
+    mcp_servers = _parse_mcp_servers(raw.get("mcp_servers"), path)
+    return AppConfig(providers=providers, sandbox=sandbox, mcp_servers=mcp_servers)
+
+
+# 解析 mcp_servers 段；缺失或非 list 时返回空元组，逐条校验字段。
+def _parse_mcp_servers(raw: Any, path: Path) -> tuple[MCPServerConfig, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"mcp_servers must be a list: {path}")
+
+    servers: list[MCPServerConfig] = []
+    for index, entry in enumerate(raw):
+        servers.append(_parse_mcp_server(entry, path, index))
+
+    names = [s.name for s in servers]
+    if len(names) != len(set(names)):
+        raise ConfigError(f"MCP server names must be unique within a file: {path}")
+    return tuple(servers)
+
+
+# 校验单个 MCP 服务器条目；command 与 url 二选一，缺失即报错。
+def _parse_mcp_server(raw: Any, path: Path, index: int) -> MCPServerConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError(f"MCP server #{index + 1} must be a mapping: {path}")
+
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ConfigError(f"MCP server #{index + 1} requires non-empty name: {path}")
+    name = name.strip()
+
+    command = raw.get("command")
+    url = raw.get("url")
+    if command is None and url is None:
+        raise ConfigError(
+            f"MCP server '{name}' requires either command or url: {path}"
+        )
+    if command is not None and not isinstance(command, str):
+        raise ConfigError(f"MCP server '{name}' command must be a string: {path}")
+    if url is not None and not isinstance(url, str):
+        raise ConfigError(f"MCP server '{name}' url must be a string: {path}")
+
+    args_raw = raw.get("args", [])
+    if not isinstance(args_raw, list):
+        raise ConfigError(f"MCP server '{name}' args must be a list: {path}")
+    args = tuple(str(a) for a in args_raw)
+
+    headers_raw = raw.get("headers", {})
+    if not isinstance(headers_raw, dict):
+        raise ConfigError(f"MCP server '{name}' headers must be a mapping: {path}")
+    headers = {str(k): str(v) for k, v in headers_raw.items()}
+
+    env_raw = raw.get("env", {})
+    if not isinstance(env_raw, dict):
+        raise ConfigError(f"MCP server '{name}' env must be a mapping: {path}")
+    env = {str(k): str(v) for k, v in env_raw.items()}
+
+    return MCPServerConfig(
+        name=name,
+        command=command,
+        args=args,
+        url=url,
+        headers=headers,
+        env=env,
+    )
 
 
 # 解析 sandbox 段；非 dict 或字段缺失时返回默认（全部关闭）。
@@ -155,7 +265,8 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
     )
 
 
-# 按固定层级合并配置；后层完整替换 Provider 列表，sandbox 各字段任一层开启即开启。
+# 按固定层级合并配置；后层完整替换 Provider 列表，sandbox 各字段任一层开启即开启，
+# mcp_servers 按 name 去重覆盖（同 name 替换、新 name 追加）。
 def load_config(
     path: Path | None = None,
     *,
@@ -171,6 +282,7 @@ def load_config(
     sandbox_enabled = False
     sandbox_auto_allow = False
     sandbox_network = False
+    merged_mcp: dict[str, MCPServerConfig] = {}
     for candidate in config_candidates(cwd, home):
         if not candidate.is_file():
             continue
@@ -180,6 +292,9 @@ def load_config(
         sandbox_enabled = sandbox_enabled or layer.sandbox.enabled
         sandbox_auto_allow = sandbox_auto_allow or layer.sandbox.auto_allow
         sandbox_network = sandbox_network or layer.sandbox.network_enabled
+        # mcp_servers 按 name 去重覆盖：后层同名替换前层，新名追加。
+        for server in layer.mcp_servers:
+            merged_mcp[server.name] = server
 
     if loaded is None:
         raise ConfigError(
@@ -193,4 +308,5 @@ def load_config(
             auto_allow=sandbox_auto_allow,
             network_enabled=sandbox_network,
         ),
+        mcp_servers=tuple(merged_mcp.values()),
     )

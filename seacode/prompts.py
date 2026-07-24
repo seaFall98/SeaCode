@@ -130,6 +130,24 @@ USING_TOOLS_SECTION = PromptSection(
  - When running multiple independent Bash commands, make separate parallel tool calls rather than chaining with &&.""",
 )
 
+# 延迟工具搜索段，引导模型在 MCP 工具未加载 Schema 时先用 ToolSearch 发现。
+# 仅在 mcp_manager 装配时由 build_system_prompt(mcp_enabled=True) 纳入。
+TOOL_SEARCH_SECTION = PromptSection(
+    name="ToolSearch",
+    priority=45,
+    content="""\
+# Deferred tool discovery
+
+Some tools are registered with deferred schemas — their names are listed in system reminders but their full input schemas are NOT loaded. This keeps the initial tool list small when many MCP servers are connected.
+
+To use a deferred tool:
+1. Call ToolSearch with query `select:<tool_name>` (or comma-separated names) to load specific tool schemas.
+2. You can also pass keywords to search by relevance if you don't know the exact name.
+3. After ToolSearch returns, the matched tools' full schemas are loaded and available for direct invocation in subsequent turns.
+
+Always call ToolSearch before invoking a deferred tool — calling a tool whose schema has not been loaded will fail.""",
+)
+
 # 语气与风格段，要求简洁、无 emoji、引用带行号、工具调用前用句号。
 TONE_STYLE_SECTION = PromptSection(
     name="ToneStyle",
@@ -362,6 +380,7 @@ def build_system_prompt(
     skill_section: str = "",
     memory_section: str = "",
     work_dir: str = ".",
+    mcp_enabled: bool = False,
 ) -> str:
     if coordinator_mode:
         from seacode.teams.coordinator import get_coordinator_system_prompt
@@ -374,6 +393,9 @@ def build_system_prompt(
     b.add(DOING_TASKS_SECTION)
     b.add(EXECUTING_ACTIONS_SECTION)
     b.add(USING_TOOLS_SECTION)
+    # MCP 启用时插入延迟工具搜索段，引导模型先 ToolSearch 再调用外部工具。
+    if mcp_enabled:
+        b.add(TOOL_SEARCH_SECTION)
     b.add(TONE_STYLE_SECTION)
     b.add(TEXT_OUTPUT_SECTION)
     b.add(environment_section(work_dir))
