@@ -28,11 +28,13 @@ from .conversation import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from .mcp import ConnectResult, MCPManager
 from .permissions import PermissionChecker, PermissionMode
 from .permissions.rules import Rule, extract_content
 from .prompts import build_environment_context, build_system_prompt
 from .tools import ToolRegistry
 from .tools.base import ToolResult
+from .tools.tool_search import ToolSearchTool
 
 # ---------------------------------------------------------------------------
 # AgentEvent 事件类型
@@ -110,6 +112,15 @@ class ErrorEvent:
     message: str
 
 
+@dataclass
+class MCPConnectEvent:
+    """MCP 服务器批量连接完成事件；携带连接摘要供 TUI 状态栏展示。"""
+
+    server_count: int
+    tool_count: int
+    errors: list[str]
+
+
 class PermissionResponse(Enum):
     """用户对权限请求的三种回复；由 TUI 通过 future.resolve 传回 Agent。"""
 
@@ -138,6 +149,7 @@ type AgentEvent = (
     | UsageEvent
     | ErrorEvent
     | PermissionRequest
+    | MCPConnectEvent
 )
 
 
@@ -286,6 +298,7 @@ class Agent:
         work_dir: str = ".",
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
         permission_checker: PermissionChecker | None = None,
+        mcp_manager: MCPManager | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -300,6 +313,16 @@ class Agent:
         self.permission_mode: PermissionMode = (
             permission_checker.mode if permission_checker else PermissionMode.DEFAULT
         )
+        # MCP 管理器；为 None 时跳过 MCP 连接与延迟工具搜索。
+        self.mcp_manager = mcp_manager
+        # MCP 连接是否已完成；run() 首轮触发一次，避免重复连接。
+        self._mcp_connected = False
+        # 注册 ToolSearchTool 让模型可发现延迟加载的 MCP 工具；
+        # 传入 registry 引用形成运行时循环，通过 TYPE_CHECKING 注解避免导入循环。
+        if mcp_manager is not None:
+            self.registry.register(
+                ToolSearchTool(registry=self.registry, protocol=protocol)
+            )
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -316,7 +339,22 @@ class Agent:
     def _build_permission_description(self, tc: ToolCallComplete) -> str:
         return PermissionChecker.describe_tool_action(tc.tool_name, tc.arguments)
 
-    # 执行 Agent 主循环：注入环境 → 每轮 build_system_prompt → 模型流 → 工具执行 → 回灌。
+    # 连接所有 MCP 服务器并注册工具；把服务器 instructions 注入对话历史。
+    # 单 Server 失败由 MCPManager 收集到 errors，不阻断其它 Server 与主流程。
+    async def _setup_mcp(self, conversation: ConversationManager) -> ConnectResult:
+        assert self.mcp_manager is not None
+        result = await self.mcp_manager.register_all_tools(self.registry)
+
+        # 把每个成功连接的 Server 的 instructions 注入对话历史，供模型参考。
+        for server in result.servers:
+            if server.instructions:
+                conversation.add_system_reminder(
+                    f"MCP server '{server.name}' instructions:\n{server.instructions}"
+                )
+
+        return result
+
+    # 执行 Agent 主循环：注入环境 → MCP 连接 → 每轮 build_system_prompt → 模型流 → 工具执行 → 回灌。
     async def run(
         self, conversation: ConversationManager
     ) -> AsyncIterator[AgentEvent]:
@@ -324,7 +362,17 @@ class Agent:
         env_context = build_environment_context(self.work_dir)
         conversation.inject_environment(env_context)
 
-        tools = self.registry.get_all_schemas(self.protocol)
+        # MCP 连接：首轮启动时一次性连接所有 Server，注册工具并注入 instructions。
+        # 单 Server 失败不阻断其它；连接结果通过 MCPConnectEvent 通知 TUI 展示摘要。
+        if self.mcp_manager is not None and not self._mcp_connected:
+            self._mcp_connected = True
+            connect_result = await self._setup_mcp(conversation)
+            yield MCPConnectEvent(
+                server_count=len(connect_result.servers),
+                tool_count=len(connect_result.tools),
+                errors=connect_result.errors,
+            )
+
         iteration = 0
         consecutive_unknown = 0
         max_tokens_escalated = False
@@ -341,7 +389,26 @@ class Agent:
                 break
 
             # 每轮动态拼装系统提示词，包含 Environment 段落与条件段落。
-            system = build_system_prompt(work_dir=self.work_dir)
+            # mcp_manager 装配时插入 ToolSearch 段落，引导模型先发现再调用 MCP 工具。
+            system = build_system_prompt(
+                work_dir=self.work_dir,
+                mcp_enabled=self.mcp_manager is not None,
+            )
+
+            # 延迟工具名 reminder：每轮注入未发现的延迟工具名，引导模型用 ToolSearch 发现。
+            # mark_discovered 后下一轮 get_all_schemas 包含完整 Schema，此 reminder 自动缩短。
+            deferred_names = self.registry.get_deferred_tool_names()
+            if deferred_names:
+                conversation.add_system_reminder(
+                    "The following deferred tools are available via ToolSearch. "
+                    "Their schemas are NOT loaded - use ToolSearch with "
+                    'query \"select:<name>[,<name>...]\" to load tool schemas '
+                    "before calling them:\n"
+                    + "\n".join(deferred_names)
+                )
+
+            # 每轮重新获取工具 Schema，使 mark_discovered 后的新工具立即纳入。
+            tools = self.registry.get_all_schemas(self.protocol)
 
             collector = StreamCollector()
             executor = StreamingExecutor()

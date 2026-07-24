@@ -13,3 +13,22 @@ sandbox:
   enabled: false
   auto_allow: false
   network_enabled: false
+
+# MCP 外部工具服务器配置（可选）；command 走 stdio 子进程，url 走 Streamable HTTP。
+# env 中的 ${VAR} 在连接时展开为环境变量；headers 中的 ${VAR} 同样展开（用于鉴权令牌）。
+# 同名服务器在多层配置中按后层覆盖前层合并；单服务器失败不阻断其它服务器与主流程。
+mcp_servers:
+  # stdio 子进程示例：通过 npx 启动一个 MCP 服务器
+  - name: filesystem
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "/path/to/allowed/dir"
+    env:
+      NODE_PATH: "${NODE_PATH}"
+  # Streamable HTTP 示例：连接远端 MCP 服务器
+  # - name: remote
+  #   url: https://mcp.example.com/sse
+  #   headers:
+  #     Authorization: "Bearer ${MCP_TOKEN}"

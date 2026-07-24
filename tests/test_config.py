@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from seacode.config import ConfigError, ProviderConfig, load_config
+from seacode.config import (
+    ConfigError,
+    MCPServerConfig,
+    ProviderConfig,
+    build_child_env,
+    load_config,
+    resolve_env_vars,
+)
 
 
 # 写入仅含测试占位符的 Provider YAML。
@@ -125,3 +132,258 @@ def test_provider_names_must_be_unique(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="unique"):
         load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# MCP 服务器配置解析
+# ---------------------------------------------------------------------------
+
+
+# 写入含 mcp_servers 段的完整配置文件。
+def _write_config_with_mcp(
+    path: Path,
+    *,
+    name: str = "primary",
+    mcp_block: str = "",
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parts = [
+        "providers:",
+        f"  - name: {name}",
+        "    protocol: openai-compat",
+        "    model: test-model",
+        "    base_url: https://api.example.test",
+        "    api_key: test-key",
+        "    thinking: false",
+    ]
+    if mcp_block:
+        parts.append(mcp_block)
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+# 验证 stdio 类型 MCPServerConfig 的 is_stdio 属性。
+def test_mcp_server_config_stdio_detection() -> None:
+    stdio = MCPServerConfig(name="fs", command="npx")
+    assert stdio.is_stdio is True
+
+    http = MCPServerConfig(name="remote", url="https://mcp.example.com")
+    assert http.is_stdio is False
+
+
+# 验证 mcp_servers 段正确解析 stdio 服务器配置。
+def test_parse_mcp_stdio_server(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config_with_mcp(
+        path,
+        mcp_block=(
+            "mcp_servers:\n"
+            "  - name: filesystem\n"
+            "    command: npx\n"
+            "    args:\n"
+            '      - "-y"\n'
+            '      - "@modelcontextprotocol/server-filesystem"\n'
+            "    env:\n"
+            "      NODE_PATH: /usr/lib/node\n"
+        ),
+    )
+
+    config = load_config(path)
+
+    assert len(config.mcp_servers) == 1
+    server = config.mcp_servers[0]
+    assert server.name == "filesystem"
+    assert server.command == "npx"
+    assert server.args == ("-y", "@modelcontextprotocol/server-filesystem")
+    assert server.env == {"NODE_PATH": "/usr/lib/node"}
+    assert server.is_stdio is True
+
+
+# 验证 mcp_servers 段正确解析 HTTP 服务器配置。
+def test_parse_mcp_http_server(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config_with_mcp(
+        path,
+        mcp_block=(
+            "mcp_servers:\n"
+            "  - name: remote\n"
+            "    url: https://mcp.example.com/sse\n"
+            "    headers:\n"
+            '      Authorization: "Bearer token"\n'
+        ),
+    )
+
+    config = load_config(path)
+
+    assert len(config.mcp_servers) == 1
+    server = config.mcp_servers[0]
+    assert server.name == "remote"
+    assert server.url == "https://mcp.example.com/sse"
+    assert server.headers == {"Authorization": "Bearer token"}
+    assert server.is_stdio is False
+
+
+# 验证 mcp_servers 缺失时返回空元组，不影响配置加载。
+def test_mcp_servers_optional(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config_with_mcp(path)
+
+    config = load_config(path)
+    assert config.mcp_servers == ()
+
+
+# 验证 mcp_servers 条目同时缺失 command 与 url 时报错。
+def test_mcp_server_requires_command_or_url(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config_with_mcp(
+        path,
+        mcp_block="mcp_servers:\n  - name: broken\n",
+    )
+
+    with pytest.raises(ConfigError, match="command or url"):
+        load_config(path)
+
+
+# 验证 mcp_servers 条目 name 缺失时报错。
+def test_mcp_server_requires_name(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config_with_mcp(
+        path,
+        mcp_block="mcp_servers:\n  - command: npx\n",
+    )
+
+    with pytest.raises(ConfigError, match="non-empty name"):
+        load_config(path)
+
+
+# 验证 mcp_servers 条目 name 重复时报错。
+def test_mcp_server_names_must_be_unique(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config_with_mcp(
+        path,
+        mcp_block=(
+            "mcp_servers:\n"
+            "  - name: dup\n"
+            "    command: npx\n"
+            "  - name: dup\n"
+            "    url: https://mcp.example.com\n"
+        ),
+    )
+
+    with pytest.raises(ConfigError, match="unique"):
+        load_config(path)
+
+
+# 验证 mcp_servers 非 list 时报错。
+def test_mcp_servers_must_be_list(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config_with_mcp(
+        path,
+        mcp_block="mcp_servers: not-a-list\n",
+    )
+
+    with pytest.raises(ConfigError, match="must be a list"):
+        load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# MCP 三层合并
+# ---------------------------------------------------------------------------
+
+
+# 验证三层配置按 name 去重覆盖合并 mcp_servers。
+# 用户层与项目层有同名 fs，项目本地层有新名 remote；合并后 fs 来自后层，remote 追加。
+def test_mcp_servers_merge_by_name_across_layers(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write_config_with_mcp(
+        home / ".seacode" / "config.yaml",
+        mcp_block=(
+            "mcp_servers:\n"
+            "  - name: fs\n"
+            "    command: user-npx\n"
+        ),
+    )
+    _write_config_with_mcp(
+        project / ".seacode" / "config.yaml",
+        mcp_block=(
+            "mcp_servers:\n"
+            "  - name: fs\n"
+            "    command: project-npx\n"
+            "  - name: git\n"
+            "    command: git-npx\n"
+        ),
+    )
+    _write_config_with_mcp(
+        project / ".seacode" / "config.local.yaml",
+        mcp_block=(
+            "mcp_servers:\n"
+            "  - name: remote\n"
+            "    url: https://mcp.example.com\n"
+        ),
+    )
+
+    config = load_config(cwd=project, home=home)
+
+    servers = {s.name: s for s in config.mcp_servers}
+    # fs 在用户层和项目层都有，后层（project）覆盖前层（home）。
+    assert servers["fs"].command == "project-npx"
+    # git 只在项目层，保留。
+    assert servers["git"].command == "git-npx"
+    # remote 只在本地层，追加。
+    assert servers["remote"].url == "https://mcp.example.com"
+
+
+# ---------------------------------------------------------------------------
+# resolve_env_vars / build_child_env
+# ---------------------------------------------------------------------------
+
+
+# 验证 resolve_env_vars 展开已定义的环境变量。
+def test_resolve_env_vars_expands_defined(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_TOKEN", "secret-value")
+    assert resolve_env_vars("Bearer ${MCP_TOKEN}") == "Bearer secret-value"
+
+
+# 验证 resolve_env_vars 对未定义变量保留原字面量。
+def test_resolve_env_vars_keeps_undefined(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("UNDEFINED_VAR", raising=False)
+    assert resolve_env_vars("${UNDEFINED_VAR}") == "${UNDEFINED_VAR}"
+
+
+# 验证 build_child_env 只注入 PATH 与显式声明的 env，不继承全部环境。
+def test_build_child_env_injects_path_and_declared_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("SECRET_KEY", "should-not-leak")
+    monkeypatch.setenv("NODE_PATH", "/usr/lib/node")
+
+    env = build_child_env({"NODE_PATH": "/custom/node"})
+
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["NODE_PATH"] == "/custom/node"
+    assert "SECRET_KEY" not in env
+
+
+# 验证 build_child_env 展开声明 env 中的 ${VAR} 占位符。
+def test_build_child_env_expands_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("API_TOKEN", "tok-123")
+
+    env = build_child_env({"AUTH": "Bearer ${API_TOKEN}"})
+
+    assert env["AUTH"] == "Bearer tok-123"
+
+
+# 验证 build_child_env 在 PATH 缺失时不注入空 PATH。
+def test_build_child_env_without_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PATH", raising=False)
+    env = build_child_env(None)
+    assert "PATH" not in env
+
+
+# 验证 build_child_env 接受 None 参数返回空 dict（除 PATH）。
+def test_build_child_env_none_returns_path_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = build_child_env(None)
+    assert env == {"PATH": "/usr/bin"}
