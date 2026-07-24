@@ -121,6 +121,10 @@ class LLMClient(ABC):
     ) -> AsyncIterator[StreamEvent]:
         raise NotImplementedError
 
+    # 更新后续请求的最大输出 token 数；默认无操作，子类按需覆盖。
+    def set_max_output_tokens(self, n: int) -> None:
+        """更新后续流式请求的最大输出 token 上限。"""
+
 
 # 从 SDK 用量对象读取整数值，并安全处理兼容端点的缺失字段。
 def _usage_value(usage: Any, field_name: str) -> int:
@@ -159,10 +163,15 @@ class AnthropicClient(LLMClient):
     # 保存配置并允许测试替换实际 SDK 客户端。
     def __init__(self, config: ProviderConfig, client: Any | None = None) -> None:
         self._config = config
+        self._max_output_tokens = 8192
         self._client = client or AsyncAnthropic(
             api_key=_api_key(config),
             base_url=config.base_url,
         )
+
+    # 更新后续请求的最大输出 token 数。
+    def set_max_output_tokens(self, n: int) -> None:
+        self._max_output_tokens = n
 
     # 调用 Messages API 并归一化文本、思考、工具调用与完成事件。
     async def stream(
@@ -173,7 +182,7 @@ class AnthropicClient(LLMClient):
     ) -> AsyncIterator[StreamEvent]:
         request: dict[str, Any] = {
             "model": self._config.model,
-            "max_tokens": 8192,
+            "max_tokens": self._max_output_tokens,
             "messages": build_anthropic_messages(list(messages)),
         }
         if system:
@@ -295,10 +304,15 @@ class OpenAIClient(LLMClient):
     # 保存配置并允许测试替换实际 SDK 客户端。
     def __init__(self, config: ProviderConfig, client: Any | None = None) -> None:
         self._config = config
+        self._max_output_tokens = 0
         self._client = client or AsyncOpenAI(
             api_key=_api_key(config),
             base_url=config.base_url,
         )
+
+    # 更新后续请求的最大输出 token 数；0 表示不设置上限。
+    def set_max_output_tokens(self, n: int) -> None:
+        self._max_output_tokens = n
 
     # 调用 Responses API 并归一化公开文本、思考与工具调用事件。
     async def stream(
@@ -312,6 +326,8 @@ class OpenAIClient(LLMClient):
             "input": build_openai_input(list(messages)),
             "stream": True,
         }
+        if self._max_output_tokens > 0:
+            request["max_output_tokens"] = self._max_output_tokens
         if system:
             request["instructions"] = system
         if tools:
@@ -402,10 +418,15 @@ class OpenAICompatClient(LLMClient):
     # 保存配置并允许测试替换实际 SDK 客户端。
     def __init__(self, config: ProviderConfig, client: Any | None = None) -> None:
         self._config = config
+        self._max_output_tokens = 8192
         self._client = client or AsyncOpenAI(
             api_key=_api_key(config),
             base_url=config.base_url,
         )
+
+    # 更新后续请求的最大输出 token 数。
+    def set_max_output_tokens(self, n: int) -> None:
+        self._max_output_tokens = n
 
     # 把 Responses 风格的 tool schema 转成 Chat Completions 的嵌套 function 格式。
     @staticmethod
@@ -437,7 +458,7 @@ class OpenAICompatClient(LLMClient):
         request: dict[str, Any] = {
             "model": self._config.model,
             "messages": request_messages,
-            "max_tokens": 8192,
+            "max_tokens": self._max_output_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }

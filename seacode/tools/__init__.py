@@ -1,9 +1,11 @@
-"""工具注册中心与默认工具装配。"""
+"""工具注册中心、分批策略与默认工具装配。"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
+from seacode.client import ToolCallComplete
 from seacode.tools.base import Tool
 
 
@@ -157,4 +159,39 @@ def create_default_registry() -> ToolRegistry:
     return registry
 
 
-__all__ = ["ToolRegistry", "create_default_registry"]
+# ---------------------------------------------------------------------------
+# 工具调用分批策略
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolBatch:
+    """一组工具调用及其并发执行策略：concurrent=True 时可 asyncio.gather。"""
+
+    concurrent: bool
+    calls: list[ToolCallComplete]
+
+
+# 按工具的并发安全属性把连续调用切分为可并发批次与独立串行批次。
+# 连续的并发安全工具（ReadFile/Glob/Grep）合并到一个 batch；不安全工具各自成独立 batch。
+def partition_tool_calls(
+    tool_calls: list[ToolCallComplete],
+    registry: ToolRegistry,
+) -> list[ToolBatch]:
+    batches: list[ToolBatch] = []
+    for tc in tool_calls:
+        tool = registry.get(tc.tool_name)
+        safe = (
+            tool is not None
+            and tool.is_concurrency_safe
+            and registry.is_enabled(tc.tool_name)
+        )
+        # 上一个批次也是并发批次时，把当前并发安全工具合并进去；否则新建批次。
+        if safe and batches and batches[-1].concurrent:
+            batches[-1].calls.append(tc)
+        else:
+            batches.append(ToolBatch(concurrent=safe, calls=[tc]))
+    return batches
+
+
+__all__ = ["ToolRegistry", "create_default_registry", "ToolBatch", "partition_tool_calls"]
