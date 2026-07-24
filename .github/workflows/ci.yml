@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "roadmap/**"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Synchronize dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check seacode tests
+
+      - name: Type check
+        run: uv run mypy seacode
+
+      - name: Test
+        run: uv run pytest tests/ -v
