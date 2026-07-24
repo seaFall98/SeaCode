@@ -70,6 +70,16 @@ Screen {
     color: #ff9c9c;
 }
 
+.thinking-done {
+    color: #d9a441;
+    text-style: italic;
+}
+
+.system-message {
+    color: #8a9a9e;
+    text-style: italic;
+}
+
 #input-area {
     dock: bottom;
     height: auto;

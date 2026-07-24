@@ -6,10 +6,11 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 from textual.containers import Horizontal
 from textual.widgets import Button, OptionList, Static
 
-from seacode.app import ChatInput, SeaCodeApp
+from seacode.app import ChatInput, SeaCodeApp, ToolGroupSummary
 from seacode.client import (
     LLMClient,
     NetworkError,
@@ -17,9 +18,12 @@ from seacode.client import (
     StreamEvent,
     TextDelta,
     ThinkingDelta,
+    ToolCallComplete,
+    ToolCallStart,
 )
 from seacode.config import ProviderConfig
 from seacode.conversation import Message
+from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 
 # 提供可按回合返回事件或抛出错误的本地假客户端。
@@ -278,3 +282,133 @@ async def test_end_to_end_history_survives_failure_and_continues() -> None:
             Message("user", "Four"),
         ),
     ]
+
+
+# ---------------------------------------------------------------------------
+# batch03：ToolGroupSummary、Esc 取消、thinking-done
+# ---------------------------------------------------------------------------
+
+
+# 在首字节后阻塞的 Provider 流，用于验证 Esc 取消时已累积文本的保留。
+class _PartialBlockingClient(LLMClient):
+    # 保存释放信号，流在发出部分文本后等待释放。
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.requests: list[tuple[Message, ...]] = []
+
+    # 先产出部分文本增量再阻塞，取消时已累积文本应被保留。
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        system: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        del system, tools
+        self.requests.append(tuple(messages))
+        yield TextDelta("Partial ")
+        yield TextDelta("answer")
+        await self.release.wait()
+        yield StreamComplete()
+
+
+# 轮询等待活动回合结束，避免固定时长导致测试不稳定。
+async def _wait_done(app: SeaCodeApp, pilot: Any, max_pauses: int = 40) -> None:
+    for _ in range(max_pauses):
+        if not app._streaming:
+            break
+        await pilot.pause(0.05)
+
+
+# 验证单轮内 >=2 个可折叠工具时 mount ToolGroupSummary 并隐藏工具块。
+# 用 mock ReadFile 替换真实工具避免文件系统访问，断言摘要文本含工具数与耗时。
+@pytest.mark.asyncio
+async def test_tool_group_summary_mounts_for_multiple_collapsible_tools() -> None:
+    class _ReadParams(BaseModel):
+        file_path: str = ""
+
+    class _MockReadFile(Tool):
+        name = "ReadFile"
+        description = "mock read for collapsible summary"
+        params_model = _ReadParams
+        category = ToolCategory.READ
+
+        async def execute(self, params: BaseModel) -> ToolResult:
+            del params
+            return ToolResult(content="file content")
+
+    client = _FakeClient(
+        [
+            [
+                ToolCallStart(tool_name="ReadFile", tool_id="r1"),
+                ToolCallComplete(
+                    tool_id="r1", tool_name="ReadFile", arguments={"file_path": "a"}
+                ),
+                ToolCallStart(tool_name="ReadFile", tool_id="r2"),
+                ToolCallComplete(
+                    tool_id="r2", tool_name="ReadFile", arguments={"file_path": "b"}
+                ),
+                StreamComplete(input_tokens=1, output_tokens=1),
+            ],
+            [TextDelta("Done"), StreamComplete(input_tokens=1, output_tokens=1)],
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    # 用 mock 覆盖真实 ReadFile，避免读取真实文件。
+    app._tool_registry.register(_MockReadFile())
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Read both")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        summaries = app.query(ToolGroupSummary)
+        assert len(summaries) == 1
+        assert "2 tool uses" in str(summaries[0].render())
+
+
+# 验证 Esc 取消正在进行的回合，保留已累积文本并显示系统消息。
+# 阻塞流先产出部分文本再等待，按 Esc 后断言系统消息与输入恢复。
+@pytest.mark.asyncio
+async def test_escape_cancels_running_turn_and_shows_system_message() -> None:
+    client = _PartialBlockingClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Block")
+        await pilot.press("enter")
+        # 让部分文本流出并进入阻塞等待。
+        for _ in range(8):
+            await pilot.pause(0.05)
+        assert app._streaming is True
+
+        await pilot.press("escape")
+        await _wait_done(app, pilot)
+
+        system_messages = app.query(".system-message")
+        assert any("Operation cancelled" in str(m.render()) for m in system_messages)
+        assert "Ready" in str(app.query_one("#turn-status").render())
+        assert input_widget.disabled is False
+
+
+# 验证 LoopComplete 后展示 thinking-done 行，含动词过去式与耗时。
+# 单轮流式回复结束后，断言挂载 thinking-done 行且文本含耗时格式。
+@pytest.mark.asyncio
+async def test_loop_complete_mounts_thinking_done_line() -> None:
+    client = _FakeClient(
+        [[TextDelta("Answer"), StreamComplete(input_tokens=1, output_tokens=1)]]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Hi")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        done_lines = app.query(".thinking-done")
+        assert len(done_lines) == 1
+        text = str(done_lines[0].render())
+        assert "✻" in text
+        assert " for " in text

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -8,22 +9,29 @@ from pydantic import BaseModel
 
 from seacode.agent import (
     Agent,
+    ErrorEvent,
     LoopComplete,
+    RetryEvent,
+    StreamingExecutor,
     StreamText,
+    ThinkingText,
     ToolResultEvent,
     ToolUseEvent,
     TurnComplete,
+    UsageEvent,
+    _ToolExecResult,
 )
 from seacode.client import (
     LLMClient,
     StreamComplete,
     StreamEvent,
     TextDelta,
+    ThinkingDelta,
     ToolCallComplete,
     ToolCallStart,
 )
 from seacode.conversation import ConversationManager, Message
-from seacode.tools import ToolRegistry
+from seacode.tools import ToolRegistry, partition_tool_calls
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 
@@ -42,10 +50,12 @@ class _MockTool(Tool):
         name: str = "MockTool",
         result: ToolResult | None = None,
         error: Exception | None = None,
+        concurrency_safe: bool = False,
     ) -> None:
         self.name = name
         self._result = result or ToolResult(content="mock output")
         self._error = error
+        self.is_concurrency_safe = concurrency_safe
 
     async def execute(self, params: BaseModel) -> ToolResult:
         if self._error is not None:
@@ -76,6 +86,11 @@ class _FakeClient(LLMClient):
         self._outcomes = outcomes
         self.requests: list[tuple[Message, ...]] = []
         self.tools_passed: list[list[dict[str, Any]] | None] = []
+        self.max_output_tokens_calls: list[int] = []
+
+    # 记录 max_tokens 升级恢复对上限的调整，供测试断言。
+    def set_max_output_tokens(self, n: int) -> None:
+        self.max_output_tokens_calls.append(n)
 
     async def stream(
         self,
@@ -347,3 +362,306 @@ async def test_unknown_tool_returns_error_result_without_breaking() -> None:
     assert result_events[0].is_error is True
     assert "unknown tool" in result_events[0].output
     assert isinstance(events[-1], LoopComplete)
+
+
+# ---------------------------------------------------------------------------
+# max_iterations 上限停止
+# ---------------------------------------------------------------------------
+
+
+# 验证达到 max_iterations 上限时发射 ErrorEvent 并停止循环。
+# 设置 max_iterations=2 且模型连续返回工具调用，断言第 3 次迭代被上限拦截。
+@pytest.mark.asyncio
+async def test_max_iterations_limit_emits_error_event() -> None:
+    tool = _MockTool(name="MockTool")
+    registry = ToolRegistry()
+    registry.register(tool)
+    outcomes = [
+        _tool_call_stream("c1", "MockTool", {"input": "x"}),
+        _tool_call_stream("c2", "MockTool", {"input": "x"}),
+        _tool_call_stream("c3", "MockTool", {"input": "x"}),
+    ]
+    client = _FakeClient(outcomes)
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic", max_iterations=2
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Loop forever")
+
+    events = await _collect(agent.run(conversation, system="sys"))
+
+    error_events = [e for e in events if isinstance(e, ErrorEvent)]
+    assert len(error_events) == 1
+    assert "maximum iterations" in error_events[0].message
+    assert "2" in error_events[0].message
+    # 上限拦截发生在第 3 次迭代发起请求之前，因此只会有 2 次模型请求。
+    assert len(client.requests) == 2
+
+
+# ---------------------------------------------------------------------------
+# 连续未知工具停止
+# ---------------------------------------------------------------------------
+
+
+# 验证连续 3 次未知工具调用触发 ErrorEvent 并停止循环。
+# 三轮均调用未注册工具名，断言第 3 轮回灌前停止并发射错误。
+@pytest.mark.asyncio
+async def test_consecutive_unknown_tools_stops_loop() -> None:
+    tool = _MockTool(name="MockTool")
+    registry = ToolRegistry()
+    registry.register(tool)
+    outcomes = [
+        _tool_call_stream("c1", "UnknownA", {}),
+        _tool_call_stream("c2", "UnknownB", {}),
+        _tool_call_stream("c3", "UnknownC", {}),
+    ]
+    client = _FakeClient(outcomes)
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("Call unknowns")
+
+    events = await _collect(agent.run(conversation, system="sys"))
+
+    error_events = [e for e in events if isinstance(e, ErrorEvent)]
+    assert len(error_events) == 1
+    assert "too many consecutive unknown" in error_events[0].message
+    assert len(client.requests) == 3
+
+
+# ---------------------------------------------------------------------------
+# max_tokens 两阶段恢复
+# ---------------------------------------------------------------------------
+
+
+# 验证 max_tokens 首次截断提升上限、注入续写指令并发射 RetryEvent。
+# 首轮流文本被截断，断言 set_max_output_tokens(64000) 调用与续写用户消息注入。
+@pytest.mark.asyncio
+async def test_max_tokens_escalation_first_stage() -> None:
+    tool = _MockTool(name="MockTool")
+    agent, conversation, client = _setup(tool)
+    client._outcomes = [
+        [
+            TextDelta("Partial answer"),
+            StreamComplete(input_tokens=1, output_tokens=1, stop_reason="max_tokens"),
+        ],
+        _text_stream("Done"),
+    ]
+    conversation.add_user_message("Hit limit")
+
+    events = await _collect(agent.run(conversation, system="sys"))
+
+    retry_events = [e for e in events if isinstance(e, RetryEvent)]
+    assert len(retry_events) == 1
+    assert retry_events[0].reason == "max_tokens escalation"
+    assert client.max_output_tokens_calls == [64000]
+    # 续写指令作为新用户消息注入，且位于截断助手消息之后。
+    assert "Resume" in conversation.messages[2].content
+    assert conversation.messages[1].content == "Partial answer"
+    assert isinstance(events[-1], LoopComplete)
+
+
+# 验证 max_tokens 再次截断进入 recovery 分支，注入拆小指令并发射 RetryEvent。
+# 首次 escalation 后再次截断，断言 recovery 1/3 与拆小指令注入。
+@pytest.mark.asyncio
+async def test_max_tokens_recovery_branch_injects_break_instruction() -> None:
+    tool = _MockTool(name="MockTool")
+    agent, conversation, client = _setup(tool)
+    client._outcomes = [
+        [StreamComplete(input_tokens=1, output_tokens=1, stop_reason="max_tokens")],
+        [
+            TextDelta("Partial two"),
+            StreamComplete(input_tokens=1, output_tokens=1, stop_reason="max_tokens"),
+        ],
+        _text_stream("Done"),
+    ]
+    conversation.add_user_message("Hit limit twice")
+
+    events = await _collect(agent.run(conversation, system="sys"))
+
+    retry_events = [e for e in events if isinstance(e, RetryEvent)]
+    assert [r.reason for r in retry_events] == [
+        "max_tokens escalation",
+        "max_tokens recovery 1/3",
+    ]
+    # recovery 注入的拆小指令位于第二轮截断助手消息之后。
+    assert "Break" in conversation.messages[2].content
+    assert conversation.messages[1].content == "Partial two"
+    assert isinstance(events[-1], LoopComplete)
+
+
+# ---------------------------------------------------------------------------
+# partition_tool_calls 切批
+# ---------------------------------------------------------------------------
+
+
+# 验证 partition_tool_calls 把连续并发安全工具合并为并发批，不安全工具独立串行批。
+# 构造 [Read, Read, Edit, Read, Read]，断言切为三批且写工具隔离。
+def test_partition_tool_calls_batches_concurrent_and_serial() -> None:
+    read_tool = _MockTool(name="ReadFile", concurrency_safe=True)
+    edit_tool = _MockTool(name="EditFile", concurrency_safe=False)
+    registry = ToolRegistry()
+    registry.register(read_tool)
+    registry.register(edit_tool)
+
+    names = ["ReadFile", "ReadFile", "EditFile", "ReadFile", "ReadFile"]
+    calls = [
+        ToolCallComplete(tool_id=str(i), tool_name=name, arguments={})
+        for i, name in enumerate(names)
+    ]
+    batches = partition_tool_calls(calls, registry)
+
+    assert len(batches) == 3
+    assert batches[0].concurrent is True
+    assert [tc.tool_name for tc in batches[0].calls] == ["ReadFile", "ReadFile"]
+    assert batches[1].concurrent is False
+    assert [tc.tool_name for tc in batches[1].calls] == ["EditFile"]
+    assert batches[2].concurrent is True
+    assert [tc.tool_name for tc in batches[2].calls] == ["ReadFile", "ReadFile"]
+
+
+# 验证禁用工具即使并发安全也降级为串行批次。
+# 注册并发安全工具但禁用它，断言切出的批次 concurrent=False。
+def test_partition_tool_calls_disables_fall_back_to_serial() -> None:
+    read_tool = _MockTool(name="ReadFile", concurrency_safe=True)
+    registry = ToolRegistry()
+    registry.register(read_tool)
+    registry.disable("ReadFile")
+
+    calls = [ToolCallComplete(tool_id="0", tool_name="ReadFile", arguments={})]
+    batches = partition_tool_calls(calls, registry)
+
+    assert len(batches) == 1
+    assert batches[0].concurrent is False
+
+
+# ---------------------------------------------------------------------------
+# StreamingExecutor 顺序与异常隔离
+# ---------------------------------------------------------------------------
+
+
+# 验证 StreamingExecutor 按提交顺序汇总结果，单个异常转为错误结果不炸整批。
+# 提交三个协程，中间一个抛异常，断言顺序保持且异常转为 is_error 结果。
+@pytest.mark.asyncio
+async def test_streaming_executor_preserves_order_and_isolates_exceptions() -> None:
+    executor = StreamingExecutor()
+
+    async def succeed(order: int) -> _ToolExecResult:
+        return _ToolExecResult(
+            tool_id=f"t{order}",
+            tool_name="X",
+            result=ToolResult(content=f"r{order}"),
+            elapsed=0.0,
+            is_unknown=False,
+        )
+
+    async def fail() -> _ToolExecResult:
+        raise RuntimeError("boom in executor")
+
+    executor.submit(succeed(1))
+    executor.submit(fail())
+    executor.submit(succeed(3))
+
+    results = await executor.collect_results()
+
+    assert len(results) == 3
+    assert results[0].tool_id == "t1"
+    assert results[1].result.is_error is True
+    assert "Tool execution error" in results[1].result.content
+    assert results[2].tool_id == "t3"
+
+
+# ---------------------------------------------------------------------------
+# UsageEvent 累计
+# ---------------------------------------------------------------------------
+
+
+# 验证 UsageEvent 跨多轮累计 input/output tokens。
+# 两轮流分别消耗 5/7 与 3/4，断言最后一轮累计为 8/11。
+@pytest.mark.asyncio
+async def test_usage_event_accumulates_tokens_across_turns() -> None:
+    tool = _MockTool(name="MockTool")
+    agent, conversation, client = _setup(tool)
+    client._outcomes = [
+        [
+            ToolCallStart(tool_name="MockTool", tool_id="c1"),
+            ToolCallComplete(tool_id="c1", tool_name="MockTool", arguments={}),
+            StreamComplete(input_tokens=5, output_tokens=7),
+        ],
+        [TextDelta("Done"), StreamComplete(input_tokens=3, output_tokens=4)],
+    ]
+    conversation.add_user_message("Run")
+
+    events = await _collect(agent.run(conversation, system="sys"))
+
+    usage_events = [e for e in events if isinstance(e, UsageEvent)]
+    assert len(usage_events) == 2
+    assert usage_events[-1].input_tokens == 8
+    assert usage_events[-1].output_tokens == 11
+
+
+# ---------------------------------------------------------------------------
+# ThinkingText 转发
+# ---------------------------------------------------------------------------
+
+
+# 验证 thinking 增量转发为 ThinkingText 事件，最终文本与思考并存。
+# 假流交替发射 thinking 与 text 增量，断言 ThinkingText 拼接完整。
+@pytest.mark.asyncio
+async def test_thinking_text_event_forwarded() -> None:
+    registry = ToolRegistry()
+    client = _FakeClient(
+        [
+            [
+                ThinkingDelta("Hello "),
+                ThinkingDelta("world."),
+                TextDelta("Answer"),
+                StreamComplete(input_tokens=1, output_tokens=1),
+            ]
+        ]
+    )
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("Think")
+
+    events = await _collect(agent.run(conversation, system="sys"))
+
+    thinking_events = [e for e in events if isinstance(e, ThinkingText)]
+    assert "".join(e.text for e in thinking_events) == "Hello world."
+    assert isinstance(events[-1], LoopComplete)
+
+
+# ---------------------------------------------------------------------------
+# 用户取消
+# ---------------------------------------------------------------------------
+
+
+# 验证 task.cancel() 触发 CancelledError 自然退出 agent.run 生成器。
+# 用阻塞流让生成器等待释放信号，取消任务后断言 CancelledError 传播。
+@pytest.mark.asyncio
+async def test_cancellation_exits_generator() -> None:
+    class _BlockingClient(LLMClient):
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+
+        async def stream(
+            self,
+            messages: Sequence[Message],
+            system: str,
+            tools: list[dict[str, Any]] | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, system, tools
+            await self.release.wait()
+            yield TextDelta("Done")
+            yield StreamComplete(input_tokens=1, output_tokens=1)
+
+    client = _BlockingClient()
+    registry = ToolRegistry()
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("Block then cancel")
+
+    task = asyncio.create_task(_collect(agent.run(conversation, system="sys")))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

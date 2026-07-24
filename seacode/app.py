@@ -1,9 +1,10 @@
-"""SeaCode 第 02 步的紧凑 Textual 对话界面，支持工具调用展示。"""
+"""SeaCode 第 03 步的紧凑 Textual 对话界面，支持 Agent Loop 与工具调用展示。"""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import random
 import time
 from collections.abc import Callable
 from typing import Any
@@ -20,10 +21,13 @@ from textual.widgets.option_list import Option
 from .agent import (
     Agent,
     ErrorEvent,
+    LoopComplete,
+    RetryEvent,
     StreamText,
     ThinkingText,
     ToolResultEvent,
     ToolUseEvent,
+    TurnComplete,
     UsageEvent,
 )
 from .client import (
@@ -42,6 +46,39 @@ from .tools.base import ToolResult
 
 # 工具调用详情展示的最大行数，超过则截断并提示剩余行数。
 MAX_TRUNCATED_LINES: int = 20
+
+# 可折叠的工具集合：只读工具在多工具回合时折叠为摘要。
+COLLAPSIBLE_TOOLS: frozenset[str] = frozenset({"ReadFile", "Glob", "Grep"})
+
+# thinking-done 行使用的动词列表，循环时随机选取一个。
+THINKING_VERBS: list[str] = [
+    "Accomplishing", "Architecting", "Baking", "Brewing",
+    "Calculating", "Cascading", "Cerebrating", "Choreographing",
+    "Churning", "Coalescing", "Cogitating", "Composing",
+    "Computing", "Concocting", "Considering", "Contemplating",
+    "Cooking", "Crafting", "Creating", "Crunching", "Crystallizing",
+    "Cultivating", "Deciphering", "Deliberating", "Doodling",
+    "Elucidating", "Enchanting", "Envisioning", "Fermenting",
+    "Forging", "Generating", "Germinating", "Harmonizing",
+    "Hatching", "Ideating", "Imagining", "Improvising", "Incubating",
+    "Inferring", "Infusing", "Manifesting", "Marinating",
+    "Meandering", "Mulling", "Musing", "Noodling", "Orbiting",
+    "Orchestrating", "Percolating", "Pondering", "Pontificating",
+    "Puzzling", "Ruminating", "Simmering", "Sketching", "Spinning",
+    "Synthesizing", "Thinking", "Tinkering", "Transmuting",
+    "Unfurling", "Unravelling", "Wandering", "Whisking", "Working",
+    "Wrangling",
+]
+
+
+# 把现在进行时动词转换为过去式，用于 thinking-done 行。
+def _to_past_tense(verb: str) -> str:
+    if verb.endswith("ing"):
+        stem = verb[:-3]
+        if stem.endswith("e"):
+            return stem + "d"
+        return stem + "ed"
+    return verb + "ed"
 
 
 def _tool_title(tool_name: str, arguments: dict[str, Any]) -> str:
@@ -173,6 +210,41 @@ class ToolCallBlock(Static, can_focus=True):
             self._render_expanded()
 
 
+class ToolGroupSummary(Static, can_focus=True):
+    """多工具调用分组的折叠摘要，显示工具数量与总耗时。"""
+
+    def __init__(self, count: int, total_elapsed: float, **kwargs: Any) -> None:
+        label = f"● Done ({count} tool uses · {total_elapsed:.1f}s)  (ctrl+o to expand)"
+        super().__init__(label, **kwargs)
+        self._count = count
+        self._total = total_elapsed
+        self._expanded = False
+
+    # 切换展开/折叠态显示。
+    def _refresh_display(self) -> None:
+        if self._expanded:
+            self.update(f"▼ Done ({self._count} tool uses · {self._total:.1f}s)")
+        else:
+            self.update(
+                f"● Done ({self._count} tool uses · {self._total:.1f}s)"
+                "  (ctrl+o to expand)"
+            )
+
+    # 切换展开/折叠状态。
+    def toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._refresh_display()
+
+    # 返回当前是否处于展开态，供 ctrl+o 同步工具块显示。
+    @property
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    # 点击切换展开/折叠。
+    def on_click(self) -> None:
+        self.toggle()
+
+
 class ChatInput(TextArea):
     """提供 Enter 发送与 Shift+Enter 换行的对话输入框。"""
 
@@ -209,12 +281,18 @@ class SeaCodeApp(App[None]):
     CSS_PATH = "styles.tcss"
     TITLE = "SeaCode"
 
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("ctrl+o", "toggle_tool_blocks", "Toggle tools", priority=True),
+    ]
+
     # 初始化当前配置、客户端、工具注册中心和单回合状态。
     def __init__(
         self,
         providers: tuple[ProviderConfig, ...] | list[ProviderConfig],
         *,
         client_factory: Callable[[ProviderConfig], LLMClient] = create_client,
+        max_steps: int = 100,
     ) -> None:
         super().__init__()
         self._providers = tuple(providers)
@@ -224,6 +302,8 @@ class SeaCodeApp(App[None]):
         self._selected_provider: ProviderConfig | None = None
         self._tool_registry = create_default_registry()
         self._streaming = False
+        self._agent_task: asyncio.Task[None] | None = None
+        self._max_steps = max_steps
 
     # 生成三行品牌标题，保留终端对话的既定信息层级。
     @staticmethod
@@ -302,14 +382,31 @@ class SeaCodeApp(App[None]):
         self._set_status("Configuration error")
         self.call_after_refresh(self._append_error, self._error_message(error))
 
-    # 接收输入消息并把单个活动回合交给 Textual worker 执行。
+    # 接收输入消息并把单个活动回合交给异步任务执行，支持 ESC 取消。
     def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         if self._streaming or self._client is None:
             return
         self._streaming = True
-        self.run_worker(self._run_turn(event.text), name="conversation", exclusive=True)
+        self._agent_task = asyncio.create_task(self._run_turn(event.text))
 
-    # 执行一条完整工具调度回合，消费 AgentEvent 流并在成功时保留逻辑历史。
+    # ESC 取消正在进行的回合；非流式状态下不响应，避免抢占其它语义。
+    def action_cancel(self) -> None:
+        if self._streaming and self._agent_task is not None:
+            self._agent_task.cancel()
+
+    # ctrl+o 切换当前回合 ToolGroupSummary 的展开/折叠，并同步隐藏工具块的显示。
+    def action_toggle_tool_blocks(self) -> None:
+        for summary in self.query(ToolGroupSummary):
+            summary.toggle()
+            expanded = summary.is_expanded
+            parent = summary.parent
+            if parent is None:
+                continue
+            for block in parent.query(ToolCallBlock):
+                if block.tool_name in COLLAPSIBLE_TOOLS:
+                    block.display = expanded
+
+    # 执行一条完整 Agent Loop 回合，消费 AgentEvent 流并管理 TUI 展示与取消。
     async def _run_turn(self, text: str) -> None:
         client = self._client
         provider = self._selected_provider
@@ -327,10 +424,14 @@ class SeaCodeApp(App[None]):
         user_message.append("❯ ", style="bold #71b8bc")
         user_message.append(text, style="bold #f2f5f5")
         await self._append_static(user_message, "message user-message")
-        live_answer = Static(Text(""), classes="message assistant-message")
+
         chat = self.query_one("#chat-area", VerticalScroll)
-        await chat.mount(live_answer)
+        ai_row = Vertical(classes="ai-row")
+        await chat.mount(ai_row)
+        live_answer = Static(Text(""), classes="message assistant-message")
+        await ai_row.mount(live_answer)
         started = time.monotonic()
+        thinking_verb = random.choice(THINKING_VERBS)
         answer = ""
         thinking_widget: Static | None = None
         thinking = ""
@@ -343,6 +444,7 @@ class SeaCodeApp(App[None]):
                 client=client,
                 registry=self._tool_registry,
                 protocol=provider.protocol,
+                max_iterations=self._max_steps,
             )
             async for event in agent.run(self._conversation, SYSTEM_PROMPT):
                 if isinstance(event, StreamText):
@@ -364,7 +466,7 @@ class SeaCodeApp(App[None]):
                 elif isinstance(event, ToolUseEvent):
                     block = ToolCallBlock(event.tool_name, event.arguments)
                     tool_blocks[event.tool_id] = block
-                    await chat.mount(block)
+                    await ai_row.mount(block)
                     chat.scroll_end(animate=False)
                 elif isinstance(event, ToolResultEvent):
                     result_block = tool_blocks.get(event.tool_id)
@@ -374,16 +476,46 @@ class SeaCodeApp(App[None]):
                             event.elapsed,
                         )
                     chat.scroll_end(animate=False)
+                elif isinstance(event, RetryEvent):
+                    await self._show_system_message(f"↻ Retrying: {event.reason}")
                 elif isinstance(event, UsageEvent):
                     total_input = event.input_tokens
                     total_output = event.output_tokens
                 elif isinstance(event, ErrorEvent):
                     await self._append_error(event.message)
-                # TurnComplete / LoopComplete 不需要额外 UI 动作。
+                elif isinstance(event, TurnComplete):
+                    # 可折叠工具 >=2 个时 mount 摘要并隐藏工具块。
+                    collapsible = [
+                        (tid, blk) for tid, blk in tool_blocks.items()
+                        if blk.tool_name in COLLAPSIBLE_TOOLS and not blk._loading
+                    ]
+                    if len(collapsible) >= 2:
+                        total_elapsed = sum(blk._elapsed for _, blk in collapsible)
+                        summary = ToolGroupSummary(len(collapsible), total_elapsed)
+                        for _, blk in collapsible:
+                            blk.display = False
+                        await ai_row.mount(summary)
+                    # 重置工具块字典，开新 ai_row 供下一轮工具调用。
+                    tool_blocks.clear()
+                    ai_row = Vertical(classes="ai-row")
+                    await chat.mount(ai_row)
+                    live_answer = Static(Text(""), classes="message assistant-message")
+                    await ai_row.mount(live_answer)
+                    answer = ""
+                    chat.scroll_end(animate=False)
+                elif isinstance(event, LoopComplete):
+                    total_time = time.monotonic() - started
+                    done_label = Static(
+                        f"✻ {_to_past_tense(thinking_verb)} for {total_time:.1f}s",
+                        classes="message thinking-done",
+                    )
+                    await ai_row.mount(done_label)
+                    chat.scroll_end(animate=False)
 
+            # 收尾：渲染剩余的累积文本。
             await live_answer.remove()
             final_answer = answer or "*(The provider completed without text.)*"
-            await chat.mount(
+            await ai_row.mount(
                 Markdown(final_answer, classes="message assistant-markdown")
             )
             elapsed = time.monotonic() - started
@@ -391,10 +523,16 @@ class SeaCodeApp(App[None]):
                 f"Ready  {elapsed:.1f}s  in {total_input} / out {total_output}"
             )
         except asyncio.CancelledError:
-            self._rollback_turn(turn_start_len)
-            await self._append_error(
-                "The request was cancelled. You can continue this conversation."
-            )
+            # 保留已累积的流式文本并追加 [cancelled] 标记。
+            await live_answer.remove()
+            if answer:
+                await ai_row.mount(
+                    Markdown(
+                        answer + "\n\n*[cancelled]*",
+                        classes="message assistant-markdown",
+                    )
+                )
+            await self._show_system_message("Operation cancelled")
             self._set_status("Ready")
             raise
         except LLMError as error:
@@ -409,6 +547,7 @@ class SeaCodeApp(App[None]):
             self._set_status("Ready")
         finally:
             self._streaming = False
+            self._agent_task = None
             input_widget.disabled = self._client is None
             if not input_widget.disabled:
                 input_widget.focus()
@@ -427,6 +566,10 @@ class SeaCodeApp(App[None]):
     # 在对话区追加不包含原始异常内容的错误消息。
     async def _append_error(self, message: str) -> None:
         await self._append_static(Text(f"✖ {message}"), "message error-message")
+
+    # 在对话区追加一条系统提示消息（取消、重试等），用 dim 样式与正文区分。
+    async def _show_system_message(self, text: str) -> None:
+        await self._append_static(Text(text), "message system-message")
 
     # 将有限错误类别映射成可行动但不泄露细节的文本。
     def _error_message(self, error: LLMError) -> str:
