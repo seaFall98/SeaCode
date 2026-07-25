@@ -8,6 +8,8 @@
 /.seacode/memory/
 /.seacode/history
 /.seacode/history.*
+# 自定义命令目录预留：用户本地命令可能含敏感信息，不进入版本控制。
+/.seacode/commands/
 
 __pycache__/
 *.py[cod]
