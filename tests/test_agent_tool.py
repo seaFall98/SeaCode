@@ -560,8 +560,9 @@ async def test_team_name_branch_returns_error() -> None:
     assert "第 14 步" in result.content
 
 
-# 验证 isolation=worktree 分支返回 is_error 提示第 13 步。
-# fake loader 返回 isolation=worktree 的 AgentDef，断言 is_error=True 且 output 含 "第 13 步"。
+# 验证 isolation=worktree 分支在 worktree_manager 未注入时返回 is_error。
+# fake loader 返回 isolation=worktree 的 AgentDef，未 set_worktree_manager，
+# 断言 is_error=True 且 content 含 "未初始化" 提示。
 async def test_isolation_worktree_branch_returns_error() -> None:
     loader = _FakeLoader(agent_def=_make_def(isolation="worktree"))
     tool, _ = _make_tool(loader=loader)
@@ -570,7 +571,7 @@ async def test_isolation_worktree_branch_returns_error() -> None:
     result = await tool.execute(params, conversation=None, parent_agent=tool.parent_agent)
 
     assert result.is_error is True
-    assert "第 13 步" in result.content
+    assert "未初始化" in result.content
 
 
 # ---------------------------------------------------------------------------

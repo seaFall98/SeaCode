@@ -323,3 +323,39 @@ def test_parse_agent_file_invalid_frontmatter_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(AgentParseError, match="missing 'name'"):
         parse_agent_file(agent_md, source="project")
+
+
+# 验证 parse_agent_file 把 isolation: worktree 字段传入 AgentDef。
+# 构造 frontmatter 含 isolation: worktree 的文件，断言 agent_def.isolation == "worktree"。
+def test_parse_agent_file_passes_isolation_field(tmp_path: Path) -> None:
+    agent_md = tmp_path / "iso.md"
+    agent_md.write_text(
+        "---\nname: Iso\ndescription: y\nisolation: worktree\n---\nbody",
+        encoding="utf-8",
+    )
+    agent_def = parse_agent_file(agent_md, source="project")
+    assert agent_def.isolation == "worktree"
+
+
+# 验证 parse_agent_file 在 isolation 缺失时使用默认空串。
+# 构造无 isolation 字段的 frontmatter，断言 agent_def.isolation == ""。
+def test_parse_agent_file_defaults_isolation_to_empty(tmp_path: Path) -> None:
+    agent_md = tmp_path / "noiso.md"
+    agent_md.write_text(
+        "---\nname: NoIso\ndescription: y\n---\nbody",
+        encoding="utf-8",
+    )
+    agent_def = parse_agent_file(agent_md, source="project")
+    assert agent_def.isolation == ""
+
+
+# 验证 parse_agent_file 非法 isolation 抛 AgentParseError。
+# 构造 isolation: invalid 的 frontmatter，断言抛错且消息含 invalid isolation。
+def test_parse_agent_file_invalid_isolation_raises(tmp_path: Path) -> None:
+    agent_md = tmp_path / "badiso.md"
+    agent_md.write_text(
+        "---\nname: BadIso\ndescription: y\nisolation: invalid\n---\nbody",
+        encoding="utf-8",
+    )
+    with pytest.raises(AgentParseError, match="invalid isolation"):
+        parse_agent_file(agent_md, source="project")

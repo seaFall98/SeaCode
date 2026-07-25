@@ -1,16 +1,18 @@
-"""Agent 工具：定义式 + Fork 双路径子 Agent 调度。
+"""Agent 工具：定义式 + Fork + Worktree 隔离三路径子 Agent 调度。
 
 按 ``params.subagent_type`` 分流：非空走定义式（从 AgentLoader 取 AgentDef，
 按 ``is_background`` 过滤工具），留空走 Fork（要求 ``enable_fork=true``，
 调用 ``build_forked_messages`` 复制父对话历史，工具用 ``clone_registry_for_fork``）。
+``AgentDef.isolation == "worktree"`` 时走 Worktree 隔离路径：在独立 worktree
+中创建子 Agent 执行任务，结束后按变更检测结果自动清理或保留。
 
-``team_name`` 与 ``isolation=worktree`` 分支保留入口但内部直接返回 is_error，
-分别由第 14 步与第 13 步启用真实路由。
+``team_name`` 分支保留入口但内部直接返回 is_error，由第 14 步启用真实路由。
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any
 
 from pydantic import BaseModel
@@ -26,6 +28,10 @@ from seacode.agents.task_manager import TaskManager
 from seacode.agents.tool_filter import clone_registry_for_fork, resolve_agent_tools
 from seacode.agents.trace import TraceManager
 from seacode.tools.base import Tool, ToolCategory, ToolResult
+from seacode.worktree.integration import build_worktree_notice, generate_worktree_name
+from seacode.worktree.manager import WorktreeError, WorktreeManager
+
+log = logging.getLogger(__name__)
 
 # 别名到具体模型 id 的映射；占位字符串由 app.py 在初始化时按配置注入。
 # 这里保留默认值，让单测可以不依赖外部配置直接构造。
@@ -170,10 +176,10 @@ class AgentTool(Tool):
                 is_error=True,
             )
 
-        # 第 13 步启用 worktree 路由；本步保留入口返回 is_error。
+        # isolation=worktree 走 Worktree 隔离路径：在独立 worktree 中执行子 Agent。
         if definition.isolation == "worktree":
-            return ToolResult(
-                content="worktree 路径在第 13 步启用", is_error=True
+            return await self._execute_with_worktree(
+                params, conversation, parent_agent, definition
             )
 
         # fork 默认后台；定义式看 run_in_background / definition.background。
@@ -326,3 +332,89 @@ class AgentTool(Tool):
     # 兼容基类签名；实际 execute 走三参版本。
     async def _execute(self, params: BaseModel) -> ToolResult:  # pragma: no cover
         return await self.execute(params)
+
+    # 注入 WorktreeManager；app.py 在装配阶段调用，None 时关闭 worktree 隔离路径。
+    def set_worktree_manager(self, manager: WorktreeManager | None) -> None:
+        self.worktree_manager = manager
+
+    # 在隔离 worktree 中执行子 Agent；任务文本前注入 worktree 上下文通知。
+    # 子 Agent 复用父 client/protocol/context_window，work_dir 切换到 worktree 路径，
+    # 权限默认 bypassPermissions（隔离环境不阻塞主循环）。执行完后 auto_cleanup 检查
+    # 变更：无变更自动删除 worktree；有变更保留并在结果末尾附加路径提示。
+    async def _execute_with_worktree(
+        self,
+        params: AgentToolParams,
+        conversation: Any,
+        parent_agent: Any,
+        definition: AgentDef,
+    ) -> ToolResult:
+        del conversation  # worktree 子 Agent 不复用父对话历史
+        if self.worktree_manager is None:
+            return ToolResult(
+                content="Worktree manager 未初始化", is_error=True
+            )
+        name = generate_worktree_name()
+        try:
+            wt = await self.worktree_manager.create(name, "HEAD")
+        except WorktreeError as e:
+            return ToolResult(
+                content=f"创建 worktree 失败: {e}", is_error=True
+            )
+        # 构造注入子 Agent 任务前的 worktree 上下文通知。
+        parent_cwd = str(getattr(parent_agent, "work_dir", "."))
+        notice = build_worktree_notice(parent_cwd, wt.path)
+        task_with_notice = notice + "\n\n" + params.prompt
+
+        # 复用父 Agent 工具集，让子 Agent 在隔离环境中仍能用 ReadFile/WriteFile 等。
+        parent_registry = getattr(parent_agent, "_full_registry", None)
+        if parent_registry is not None:
+            sub_registry = clone_registry_for_fork(parent_registry)
+        else:
+            from seacode.tools import ToolRegistry
+
+            sub_registry = ToolRegistry()
+
+        client = self._select_llm(params, definition, parent_agent)
+        sub_agent = self._create_sub_agent(
+            client=client,
+            parent_agent=parent_agent,
+            definition=definition,
+            sub_registry=sub_registry,
+        )
+        # 覆盖 work_dir 到 worktree 路径，让子 Agent 的所有工具调用都在隔离环境内。
+        sub_agent.work_dir = wt.path
+
+        # 调用链追踪：trace_id 继承父 Agent；agent_id 由 TraceManager 生成。
+        parent_trace_id: str = str(
+            getattr(parent_agent, "trace_id", None)
+            or getattr(parent_agent, "agent_id", "root")
+        )
+        trace_node = self.trace_manager.create(
+            agent_type=definition.agent_type,
+            parent_id=getattr(parent_agent, "agent_id", None),
+            trace_id=parent_trace_id,
+        )
+        sub_agent.agent_id = trace_node.agent_id
+        sub_agent.parent_id = getattr(parent_agent, "agent_id", None)
+        sub_agent.trace_id = parent_trace_id
+
+        try:
+            result_text = await sub_agent.run_to_completion(task_with_notice)
+            self.trace_manager.update(
+                trace_node.agent_id,
+                input_tokens=getattr(sub_agent, "total_input_tokens", 0),
+                output_tokens=getattr(sub_agent, "total_output_tokens", 0),
+            )
+            self.trace_manager.complete(trace_node.agent_id)
+        except Exception as e:
+            log.error("worktree 子 Agent 执行失败: %s", e)
+            self.trace_manager.complete(trace_node.agent_id, status="failed")
+            return ToolResult(
+                content=f"子 Agent 执行失败: {e}", is_error=True
+            )
+
+        # 无变更自动删除；有变更保留并在结果末尾附加路径提示。
+        cleanup = await self.worktree_manager.auto_cleanup(name, wt.head_commit)
+        if cleanup.kept:
+            result_text = (result_text or "") + f"\n[Worktree preserved at {wt.path}]"
+        return ToolResult(content=result_text or "", is_error=False)

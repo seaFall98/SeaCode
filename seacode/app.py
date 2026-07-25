@@ -61,6 +61,7 @@ from .commands import (
     parse_command,
 )
 from .commands.handlers import register_all_commands
+from .commands.handlers.rewind import create_rewind_command
 from .commands.handlers.skill import SKILL_COMMAND
 from .commands.handlers.skill_register import (
     make_skill_register_callback,
@@ -68,8 +69,10 @@ from .commands.handlers.skill_register import (
 )
 from .commands.handlers.tasks import create_tasks_command
 from .commands.handlers.trace import create_trace_command
-from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig
+from .commands.handlers.worktree import create_worktree_command
+from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig, WorktreeConfig
 from .conversation import ConversationManager, Message
+from .filehistory.history import FileHistory
 from .hooks import HookContext, HookEngine
 from .mcp import MCPManager
 from .memory import (
@@ -96,8 +99,12 @@ from .tools.agent_tool import AgentTool
 from .tools.ask_user import AskUserTool
 from .tools.base import ToolResult
 from .tools.bash import Bash
+from .tools.enter_worktree import EnterWorktreeTool
+from .tools.exit_worktree import ExitWorktreeTool
 from .tools.install_skill import InstallSkill
 from .tools.load_skill import LoadSkill
+from .worktree.cleanup import start_stale_cleanup_task
+from .worktree.manager import WorktreeManager
 
 # 工具调用详情展示的最大行数，超过则截断并提示剩余行数。
 MAX_TRUNCATED_LINES: int = 20
@@ -696,6 +703,8 @@ class SeaCodeApp(App[None]):
         # enable_verification_agent 加载内置 Verification 子 Agent。
         enable_fork: bool = False,
         enable_verification_agent: bool = False,
+        # batch13：Worktree 隔离工作区配置；从 .seacode/config.yaml 的 worktree 段加载。
+        worktree_cfg: WorktreeConfig | None = None,
     ) -> None:
         super().__init__()
         self._providers = tuple(providers)
@@ -709,6 +718,16 @@ class SeaCodeApp(App[None]):
         self._max_steps = max_steps
         # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，默认全关闭。
         self._sandbox_cfg = sandbox_cfg or SandboxAppConfig()
+        # batch13：Worktree 隔离工作区配置与运行时管理器。
+        # worktree_cfg 在 _select_provider 中按配置初始化 WorktreeManager；
+        # worktree_manager / file_history 在装配阶段填充，None 时关闭相关路径。
+        self._worktree_cfg = worktree_cfg or WorktreeConfig()
+        self.worktree_manager: WorktreeManager | None = None
+        self.file_history: FileHistory | None = None
+        self._stale_cleanup_task: asyncio.Task[None] | None = None
+        # restore_session 是 async，但 _assemble_worktree_system 是 sync；
+        # 故调度为 task，在 _run_turn 创建 Agent 前 await 并据结果切换 work_dir。
+        self._restore_session_task: asyncio.Task[Any] | None = None
         # batch11：生命周期 Hook 引擎；为 None 时所有注入点零开销。
         # 由 __main__.py 通过 load_hooks(config.raw_hooks) 构造后注入；
         # on_mount 时触发 startup 事件，on_unmount 时触发 shutdown 事件。
@@ -918,6 +937,13 @@ class SeaCodeApp(App[None]):
             self.trace_manager = None
             self._agent_tool = None
             self._ask_user_tool = None
+        # batch13：装配 Worktree 隔离工作区与文件历史。
+        # WorktreeManager 按配置的 symlink_directories 初始化；restore_session 在
+        # 启动时尝试恢复中断的 worktree session。FileHistory 按 session_id 隔离快照，
+        # 注入到 write_file/edit_file 工具与 Agent。EnterWorktree/ExitWorktree 工具
+        # 与 /worktree /rewind 命令注册到对应注册中心。后台清理 task 按 interval/cutoff
+        # 自动回收 stale worktree。失败不阻断启动——worktree 能力降级为不可用。
+        self._assemble_worktree_system(work_dir)
         # 启动后台任务通知轮询；on_unmount 时取消。
         if self.task_manager is not None and self._notification_polling_task is None:
             try:
@@ -938,6 +964,76 @@ class SeaCodeApp(App[None]):
         input_widget = self.query_one(ChatInput)
         input_widget.disabled = False
         input_widget.focus()
+
+    # batch13：装配 WorktreeManager、FileHistory、工具与命令注册、后台清理 task。
+    # 任一步失败静默降级，不阻断 Provider 选择主流程；worktree_manager 为 None 时
+    # AgentTool 的 _execute_with_worktree 路径返回错误，EnterWorktree/ExitWorktree
+    # 工具不注册，/worktree /rewind 命令不注册。
+    def _assemble_worktree_system(self, work_dir: str) -> None:
+        try:
+            wt_cfg = self._worktree_cfg
+            self.worktree_manager = WorktreeManager(
+                repo_root=work_dir,
+                symlink_directories=list(wt_cfg.symlink_directories),
+            )
+            # 注入到 AgentTool 让 _execute_with_worktree 路径可用。
+            if self._agent_tool is not None:
+                self._agent_tool.set_worktree_manager(self.worktree_manager)
+            # 注册 EnterWorktree / ExitWorktree 工具。
+            self._tool_registry.register(
+                EnterWorktreeTool(self.worktree_manager)
+            )
+            self._tool_registry.register(
+                ExitWorktreeTool(self.worktree_manager)
+            )
+            # 注册 /worktree /rewind 命令。
+            self._command_registry.register_sync(
+                create_worktree_command(self.worktree_manager)
+            )
+            self._command_registry.register_sync(create_rewind_command())
+            # 调度 restore_session；_run_turn 创建 Agent 前 await 结果，
+            # 据恢复的 session 切换 agent.work_dir 到 worktree 路径。
+            if self._restore_session_task is None:
+                try:
+                    self._restore_session_task = asyncio.create_task(
+                        self.worktree_manager.restore_session()
+                    )
+                except RuntimeError:
+                    # 事件循环尚未启动（如测试环境）；_run_turn 会再次尝试。
+                    self._restore_session_task = None
+            # 启动后台 stale worktree 清理 task；on_unmount 时取消。
+            if self._stale_cleanup_task is None:
+                try:
+                    self._stale_cleanup_task = asyncio.create_task(
+                        start_stale_cleanup_task(
+                            self.worktree_manager,
+                            wt_cfg.stale_cleanup_interval,
+                            wt_cfg.stale_cutoff_hours,
+                        )
+                    )
+                except RuntimeError:
+                    # 事件循环尚未启动（如测试环境）；跳过，下次 _select_provider 重试。
+                    self._stale_cleanup_task = None
+        except Exception:
+            # 装配失败时降级为不可用，主流程继续。
+            self.worktree_manager = None
+        # FileHistory 装配：按 session_id 隔离快照，注入到 Agent 与写文件工具。
+        # 失败不阻断启动；file_history 为 None 时 Agent.run 跳过 make_snapshot。
+        try:
+            session_id = ""
+            if self._session is not None:
+                session_id = self._session.session_id
+            if session_id:
+                self.file_history = FileHistory(work_dir, session_id)
+                # 注入到 write_file/edit_file 等持有 file_history 属性的工具。
+                for tool in self._tool_registry.list_tools():
+                    if hasattr(tool, "file_history"):
+                        try:
+                            tool.file_history = self.file_history
+                        except Exception:
+                            continue
+        except Exception:
+            self.file_history = None
 
     # 装配权限检查器与 OS 级沙箱：三层规则文件 + 危险命令检测 + 路径沙箱 + 模式 + 沙箱挂载。
     def _assemble_permission_system(self) -> None:
@@ -1345,6 +1441,19 @@ class SeaCodeApp(App[None]):
         total_output = 0
 
         try:
+            # batch13：在创建 Agent 前 await restore_session 结果。
+            # 若恢复了中断的 worktree session，把 Agent 的 work_dir 切换到 worktree 路径，
+            # 让工具调用直接在隔离工作区执行；未恢复时使用当前工作目录。
+            restored_work_dir: str | None = None
+            if self._restore_session_task is not None:
+                try:
+                    restored = await self._restore_session_task
+                    if restored is not None:
+                        restored_work_dir = restored.worktree_path
+                except Exception:
+                    # restore_session 失败不阻断主循环；按当前工作目录继续。
+                    pass
+                self._restore_session_task = None
             agent = Agent(
                 client=client,
                 registry=self._tool_registry,
@@ -1361,6 +1470,12 @@ class SeaCodeApp(App[None]):
             )
             # 保存当前回合 Agent 引用，供命令路径（/status /compact /plan 等）访问。
             self._agent = agent
+            # batch13：注入 FileHistory 与恢复的 worktree work_dir。
+            # file_history 为 None 时 Agent.run 跳过 make_snapshot（向后兼容）。
+            if self.file_history is not None:
+                agent.file_history = self.file_history
+            if restored_work_dir is not None:
+                agent.work_dir = restored_work_dir
             # batch10：刷新 Skill 系统对当前回合 Agent 的引用。
             # executor 持有 agent 供 inline/fork 执行；load_skill 调 agent.activate_skill。
             # skill_catalog 注入环境上下文，让模型知道可用 Skill。
@@ -1743,10 +1858,17 @@ class SeaCodeApp(App[None]):
     # batch11：触发 shutdown 事件；用 ensure_future 后台执行，避免 on_unmount
     # 等待 Hook 完成（shutdown Hook 异常由 _run_single 兜底捕获记 warning）。
     # batch12：取消后台任务通知轮询协程，避免退出后仍尝试访问已关闭的对话历史。
+    # batch13：取消 stale worktree 清理 task 与 restore_session task，避免退出后残留。
     def on_unmount(self) -> None:
         if self._notification_polling_task is not None:
             self._notification_polling_task.cancel()
             self._notification_polling_task = None
+        if self._stale_cleanup_task is not None:
+            self._stale_cleanup_task.cancel()
+            self._stale_cleanup_task = None
+        if self._restore_session_task is not None:
+            self._restore_session_task.cancel()
+            self._restore_session_task = None
         if self._hook_engine is not None:
             try:
                 asyncio.ensure_future(self._trigger_shutdown_hooks())

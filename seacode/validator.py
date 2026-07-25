@@ -43,3 +43,41 @@ def validate_hooks(raw_hooks: Any) -> list[dict]:
         return raw_hooks
     from seacode.config import ConfigError
     raise ConfigError("'hooks' must be a list of hook definitions")
+
+
+# batch13：校验 worktree 配置段；返回 WorktreeConfig 实例。
+# symlink_directories 必须是 list[str]；stale_cleanup_interval / stale_cutoff_hours 必须是正整数。
+# 缺字段用默认值；类型非法抛 ConfigError（延迟导入避免循环依赖）。
+def validate_worktree(data: dict[str, Any]) -> Any:
+    from seacode.config import WorktreeConfig
+
+    if not isinstance(data, dict):
+        return WorktreeConfig()
+
+    raw_symlinks = data.get("symlink_directories", [])
+    if raw_symlinks is None:
+        raw_symlinks = []
+    if not isinstance(raw_symlinks, list):
+        from seacode.config import ConfigError
+        raise ConfigError("'worktree.symlink_directories' must be a list of strings")
+    symlinks = tuple(str(s) for s in raw_symlinks)
+
+    raw_interval = data.get("stale_cleanup_interval", 3600)
+    if not isinstance(raw_interval, int) or isinstance(raw_interval, bool) or raw_interval <= 0:
+        from seacode.config import ConfigError
+        raise ConfigError(
+            "'worktree.stale_cleanup_interval' must be a positive integer"
+        )
+
+    raw_cutoff = data.get("stale_cutoff_hours", 24)
+    if not isinstance(raw_cutoff, int) or isinstance(raw_cutoff, bool) or raw_cutoff <= 0:
+        from seacode.config import ConfigError
+        raise ConfigError(
+            "'worktree.stale_cutoff_hours' must be a positive integer"
+        )
+
+    return WorktreeConfig(
+        symlink_directories=symlinks,
+        stale_cleanup_interval=raw_interval,
+        stale_cutoff_hours=raw_cutoff,
+    )
