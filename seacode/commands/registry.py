@@ -73,6 +73,16 @@ class CommandRegistry:
     def register_sync(self, command: Command) -> None:
         self._register_inner(command)
 
+    # 注销命令：按主名移除命令与别名映射；不存在时静默返回。
+    # 供 Skill reload 时清理旧命令再重注册，避免重复注册冲突。
+    def unregister(self, name: str) -> None:
+        cmd = self._commands.pop(name, None)
+        if cmd is None:
+            return
+        for alias in cmd.aliases:
+            if self._alias_map.get(alias) == name:
+                self._alias_map.pop(alias, None)
+
     # 实际注册逻辑：检查命令名与别名的双向冲突。
     def _register_inner(self, command: Command) -> None:
         if command.name in self._commands:

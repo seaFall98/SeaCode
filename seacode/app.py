@@ -53,6 +53,11 @@ from .commands import (
     parse_command,
 )
 from .commands.handlers import register_all_commands
+from .commands.handlers.skill import SKILL_COMMAND
+from .commands.handlers.skill_register import (
+    make_skill_register_callback,
+    register_skill_commands,
+)
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig
 from .conversation import ConversationManager, Message
 from .mcp import MCPManager
@@ -74,9 +79,12 @@ from .permissions import (
 )
 from .sandbox import SandboxConfig, create_sandbox
 from .session_dialog import InlineResumeWidget
+from .skills import SkillExecutor, SkillLoader
 from .tools import create_default_registry
 from .tools.base import ToolResult
 from .tools.bash import Bash
+from .tools.install_skill import InstallSkill
+from .tools.load_skill import LoadSkill
 
 # 工具调用详情展示的最大行数，超过则截断并提示剩余行数。
 MAX_TRUNCATED_LINES: int = 20
@@ -609,6 +617,29 @@ class SeaCodeApp(App[None]):
         register_all_commands(self._command_registry)
         self._completion_popup = CompletionPopup()
         self._agent: Agent | None = None
+        # batch10：Skill 系统。loader 两级搜索项目级与用户级 skills 目录；
+        # executor 持有当前回合 Agent 引用（_run_turn 中刷新），inline/fork 执行 Skill。
+        # load_skill/install_skill 工具注入到 ToolRegistry，/skill 命令注册到 CommandRegistry。
+        # 每个 Skill 自动注册为 PROMPT 斜杠命令；reload 时通过回调重注册。
+        self._skill_loader = SkillLoader(
+            project_dir=Path(os.getcwd()) / ".seacode" / "skills",
+            user_dir=Path.home() / ".seacode" / "skills",
+        )
+        self._skill_loader.load_all()
+        # executor 初始 agent=None，_run_turn 中刷新为当前回合 Agent。
+        self._skill_executor = SkillExecutor(agent=None)
+        self._load_skill_tool = LoadSkill()
+        self._load_skill_tool.set_loader(self._skill_loader)
+        self._install_skill_tool = InstallSkill()
+        self._install_skill_tool.set_loader(self._skill_loader)
+        self._install_skill_tool.set_on_installed(self._make_skill_register_callback())
+        self._tool_registry.register(self._load_skill_tool)
+        self._tool_registry.register(self._install_skill_tool)
+        self._command_registry.register_sync(SKILL_COMMAND)
+        register_skill_commands(
+            self._command_registry, self._skill_loader, self._skill_executor
+        )
+        self._skill_loader.register_reload_callback(self._make_skill_register_callback())
 
     # 生成三行品牌标题，保留终端对话的既定信息层级。
     @staticmethod
@@ -826,7 +857,28 @@ class SeaCodeApp(App[None]):
                 "render_restored": lambda msgs: asyncio.create_task(
                     self._render_restored_messages(msgs)
                 ),
+                # batch10：/skill reload 通过这两个回调触发斜杠命令重注册与 catalog 刷新。
+                "register_skill_commands": self._make_skill_register_callback(),
+                "build_skill_catalog": self._build_skill_catalog_text,
             },
+        )
+
+    # batch10：拼装 Skill 目录摘要文本，注入环境上下文让模型感知可用 Skill。
+    # 空 catalog 返回空字符串，避免注入空段落。
+    def _build_skill_catalog_text(self) -> str:
+        catalog = self._skill_loader.get_catalog()
+        if not catalog:
+            return ""
+        lines = ["You can use the following Skills:"]
+        for name, desc in sorted(catalog):
+            lines.append(f"- {name}: {desc}")
+        return "\n".join(lines)
+
+    # batch10：返回 register_skill_commands 的闭包回调。
+    # InstallSkill 安装成功与 /skill reload 时调用，重新注册所有 Skill 为斜杠命令。
+    def _make_skill_register_callback(self) -> Callable[[], None]:
+        return make_skill_register_callback(
+            self._command_registry, self._skill_loader, self._skill_executor
         )
 
     # UIController: 在对话区追加系统消息（同步入口，内部异步调度）。
@@ -1023,6 +1075,13 @@ class SeaCodeApp(App[None]):
             )
             # 保存当前回合 Agent 引用，供命令路径（/status /compact /plan 等）访问。
             self._agent = agent
+            # batch10：刷新 Skill 系统对当前回合 Agent 的引用。
+            # executor 持有 agent 供 inline/fork 执行；load_skill 调 agent.activate_skill。
+            # skill_catalog 注入环境上下文，让模型知道可用 Skill。
+            self._skill_executor._agent = agent
+            self._load_skill_tool.set_agent(agent)
+            agent.set_skill_loader(self._skill_loader)
+            agent.set_skill_catalog(self._build_skill_catalog_text())
             # 同步当前会话 ID 给 Agent，仅用于压缩摘要里的 transcript_path 提示。
             if self._session is not None:
                 agent.session_id = self._session.session_id
