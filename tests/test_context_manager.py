@@ -755,19 +755,27 @@ def test_build_recovery_attachment_returns_empty_when_nothing_to_attach() -> Non
 
 
 # 验证 build_recovery_attachment 文件数超过 5 时只渲染前 5 个。
+# 显式构造 FileReadRecord 并赋予单调递增的 timestamp，避免依赖 time.time()
+# 在同一时钟滴答内的精度差异——Windows 上 7 次连续调用常返回相同值使排序
+# 退化为插入顺序，而 CI（Linux）精度更高每次都不同，导致断言跨环境不一致。
 def test_build_recovery_attachment_truncates_files_at_limit() -> None:
+    from seacode.context.manager import FileReadRecord
+
     state = RecoveryState()
+    # f0 最早（timestamp 最小）、f6 最近（timestamp 最大）。
+    # snapshot_files 按时间倒序取最近 5 个，应保留 [f6, f5, f4, f3, f2]、丢弃 [f0, f1]。
+    base_ts = 1_700_000_000.0
     for i in range(7):
-        state.record_file_read(f"/f{i}.py", f"content-{i}")
+        state._files[f"/f{i}.py"] = FileReadRecord(
+            path=f"/f{i}.py", content=f"content-{i}", timestamp=base_ts + i
+        )
 
     attachment = build_recovery_attachment(state, None)
 
-    # 只含前 5 个文件（按时间倒序，最近 5 个）。
-    for i in range(5, 7):
+    # 最早的 f0、f1 不应被渲染（snapshot_files 按时间倒序截断到 5 个）。
+    for i in range(0, 2):
         assert f"/f{i}.py" not in attachment
-    # 注意：snapshot_files 按时间倒序，f6 最先记录、f0 最后记录。
-    # 但 record_file_read 用 time.time()，7 个文件几乎同时记录。
-    # 验证只渲染了 5 个文件标题即可。
+    # 最近 5 个都被渲染为文件标题。
     assert attachment.count("### /f") == 5
 
 
