@@ -36,9 +36,9 @@ class _FakeClient(LLMClient):
         self.requests: list[tuple[Message, ...]] = []
 
     # 记录请求历史并交付预设事件，不连接真实 Provider。
-    # batch08 后 LoopComplete 会异步触发记忆提取与会话摘要生成，
-    # 两者通过同一 client.stream 发起请求；这些后台请求以特定提示词
-    # 开头，返回空流不消耗 outcome，避免抢占主对话的预设结果。
+    # batch08 后 LoopComplete 会异步触发记忆提取、会话摘要与内存整理，
+    # 三者通过同一 client.stream 发起后台请求；这些请求以特定提示词
+    # 开头，返回空流不消耗 outcome，也不记入 requests，避免污染断言。
     async def stream(
         self,
         messages: Sequence[Message],
@@ -46,12 +46,14 @@ class _FakeClient(LLMClient):
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         del system, tools
-        self.requests.append(tuple(messages))
         first = messages[0].content if messages else ""
         if first.startswith("Analyze the conversation below"):
             return
         if first.startswith("你是一个对话摘要助手"):
             return
+        if first.startswith("# Dream: Memory Consolidation"):
+            return
+        self.requests.append(tuple(messages))
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
