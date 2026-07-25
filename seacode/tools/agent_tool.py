@@ -1,0 +1,328 @@
+"""Agent 工具：定义式 + Fork 双路径子 Agent 调度。
+
+按 ``params.subagent_type`` 分流：非空走定义式（从 AgentLoader 取 AgentDef，
+按 ``is_background`` 过滤工具），留空走 Fork（要求 ``enable_fork=true``，
+调用 ``build_forked_messages`` 复制父对话历史，工具用 ``clone_registry_for_fork``）。
+
+``team_name`` 与 ``isolation=worktree`` 分支保留入口但内部直接返回 is_error，
+分别由第 14 步与第 13 步启用真实路由。
+"""
+
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+from pydantic import BaseModel
+
+from seacode.agents.fork import (
+    FORK_QUERY_SOURCE,
+    ForkError,
+    build_forked_messages,
+)
+from seacode.agents.loader import AgentLoader
+from seacode.agents.parser import AgentDef
+from seacode.agents.task_manager import TaskManager
+from seacode.agents.tool_filter import clone_registry_for_fork, resolve_agent_tools
+from seacode.agents.trace import TraceManager
+from seacode.tools.base import Tool, ToolCategory, ToolResult
+
+# 别名到具体模型 id 的映射；占位字符串由 app.py 在初始化时按配置注入。
+# 这里保留默认值，让单测可以不依赖外部配置直接构造。
+_DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "haiku": "claude-haiku-4-5",
+    "sonnet": "claude-sonnet-4-5",
+    "opus": "claude-opus-4-1",
+}
+
+
+class AgentToolParams(BaseModel):
+    """Agent 工具参数；subagent_type 留空走 Fork 路径。"""
+
+    subagent_type: str = ""
+    description: str = ""
+    prompt: str = ""
+    run_in_background: bool = False
+    model: str | None = None
+    team_name: str | None = None
+
+
+class AgentTool(Tool):
+    """子 Agent 调度工具；定义式 + Fork 双路径。"""
+
+    name = "Agent"
+    description = (
+        "Launch a sub-agent to handle a bounded task. Pass subagent_type for "
+        "defined agents; leave empty to fork the current conversation."
+    )
+    category = ToolCategory.READ  # 用 read 避免子 Agent 调度被误判为高风险写操作
+    is_system_tool = False
+    should_defer = False  # Agent 工具不延迟；需立即执行子 Agent 并阻塞当前回合
+    # Agent 工具需要 Agent.execute(params, conversation, parent_agent) 三参签名。
+    params_model = AgentToolParams
+
+    def __init__(
+        self,
+        agent_loader: AgentLoader,
+        task_manager: TaskManager,
+        trace_manager: TraceManager,
+        parent_agent: Any,
+        enable_fork: bool = False,
+        provider_config: Any = None,
+        worktree_manager: Any = None,
+        team_manager: Any = None,
+        model_aliases: dict[str, str] | None = None,
+    ) -> None:
+        self.agent_loader = agent_loader
+        self.task_manager = task_manager
+        self.trace_manager = trace_manager
+        self.parent_agent = parent_agent
+        self.enable_fork = enable_fork
+        self.provider_config = provider_config
+        # worktree_manager / team_manager 保留参数签名但不路由；第 13/14 步启用。
+        self.worktree_manager = worktree_manager
+        self.team_manager = team_manager
+        # query_source: None 或 FORK_QUERY_SOURCE；fork 子 Agent 标记后不能再 fork。
+        self.query_source: str | None = None
+        self.model_aliases = dict(_DEFAULT_MODEL_ALIASES)
+        if model_aliases:
+            self.model_aliases.update(model_aliases)
+
+    # 执行子 Agent；按 subagent_type 分流到定义式或 Fork 路径。
+    async def execute(
+        self,
+        params: BaseModel,
+        conversation: Any = None,
+        parent_agent: Any = None,
+    ) -> ToolResult:
+        # 基类签名是 BaseModel，实际由 params_model 校验为 AgentToolParams。
+        tool_params: AgentToolParams = params  # type: ignore[assignment]
+        # 优先使用传入 parent_agent，回退到构造时保存的引用。
+        parent = parent_agent if parent_agent is not None else self.parent_agent
+
+        if getattr(tool_params, "team_name", None):
+            return ToolResult(
+                content="team_name 路径在第 14 步启用", is_error=True
+            )
+
+        if tool_params.subagent_type:
+            return await self._execute_subagent(
+                tool_params, conversation, parent, is_fork=False
+            )
+
+        # Fork 路径。
+        if not self.enable_fork:
+            return ToolResult(
+                content="fork 未启用，请在配置中开启 enable_fork",
+                is_error=True,
+            )
+        if self.query_source == FORK_QUERY_SOURCE:
+            return ToolResult(
+                content="fork 子 Agent 不能再次 fork", is_error=True
+            )
+        try:
+            fork_messages = build_forked_messages(conversation, tool_params.prompt)
+        except ForkError as e:
+            return ToolResult(content=str(e), is_error=True)
+
+        fork_registry = clone_registry_for_fork(parent._full_registry)
+        # fork 子 Agent 默认 bypassPermissions，max_turns 继承父 Agent。
+        fork_def = AgentDef(
+            agent_type="fork",
+            when_to_use="",
+            system_prompt="",
+            permission_mode="bypassPermissions",
+            max_turns=getattr(parent, "max_iterations", 100),
+        )
+        return await self._execute_subagent(
+            tool_params,
+            conversation,
+            parent,
+            is_fork=True,
+            fork_conversation=fork_messages,
+            fork_def=fork_def,
+            fork_registry=fork_registry,
+        )
+
+    # 子 Agent 实际执行；前台同步返回文本，后台异步返回 task_id。
+    async def _execute_subagent(
+        self,
+        params: AgentToolParams,
+        conversation: Any,
+        parent_agent: Any,
+        is_fork: bool,
+        fork_conversation: Any = None,
+        fork_def: AgentDef | None = None,
+        fork_registry: Any = None,
+    ) -> ToolResult:
+        definition = (
+            fork_def
+            if is_fork and fork_def is not None
+            else self.agent_loader.get(params.subagent_type)
+        )
+        if definition is None:
+            available = self.agent_loader.list_agents()
+            available_str = ", ".join(f"{name} ({desc})" for name, desc in available)
+            return ToolResult(
+                content=(
+                    f"未知子 Agent 类型: {params.subagent_type}，可用: {available_str}"
+                ),
+                is_error=True,
+            )
+
+        # 第 13 步启用 worktree 路由；本步保留入口返回 is_error。
+        if definition.isolation == "worktree":
+            return ToolResult(
+                content="worktree 路径在第 13 步启用", is_error=True
+            )
+
+        # fork 默认后台；定义式看 run_in_background / definition.background。
+        is_background = is_fork or params.run_in_background or definition.background
+
+        # 工具过滤：fork 用 clone_registry_for_fork；定义式用 resolve_agent_tools。
+        parent_registry = parent_agent._full_registry
+        if is_fork and fork_registry is not None:
+            sub_registry = fork_registry
+        elif is_fork:
+            sub_registry = clone_registry_for_fork(parent_registry)
+        else:
+            sub_registry = resolve_agent_tools(
+                parent_registry, definition, is_background
+            )
+
+        # 子 Agent 实例化：复用父 Agent 的 protocol / work_dir / context_window。
+        client = self._select_llm(params, definition, parent_agent)
+        sub_agent = self._create_sub_agent(
+            client=client,
+            parent_agent=parent_agent,
+            definition=definition,
+            sub_registry=sub_registry,
+        )
+
+        # 调用链追踪：trace_id 继承父 Agent；agent_id 由 TraceManager 生成。
+        parent_trace_id: str = str(
+            getattr(parent_agent, "trace_id", None)
+            or getattr(parent_agent, "agent_id", "root")
+        )
+        trace_node = self.trace_manager.create(
+            agent_type=definition.agent_type,
+            parent_id=getattr(parent_agent, "agent_id", None),
+            trace_id=parent_trace_id,
+        )
+        sub_agent.agent_id = trace_node.agent_id
+        sub_agent.parent_id = getattr(parent_agent, "agent_id", None)
+        sub_agent.trace_id = parent_trace_id
+
+        # fork 子 Agent 继承 replacement_state 以命中 prompt cache。
+        if is_fork:
+            sub_agent.replacement_state = copy.deepcopy(
+                getattr(parent_agent, "replacement_state", None)
+            )
+
+        # 前台同步路径：直接 await run_to_completion 并把结果回灌。
+        if not is_background:
+            result_text = await sub_agent.run_to_completion(
+                params.prompt, conversation=fork_conversation
+            )
+            self.trace_manager.update(
+                trace_node.agent_id,
+                input_tokens=getattr(sub_agent, "total_input_tokens", 0),
+                output_tokens=getattr(sub_agent, "total_output_tokens", 0),
+            )
+            self.trace_manager.complete(trace_node.agent_id)
+            return ToolResult(content=result_text or "")
+
+        # 后台异步路径：通过 TaskManager.launch 启动；不阻塞当前回合。
+        task_id = await self.task_manager.launch(
+            agent=sub_agent,
+            task="" if is_fork else params.prompt,
+            name=definition.agent_type,
+            fork_conversation=fork_conversation if is_fork else None,
+        )
+        return ToolResult(
+            content=(
+                f"后台任务已启动 (id: {task_id})。"
+                "不要 wait/sleep/poll，主对话会在任务完成时收到通知。"
+            )
+        )
+
+    # 创建子 Agent 实例；延迟导入避免循环。
+    def _create_sub_agent(
+        self,
+        client: Any,
+        parent_agent: Any,
+        definition: AgentDef,
+        sub_registry: Any,
+    ) -> Any:
+        from seacode.agent import Agent
+        from seacode.permissions import PermissionChecker, PermissionMode
+
+        # 权限模式映射：bypassPermissions → BYPASS；空串沿用父 Agent 当前模式。
+        parent_mode = getattr(parent_agent, "permission_mode", PermissionMode.DEFAULT)
+        mode_str = definition.permission_mode or parent_mode.value
+        mode_map = {
+            "default": PermissionMode.DEFAULT,
+            "acceptEdits": PermissionMode.ACCEPT_EDITS,
+            "bypassPermissions": PermissionMode.BYPASS,
+            "": parent_mode,
+        }
+        sub_mode = mode_map.get(mode_str, PermissionMode.DEFAULT)
+
+        # 复用父 Agent 权限组件构造子 Agent 检查器；父 checker 为 None 时子 Agent 也不启用。
+        parent_checker = getattr(parent_agent, "permission_checker", None)
+        if parent_checker is not None:
+            sub_checker = PermissionChecker(
+                detector=parent_checker.detector,
+                sandbox=parent_checker.sandbox,
+                rule_engine=parent_checker.rule_engine,
+                mode=sub_mode,
+                sandbox_enabled=parent_checker.sandbox_enabled,
+            )
+        else:
+            sub_checker = None
+
+        return Agent(
+            client=client,
+            registry=sub_registry,
+            protocol=getattr(parent_agent, "protocol", "anthropic"),
+            work_dir=getattr(parent_agent, "work_dir", "."),
+            max_iterations=definition.max_turns,
+            permission_checker=sub_checker,
+            context_window=getattr(parent_agent, "context_window", 200_000),
+            instructions_content=getattr(parent_agent, "instructions_content", ""),
+            memory_manager=None,  # 子 Agent 不直接写长期记忆
+            hook_engine=getattr(parent_agent, "hook_engine", None),
+        )
+
+    # 选择子 Agent LLM 客户端；model 别名映射或具体模型名直通；失败回退父 client。
+    def _select_llm(
+        self, params: AgentToolParams, definition: AgentDef, parent_agent: Any
+    ) -> Any:
+        # params.model 优先；definition.model 非 inherit 时次之；否则回退父 client。
+        model_override = params.model
+        if not model_override and definition.model != "inherit":
+            model_override = definition.model
+        if not model_override:
+            return parent_agent.client
+
+        # 别名映射；非别名直通模型名。
+        model_id = self.model_aliases.get(
+            model_override.lower(), model_override
+        )
+
+        if self.provider_config is None:
+            return parent_agent.client
+        try:
+            # 浅拷贝配置并替换 model 字段；保留 protocol/base_url/api_key。
+            new_cfg = copy.copy(self.provider_config)
+            object.__setattr__(new_cfg, "model", model_id)
+            from seacode.client import create_client
+
+            return create_client(new_cfg)
+        except Exception:
+            # 失败回退父 client，保证调用方不中断。
+            return parent_agent.client
+
+    # 兼容基类签名；实际 execute 走三参版本。
+    async def _execute(self, params: BaseModel) -> ToolResult:  # pragma: no cover
+        return await self.execute(params)

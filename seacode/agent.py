@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -351,6 +352,13 @@ class Agent:
         instructions_content: str = "",
         memory_manager: MemoryManager | None = None,
         hook_engine: HookEngine | None = None,
+        # batch12：子 Agent 与任务管理；agent_id/parent_id/trace_id 由 AgentTool 注入，
+        # team_name/_team_manager 保留签名但第 14 步才启用真实路由。
+        agent_id: str | None = None,
+        parent_id: str | None = None,
+        trace_id: str | None = None,
+        team_name: str | None = None,
+        team_manager: Any = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -412,6 +420,30 @@ class Agent:
         # 由 __main__.py 在创建 Agent 时注入，或由 app.py 在 _run_turn 中通过
         # set_hook_engine 注入。8 个注入点在 run() 中按生命周期顺序触发。
         self.hook_engine: HookEngine | None = hook_engine
+        # batch12：子 Agent 与任务管理字段。
+        # agent_id 唯一标识一个 Agent 实例；parent_id 指向父 Agent（子 Agent 场景）；
+        # trace_id 标识整条调用链，子 Agent 继承父 Agent 的 trace_id。
+        # AgentTool 在实例化子 Agent 后通过 setattr 覆盖这三个字段。
+        self.agent_id: str = agent_id or uuid4().hex[:12]
+        self.parent_id: str | None = parent_id
+        self.trace_id: str | None = trace_id
+        # team_name / _team_manager 保留签名，第 14 步启用真实路由。
+        self.team_name: str | None = team_name
+        self._team_manager: Any = team_manager
+        # _full_registry：子 Agent 调度时保存父 Agent 完整工具注册表引用，
+        # 供 AgentTool 在 fork/定义式路径克隆或过滤工具使用。主 Agent 由 app.py 注入。
+        self._full_registry: Any = None
+        # 子 Agent 系统提示词与目录摘要；定义式子 Agent 由 AgentDef.system_prompt 提供，
+        # fork 子 Agent 用 FORK_BOILERPLATE（已包含在 fork_messages 中，不重复注入）。
+        # _agent_catalog 是注入到环境上下文的可用子 Agent 摘要文本；
+        # _agent_catalog_list 保留 (name, description) 元组列表供运行时查询。
+        self._current_definition: Any = None
+        self._fork_conversation: Any = None
+        self._current_conversation: Any = None
+        self._agent_catalog: str = ""
+        self._agent_catalog_list: list[tuple[str, str]] = []
+        # last_output：run_to_completion 结束时保存最终文本，供 TaskManager 读取。
+        self.last_output: str = ""
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -440,9 +472,35 @@ class Agent:
     def set_hook_engine(self, engine: HookEngine | None) -> None:
         self.hook_engine = engine
 
+    # batch12：注入子 Agent 目录摘要文本与 (name, description) 列表。
+    # catalog 文本由 app.py 拼装为 ## Available Sub-Agent Types 段落注入环境上下文；
+    # catalog_list 保留元组列表供运行时查询（如错误提示列出可用子 Agent）。
+    def set_agent_catalog(
+        self, catalog: str, catalog_list: list[tuple[str, str]]
+    ) -> None:
+        self._agent_catalog = catalog
+        self._agent_catalog_list = list(catalog_list)
+
+    # batch12：保存父 Agent 完整工具注册表引用，供 AgentTool 克隆/过滤工具使用。
+    def set_full_registry(self, registry: Any) -> None:
+        self._full_registry = registry
+
     # 从工具调用参数推断 file_path；支持 file_path/path 两种常见字段名。
     def _infer_file_path(self, arguments: dict[str, Any]) -> str:
         return arguments.get("file_path") or arguments.get("path") or ""
+
+    # batch12：检查工具是否接受 conversation 与 parent_agent 扩展参数。
+    # AgentTool 与 AskUserTool 的 execute 签名为 (params, conversation, parent_agent)，
+    # 其它工具仍走基类 (params) 单参签名。用 inspect 检查避免 TypeError。
+    def _tool_accepts_context(self, tool: Any) -> bool:
+        import inspect
+
+        try:
+            sig = inspect.signature(tool.execute)
+        except (ValueError, TypeError):
+            return False
+        params = sig.parameters
+        return "conversation" in params and "parent_agent" in params
 
     # 构造 HookContext；event 标识事件名，其余字段按场景传入。
     def _build_hook_context(self, event: str, **kwargs: Any) -> HookContext:
@@ -487,7 +545,10 @@ class Agent:
         self, conversation: ConversationManager
     ) -> AsyncIterator[AgentEvent]:
         # 会话启动时注入会话级环境上下文（position 0，env_injected 标记只注入一次）。
-        env_context = build_environment_context(self.work_dir)
+        # batch12：附加子 Agent 目录摘要（## Available Sub-Agent Types 段落）。
+        env_context = build_environment_context(
+            self.work_dir, agent_catalog=self._agent_catalog
+        )
         conversation.inject_environment(env_context)
 
         # 长期记忆注入：load_instructions 拼接的指令 + MEMORY.md 索引内容 + 当前日期，
@@ -669,7 +730,10 @@ class Agent:
                     if needs_ask:
                         deferred_tool_calls.append(tc)
                     else:
-                        executor.submit(self._execute_single_tool_direct(tc))
+                        # batch12：传 conversation 供 AgentTool 构造 fork messages。
+                        executor.submit(
+                            self._execute_single_tool_direct(tc, conversation)
+                        )
                 yield event
 
             response = collector.response
@@ -823,7 +887,8 @@ class Agent:
                 elapsed = 0.0
                 is_unknown = False
 
-                async for item in self._execute_tool_with_permission(tc):
+                # batch12：传 conversation 供 AskUserTool 等扩展工具使用。
+                async for item in self._execute_tool_with_permission(tc, conversation):
                     if isinstance(item, PermissionRequest):
                         yield item
                     else:
@@ -896,8 +961,12 @@ class Agent:
 
     # 直接执行单个工具调用，返回结构化结果与耗时；未知/禁用工具返回错误结果。
     # 权限 deny 决策在此处直接转为错误结果；ask 决策由 _execute_tool_with_permission 处理。
+    # batch12：conversation 用于 AgentTool 取父对话历史构造 fork messages；
+    # 不传时回退到 None，AgentTool 内部用 self.parent_agent 作为 fallback。
     async def _execute_single_tool_direct(
-        self, tc: ToolCallComplete
+        self,
+        tc: ToolCallComplete,
+        conversation: Any = None,
     ) -> _ToolExecResult:
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
@@ -942,7 +1011,14 @@ class Agent:
 
         try:
             params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
+            # batch12：扩展签名工具（AgentTool/AskUserTool）传入 conversation 与 parent_agent。
+            # 基类 execute 只声明 params；通过 _tool_accepts_context 门控后传扩展参数。
+            if self._tool_accepts_context(tool):
+                result = await tool.execute(
+                    params, conversation=conversation, parent_agent=self  # type: ignore[call-arg]
+                )
+            else:
+                result = await tool.execute(params)
         except ValidationError as e:
             result = ToolResult(
                 content=f"Parameter validation error: {e}", is_error=True
@@ -960,8 +1036,11 @@ class Agent:
 
     # 执行需 HITL 确认的工具调用；yield PermissionRequest 等待 TUI 回复后继续。
     # yield 顺序：PermissionRequest（ask 时）→ (result, elapsed, is_unknown) 元组。
+    # batch12：conversation 用于 AskUserTool 等扩展工具；不传时回退到 None。
     async def _execute_tool_with_permission(
-        self, tc: ToolCallComplete
+        self,
+        tc: ToolCallComplete,
+        conversation: Any = None,
     ) -> AsyncIterator[PermissionRequest | tuple[ToolResult, float, bool]]:
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
@@ -1019,7 +1098,13 @@ class Agent:
 
         try:
             params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
+            # batch12：支持扩展签名的工具传入 conversation 与 parent_agent。
+            if self._tool_accepts_context(tool):
+                result = await tool.execute(
+                    params, conversation=conversation, parent_agent=self  # type: ignore[call-arg]
+                )
+            else:
+                result = await tool.execute(params)
         except ValidationError as e:
             result = ToolResult(
                 content=f"Parameter validation error: {e}", is_error=True
@@ -1125,3 +1210,183 @@ class Agent:
             return render_reminder(memories)
         except Exception:
             return ""
+
+    # -----------------------------------------------------------------
+    # batch12：子 Agent 非交互执行循环
+    # -----------------------------------------------------------------
+
+    # 非交互执行循环：用于子 Agent（定义式 + Fork 路径）与后台任务。
+    # 与 run() 的差异：不 yield 事件、不触发 session_start/turn_start 等 Hook、
+    # 不做 HITL 权限确认（子 Agent 走 bypassPermissions 或 pre_tool_use Hook 拒绝）、
+    # 不做长期记忆提取与整理（子 Agent 不直接写记忆）。
+    # fork 路径传入 conversation（已含 FORK_BOILERPLATE 与 task）；定义式路径传 task 字符串，
+    # 内部新建 ConversationManager 并以 AgentDef.system_prompt 为系统提示词。
+    # 工具调用按 self.registry 执行；max_iterations 由 AgentDef.max_turns 在构造时传入。
+    async def run_to_completion(
+        self,
+        task: str,
+        conversation: Any = None,
+        event_callback: Any = None,
+    ) -> str:
+        # fork 路径用传入的 conversation（已含 FORK_BOILERPLATE + task user message）；
+        # 定义式路径新建 ConversationManager 并把 task 作为首条 user message。
+        if conversation is not None:
+            conv = conversation
+        else:
+            conv = ConversationManager()
+            if task:
+                conv.add_user_message(task)
+
+        # 子 Agent 系统提示词：定义式用 AgentDef.system_prompt；fork 用空串
+        # （FORK_BOILERPLATE 已在 messages 中以 user message 形式注入）。
+        system_prompt = ""
+        definition = getattr(self, "_current_definition", None)
+        if definition is not None:
+            # definition 为 Any 类型；直接取 system_prompt 属性避免 getattr 默认值类型推断。
+            sp = getattr(definition, "system_prompt", None)
+            if sp:
+                system_prompt = str(sp)
+
+        iteration = 0
+        consecutive_unknown = 0
+
+        while True:
+            iteration += 1
+
+            # 停止条件 1：迭代上限。
+            if self.max_iterations > 0 and iteration > self.max_iterations:
+                break
+
+            # 每轮重新获取工具 Schema（mark_discovered 后新工具立即纳入）。
+            tools = self.registry.get_all_schemas(self.protocol)
+            messages = conv.get_messages()
+            llm_stream = self.client.stream(messages, system=system_prompt, tools=tools)
+
+            collector = StreamCollector()
+            executor = StreamingExecutor()
+            # pre_tool_use Hook 拒绝的工具结果累积，随后并入 tool_results 回灌对话。
+            rejected_results: list[ToolResultBlock] = []
+
+            # 消费 LLM 流：文本/思考增量累积，工具调用完整后立即提交执行。
+            async for event in collector.consume(llm_stream):
+                if isinstance(event, ToolUseEvent):
+                    tc = collector.response.tool_calls[-1]
+                    # pre_tool_use Hook 拒绝的工具构造 is_error ToolResult，
+                    # 累积到 rejected_results 在流结束后与 streaming_results 合并回灌。
+                    if self.hook_engine:
+                        hook_ctx = self._build_hook_context(
+                            "pre_tool_use",
+                            tool_name=tc.tool_name,
+                            tool_args=tc.arguments,
+                            file_path=self._infer_file_path(tc.arguments),
+                        )
+                        rejection = await self.hook_engine.run_pre_tool_hooks(hook_ctx)
+                        if rejection is not None:
+                            rejected_results.append(
+                                ToolResultBlock(
+                                    tool_use_id=tc.tool_id,
+                                    content=f"Hook rejected: {rejection.reason}",
+                                    is_error=True,
+                                )
+                            )
+                            continue
+                    # 子 Agent 默认 bypassPermissions，权限检查只走 deny/allow，
+                    # ask 决策在此路径直接当 allow 处理（不阻塞等待 HITL）。
+                    tool = self.registry.get(tc.tool_name)
+                    needs_deny = False
+                    deny_reason = ""
+                    if tool and self.permission_checker:
+                        decision = self.permission_checker.check(tool, tc.arguments)
+                        if decision.effect == "deny":
+                            needs_deny = True
+                            deny_reason = decision.reason
+                    if needs_deny:
+                        # deny 决策构造错误结果回灌；通过 executor 提交保持顺序。
+                        executor.submit(self._make_denied_result(tc, deny_reason))
+                    else:
+                        # batch12：传 conv 供 AgentTool 构造 fork messages。
+                        executor.submit(
+                            self._execute_single_tool_direct(tc, conv)
+                        )
+
+            response = collector.response
+            self.total_input_tokens += response.input_tokens
+            self.total_output_tokens += response.output_tokens
+
+            # 可选进度上报：供 TaskManager 在 adopt_running 场景读取部分输出。
+            if event_callback is not None:
+                try:
+                    event_callback(
+                        {
+                            "text": response.text,
+                            "tool_calls": len(response.tool_calls),
+                            "iteration": iteration,
+                        }
+                    )
+                except Exception:
+                    pass
+
+            conv_thinking = [
+                ThinkingBlock(thinking=tb.thinking, signature=tb.signature)
+                for tb in response.thinking_blocks
+            ]
+
+            # 停止条件 2：无工具调用，模型给出最终回复。
+            if not response.tool_calls:
+                conv.add_assistant_message(response.text, thinking_blocks=conv_thinking)
+                self.last_output = response.text
+                break
+
+            # 有工具调用：提交助手消息、执行工具、回灌结果。
+            tool_uses = [
+                ToolUseBlock(
+                    tool_use_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    arguments=tc.arguments,
+                )
+                for tc in response.tool_calls
+            ]
+            conv.add_assistant_message(
+                response.text, tool_uses=tool_uses, thinking_blocks=conv_thinking
+            )
+
+            streaming_results = await executor.collect_results()
+            tool_results: list[ToolResultBlock] = []
+            # 并入 pre_tool_use Hook 拒绝的工具结果，让模型看到拒绝原因并调整策略。
+            tool_results.extend(rejected_results)
+            for br in streaming_results:
+                if br.is_unknown:
+                    consecutive_unknown += 1
+                else:
+                    consecutive_unknown = 0
+                content = self._maybe_persist_or_truncate(br.tool_id, br.result.content)
+                tool_results.append(
+                    ToolResultBlock(
+                        tool_use_id=br.tool_id,
+                        content=content,
+                        is_error=br.result.is_error,
+                    )
+                )
+
+            # 停止条件 3：连续未知工具调用达到上限。
+            if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
+                break
+
+            conv.add_tool_results_message(tool_results)
+
+        return self.last_output
+
+    # 构造一个被 deny 的工具执行协程，返回 is_error=True 的 _ToolExecResult。
+    # 用于 run_to_completion 中权限 deny 决策的直接回灌，避免阻塞主循环。
+    async def _make_denied_result(
+        self, tc: ToolCallComplete, reason: str
+    ) -> _ToolExecResult:
+        return _ToolExecResult(
+            tool_id=tc.tool_id,
+            tool_name=tc.tool_name,
+            result=ToolResult(
+                content=f"Permission denied: {reason}", is_error=True
+            ),
+            elapsed=0.0,
+            is_unknown=False,
+        )

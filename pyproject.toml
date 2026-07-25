@@ -22,6 +22,11 @@ sea = "seacode.__main__:main"
 requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
+# 内置子 Agent 定义 .md 文件需显式包含进 wheel，否则 importlib.resources 在
+# 安装环境下找不到这些文件。源码模式下文件就在源树中，无需额外配置。
+[tool.hatch.build.targets.wheel.force-include]
+"seacode/agents/builtins" = "seacode/agents/builtins"
+
 [dependency-groups]
 dev = [
     "mypy==2.3.0",
