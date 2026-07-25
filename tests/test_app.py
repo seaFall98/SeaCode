@@ -39,6 +39,7 @@ class _FakeClient(LLMClient):
     # batch08 后 LoopComplete 会异步触发记忆提取、会话摘要与内存整理，
     # 三者通过同一 client.stream 发起后台请求；这些请求以特定提示词
     # 开头，返回空流不消耗 outcome，也不记入 requests，避免污染断言。
+    # 内存整理通过子 Agent 发起，会注入环境上下文，故检查全部消息。
     async def stream(
         self,
         messages: Sequence[Message],
@@ -51,7 +52,7 @@ class _FakeClient(LLMClient):
             return
         if first.startswith("你是一个对话摘要助手"):
             return
-        if first.startswith("# Dream: Memory Consolidation"):
+        if any(m.content.startswith("# Dream: Memory Consolidation") for m in messages):
             return
         self.requests.append(tuple(messages))
         outcome = self._outcomes.pop(0)
