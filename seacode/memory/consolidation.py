@@ -245,14 +245,20 @@ def _rollback_lock(mem_dir: str, prior_mtime: int) -> None:
 # 检测进程是否存活。Windows 用 OpenProcess，Unix 用 os.kill(pid, 0)。
 # PermissionError 也算"不存活"——保守判定，宁可错抢锁也不永久卡住。
 def _is_process_running(pid: int) -> bool:
+    # Windows 用 OpenProcess 查询进程存活；Unix 用 os.kill(pid, 0) 探测。
+    # getattr 兼容 mypy 在 Linux 上的类型检查（windll 仅 Windows 存在）。
     if os.name == "nt":
         import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return True
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        h = ctypes.windll.kernel32.OpenProcess(
+        h = windll.kernel32.OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION, False, pid
         )
         if h:
-            ctypes.windll.kernel32.CloseHandle(h)
+            windll.kernel32.CloseHandle(h)
             return True
         return False
     try:
