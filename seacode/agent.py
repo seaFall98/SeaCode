@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -433,6 +433,11 @@ class Agent:
         # _full_registry：子 Agent 调度时保存父 Agent 完整工具注册表引用，
         # 供 AgentTool 在 fork/定义式路径克隆或过滤工具使用。主 Agent 由 app.py 注入。
         self._full_registry: Any = None
+        # batch14：Coordinator Mode 与团队邮箱消费。
+        # coordinator_mode=True 时 build_system_prompt 走协调者提示词分支，工具集收敛为调度-only。
+        # notification_fn 由 app.py 注入 team_manager.drain_lead_mailbox，每轮消费 lead 邮箱。
+        self.coordinator_mode: bool = False
+        self.notification_fn: Callable[[], list[str]] | None = None
         # 子 Agent 系统提示词与目录摘要；定义式子 Agent 由 AgentDef.system_prompt 提供，
         # fork 子 Agent 用 FORK_BOILERPLATE（已包含在 fork_messages 中，不重复注入）。
         # _agent_catalog 是注入到环境上下文的可用子 Agent 摘要文本；
@@ -487,6 +492,27 @@ class Agent:
     # batch12：保存父 Agent 完整工具注册表引用，供 AgentTool 克隆/过滤工具使用。
     def set_full_registry(self, registry: Any) -> None:
         self._full_registry = registry
+
+    # batch14：消费 lead 邮箱中本 agent 的未读消息并注入对话历史。
+    # _team_manager 或 team_name 缺失时静默跳过（向后兼容 batch01-13 行为）。
+    def _consume_mailbox(self, conversation: ConversationManager) -> None:
+        if self._team_manager is None or not self.team_name:
+            return
+        mailbox = self._team_manager.get_mailbox(self.team_name)
+        msgs = mailbox.consume(self.agent_id)
+        for msg in msgs:
+            conversation.add_user_message(
+                f"From {msg.from_agent}: {msg.content}"
+            )
+
+    # batch14：每轮开头消费 lead 邮箱与注入 notification_fn 返回的提示。
+    # notification_fn 通常为 team_manager.drain_lead_mailbox，返回 <team-notification> XML 列表。
+    def _consume_team_notifications(self, conversation: ConversationManager) -> None:
+        self._consume_mailbox(conversation)
+        if self.notification_fn is not None:
+            notes = self.notification_fn()
+            for note in notes:
+                conversation.add_system_reminder(note)
 
     # 从工具调用参数推断 file_path；支持 file_path/path 两种常见字段名。
     def _infer_file_path(self, arguments: dict[str, Any]) -> str:
@@ -604,6 +630,10 @@ class Agent:
         while True:
             iteration += 1
 
+            # batch14：每轮开头消费 lead 邮箱与注入 notification_fn 提示。
+            # _team_manager / notification_fn 为 None 时静默跳过（向后兼容 batch01-13）。
+            self._consume_team_notifications(conversation)
+
             # batch11: turn_start hook — 每轮迭代开头触发。
             if self.hook_engine:
                 await self.hook_engine.run_hooks(
@@ -634,11 +664,14 @@ class Agent:
             # 每轮动态拼装系统提示词，包含 Environment 段落与条件段落。
             # mcp_manager 装配时插入 ToolSearch 段落，引导模型先发现再调用 MCP 工具。
             # skill_catalog 非空时注入 # Skills 段落，让模型知道可用 Skill。
+            # batch14：coordinator_mode=True 时走协调者提示词分支，工具集收敛为调度-only。
             system = build_system_prompt(
                 work_dir=self.work_dir,
                 mcp_enabled=self.mcp_manager is not None,
                 skill_section=self.skill_catalog,
                 hook_prompts=hook_prompts,
+                coordinator_mode=self.coordinator_mode,
+                agent_catalog=self._agent_catalog_list,
             )
 
             # 延迟工具名 reminder：每轮注入未发现的延迟工具名，引导模型用 ToolSearch 发现。
@@ -1272,6 +1305,10 @@ class Agent:
 
         while True:
             iteration += 1
+
+            # batch14：每轮开头消费 lead 邮箱与注入 notification_fn 提示。
+            # 子 Agent（teammate）路径通常 _team_manager 为 None，此处静默跳过。
+            self._consume_team_notifications(conv)
 
             # 停止条件 1：迭代上限。
             if self.max_iterations > 0 and iteration > self.max_iterations:

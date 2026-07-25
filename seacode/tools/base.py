@@ -23,6 +23,8 @@ class ToolCategory(StrEnum):
     READ = "read"
     WRITE = "write"
     SYSTEM = "system"
+    # 命令级工具：团队管理与消息发送等调度类操作。
+    COMMAND = "command"
 
 
 class ToolResult(BaseModel):

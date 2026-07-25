@@ -546,8 +546,8 @@ def test_select_llm_definition_model_used_when_params_none(
 # ---------------------------------------------------------------------------
 
 
-# 验证 team_name 分支返回 is_error 提示第 14 步。
-# params.team_name="team1"，断言 is_error=True 且 output 含 "第 14 步"。
+# 验证 team_name 分支在 team_manager 未注入时返回 is_error。
+# params.team_name="team1"，未 set_team_manager，断言 is_error=True 且 output 含 "未初始化"。
 async def test_team_name_branch_returns_error() -> None:
     tool, _ = _make_tool()
     params = AgentToolParams(
@@ -557,7 +557,7 @@ async def test_team_name_branch_returns_error() -> None:
     result = await tool.execute(params, conversation=None, parent_agent=tool.parent_agent)
 
     assert result.is_error is True
-    assert "第 14 步" in result.content
+    assert "未初始化" in result.content
 
 
 # 验证 isolation=worktree 分支在 worktree_manager 未注入时返回 is_error。
