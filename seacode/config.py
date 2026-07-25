@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .validator import DEFAULT_CONTEXT_WINDOW, lookup_model_context_window
+
 SUPPORTED_PROTOCOLS: Final = frozenset({"anthropic", "openai", "openai-compat"})
 _ENV_KEY_NAMES: Final = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -36,12 +38,41 @@ class ProviderConfig:
     base_url: str
     api_key: str
     thinking: bool = False
+    # 0 表示"未设置" — get_context_window() 通过四层 fallback 解析真实窗口大小。
+    # 正数表示配置文件里显式指定的覆盖值（最高优先级）。
+    context_window: int = 0
+    # 运行时 cache，存放从 provider 的 /v1/models 端点自动拉取的 context window
+    # （get_context_window 的第 2 层）。通过 set_fetched_context_window() 写入一次；
+    # 0 表示"尚未拉取"。不参与相等比较与哈希，避免缓存更新影响身份判断。
+    _fetched_context_window: int = field(default=0, repr=False, compare=False)
 
     # 优先使用 YAML 密钥，空值时才兼容外部协议的环境变量。
     def resolve_api_key(self) -> str:
         if self.api_key:
             return self.api_key
         return os.environ.get(_ENV_KEY_NAMES[self.protocol], "")
+
+    # 记录从 provider 自动拉取到的 context window（第 2 层）。
+    # 非正数会被忽略，这样一次失败的拉取就不会污染 cache。
+    # frozen dataclass 用 object.__setattr__ 绕过只读限制，仅用于此运行时缓存字段。
+    def set_fetched_context_window(self, window: int) -> None:
+        if window > 0:
+            object.__setattr__(self, "_fetched_context_window", window)
+
+    # 通过四层 fallback 解析模型的 context window，按优先级从高到低：
+    #   1. 配置文件提供的 context_window（> 0）——显式覆盖，永远优先。
+    #   2. 从 provider 的 /v1/models 端点自动拉取并缓存的值（仅 anthropic 协议）。
+    #   3. validator.py 中的内置"模型名 -> window"映射表（按子串匹配）。
+    #   4. DEFAULT_CONTEXT_WINDOW 保守默认值。
+    def get_context_window(self) -> int:
+        if self.context_window > 0:
+            return self.context_window
+        if self._fetched_context_window > 0:
+            return self._fetched_context_window
+        window = lookup_model_context_window(self.model)
+        if window > 0:
+            return window
+        return DEFAULT_CONTEXT_WINDOW
 
 
 @dataclass(frozen=True)
@@ -255,6 +286,13 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
     if not isinstance(thinking, bool):
         raise ConfigError(f"Provider #{index + 1} field thinking must be boolean: {path}")
 
+    # context_window 为可选正整数；0 或缺失表示走四层 fallback。
+    context_window = raw.get("context_window", 0)
+    if not isinstance(context_window, int) or context_window < 0:
+        raise ConfigError(
+            f"Provider #{index + 1} field context_window must be a non-negative integer: {path}"
+        )
+
     return ProviderConfig(
         name=values["name"],
         protocol=protocol,
@@ -262,6 +300,7 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
         base_url=values["base_url"].rstrip("/"),
         api_key=values["api_key"],
         thinking=thinking,
+        context_window=context_window,
     )
 
 

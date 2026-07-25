@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from seacode.agent import (
     Agent,
+    CompactNotification,
     ErrorEvent,
     LoopComplete,
     MCPConnectEvent,
@@ -697,10 +698,12 @@ async def test_cancellation_exits_generator() -> None:
 # 验证会话启动时 inject_environment 在 position 0 注入环境上下文。
 # 假客户端返回纯文本流，断言首条消息为 user 角色且含 "Current working directory"。
 @pytest.mark.asyncio
-async def test_inject_environment_inserts_context_at_head() -> None:
+async def test_inject_environment_inserts_context_at_head(tmp_path: Path) -> None:
     registry = ToolRegistry()
     client = _FakeClient([_text_stream("Hello")])
-    agent = Agent(client=client, registry=registry, protocol="anthropic", work_dir="/custom")
+    agent = Agent(
+        client=client, registry=registry, protocol="anthropic", work_dir=str(tmp_path)
+    )
     conversation = ConversationManager()
     conversation.add_user_message("Hi")
 
@@ -708,7 +711,7 @@ async def test_inject_environment_inserts_context_at_head() -> None:
 
     assert len(conversation.messages) >= 2
     assert conversation.messages[0].role == "user"
-    assert "Current working directory: /custom" in conversation.messages[0].content
+    assert f"Current working directory: {tmp_path}" in conversation.messages[0].content
     assert conversation.env_injected is True
 
 
@@ -1330,3 +1333,170 @@ async def test_mcp_server_instructions_injected_to_conversation() -> None:
     ]
     assert len(instruction_msgs) == 1
     assert "Use UTF-8 paths only" in instruction_msgs[0].content
+
+
+# ---------------------------------------------------------------------------
+# batch07：上下文治理集成测试
+# ---------------------------------------------------------------------------
+
+
+# 返回超大内容的测试工具，用于验证即时落盘机制。
+class _BigOutputParams(BaseModel):
+    input: str = ""
+
+
+class _BigOutputTool(Tool):
+    name = "BigOutput"
+    description = "Tool that returns oversized output for persist tests."
+    params_model = _BigOutputParams
+    category = ToolCategory.READ
+
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    async def execute(self, params: BaseModel) -> ToolResult:
+        return ToolResult(content=self._content)
+
+
+# 验证超大工具结果触发即时落盘，对话历史中的 content 被替换为预览。
+# 构造返回 > MAX_OUTPUT_CHARS 的工具，调用后断言 tool_result content 含 <persisted-output> 标签。
+@pytest.mark.asyncio
+async def test_large_tool_result_persisted_to_disk(tmp_path: Path) -> None:
+    from seacode.tools.base import MAX_OUTPUT_CHARS
+
+    big_content = "x" * (MAX_OUTPUT_CHARS + 500)
+    tool = _BigOutputTool(big_content)
+    registry = ToolRegistry()
+    registry.register(tool)
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "BigOutput", {"input": "go"}),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        work_dir=str(tmp_path),
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Run big tool")
+
+    events = await _collect(agent.run(conversation))
+
+    # 工具结果事件携带原始内容（事件展示用原始内容，落盘只影响对话历史）。
+    result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+    assert len(result_events) == 1
+
+    # 对话历史中的 tool_result content 被替换为预览。
+    tool_result_msg = next(
+        m for m in conversation.messages if m.tool_results
+    )
+    tr = tool_result_msg.tool_results[0]
+    assert "<persisted-output>" in tr.content
+    # 落盘文件存在。
+    assert (tmp_path / ".seacode" / "session" / "tool-results" / "c1.txt").exists()
+
+
+# 验证 auto_compact 触发后 CompactNotification 事件被正确 yield。
+# 构造足够大的对话 + 小 context_window，第一个 outcome 是摘要流，第二个是最终回复。
+@pytest.mark.asyncio
+async def test_compact_notification_emitted_when_threshold_exceeded(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    # 构造足够大的前缀使 _prefix_too_small_to_compact 返回 False（> 2000 token ≈ 7000 字符）。
+    big_content = "x" * 30_000
+    # context_window=40000：软阈值 = 40000 - 20000 - 13000 = 7000。
+    # 4 条 big_content ≈ 34284 token > 7000，触发自动压缩。
+    # 需要 >= 6 条消息使 keep_start > 0（MIN_KEEP_MESSAGES=5 时保留尾部 5 条，
+    # 剩余前缀进摘要）。
+    client = _FakeClient(
+        [
+            _text_stream("<summary>compacted summary</summary>"),
+            _text_stream("Final reply"),
+        ]
+    )
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        work_dir=str(tmp_path),
+        context_window=40_000,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message(big_content)
+    conversation.add_assistant_message(big_content)
+    conversation.add_user_message(big_content)
+    conversation.add_assistant_message(big_content)
+    conversation.add_user_message("continue")
+
+    events = await _collect(agent.run(conversation))
+
+    compact_events = [e for e in events if isinstance(e, CompactNotification)]
+    assert len(compact_events) == 1
+    assert compact_events[0].before_tokens > 0
+    assert compact_events[0].boundary is not None
+    # 压缩后对话被重建；agent.run 在 compact 后会重新注入环境上下文，
+    # 因此摘要消息位于环境消息之后，而非 history[0]。
+    summary_msgs = [
+        m for m in conversation.history if "compacted summary" in m.content
+    ]
+    assert len(summary_msgs) == 1
+    # 最终回复正常完成。
+    assert isinstance(events[-1], LoopComplete)
+
+
+# 验证 record_usage_anchor 在 API 响应后被调用，锚点对齐 history 长度。
+# 构造单轮工具调用，调用后断言 baseline_tokens > 0 且 anchor_count 对齐。
+@pytest.mark.asyncio
+async def test_record_usage_anchor_called_after_api_response(
+    tmp_path: Path,
+) -> None:
+    tool = _MockTool(name="MockTool", result=ToolResult(content="ok"))
+    agent, conversation, client = _setup(tool)
+    client._outcomes = [
+        _tool_call_stream("c1", "MockTool", {"input": "x"}),
+        _text_stream("Done"),
+    ]
+    conversation.add_user_message("Run tool")
+
+    await _collect(agent.run(conversation))
+
+    # 工具调用后锚点被记录（input_tokens=1, output_tokens=1）。
+    assert conversation.baseline_tokens > 0
+    # anchor_count 对齐到工具调用后的 assistant 消息位置。
+    assert conversation.anchor_count > 0
+
+
+# 验证压缩成功后重新注入环境上下文。
+# 压缩 replace_history 会重置 env_injected，agent 应重新注入 env。
+@pytest.mark.asyncio
+async def test_env_reinjected_after_compact(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    big_content = "x" * 30_000
+    client = _FakeClient(
+        [
+            _text_stream("<summary>summary</summary>"),
+            _text_stream("Done"),
+        ]
+    )
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        work_dir=str(tmp_path),
+        context_window=40_000,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message(big_content)
+    conversation.add_assistant_message("ack")
+    conversation.add_user_message("continue")
+
+    await _collect(agent.run(conversation))
+
+    # 压缩后 env_injected 应为 True（重新注入）。
+    assert conversation.env_injected is True
+    # 首条消息是环境上下文。
+    assert "Current working directory" in conversation.history[0].content

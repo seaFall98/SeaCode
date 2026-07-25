@@ -12,6 +12,7 @@ from seacode.config import (
     load_config,
     resolve_env_vars,
 )
+from seacode.validator import DEFAULT_CONTEXT_WINDOW
 
 
 # 写入仅含测试占位符的 Provider YAML。
@@ -387,3 +388,131 @@ def test_build_child_env_none_returns_path_only(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("PATH", "/usr/bin")
     env = build_child_env(None)
     assert env == {"PATH": "/usr/bin"}
+
+
+# ---------------------------------------------------------------------------
+# context_window 四层 fallback 与 set_fetched_context_window
+# ---------------------------------------------------------------------------
+
+
+# 构造基本 Provider，方便 fallback 测试复用。
+def _provider_with_model(model: str, *, context_window: int = 0) -> ProviderConfig:
+    return ProviderConfig(
+        name="fallback",
+        protocol="anthropic",
+        model=model,
+        base_url="https://api.example.test",
+        api_key="test-key",
+        context_window=context_window,
+    )
+
+
+# 验证第 1 层 fallback：显式 context_window > 0 时永远优先。
+# 构造 context_window=100000 的 provider，断言 get_context_window 返回该值。
+def test_get_context_window_prefers_explicit_config() -> None:
+    provider = _provider_with_model("claude-3", context_window=100_000)
+
+    assert provider.get_context_window() == 100_000
+
+
+# 验证第 2 层 fallback：显式为 0 但 _fetched_context_window > 0 时返回缓存值。
+# set_fetched_context_window 后断言 get_context_window 返回缓存值。
+def test_get_context_window_uses_fetched_when_no_explicit() -> None:
+    provider = _provider_with_model("unknown-model")
+    provider.set_fetched_context_window(150_000)
+
+    assert provider.get_context_window() == 150_000
+
+
+# 验证第 1 层优先于第 2 层：两者都存在时返回显式值。
+# 同时设置 context_window 与 _fetched_context_window，断言返回显式值。
+def test_get_context_window_explicit_overrides_fetched() -> None:
+    provider = _provider_with_model("claude-3", context_window=100_000)
+    provider.set_fetched_context_window(150_000)
+
+    assert provider.get_context_window() == 100_000
+
+
+# 验证第 3 层 fallback：无显式无缓存时按内置映射表查找。
+# 构造 model="claude-3-5-sonnet"，断言返回 200000（claude 子串命中）。
+def test_get_context_window_falls_back_to_model_mapping() -> None:
+    provider = _provider_with_model("claude-3-5-sonnet")
+
+    assert provider.get_context_window() == 200_000
+
+
+# 验证第 3 层 fallback 对 gpt-4o 模型返回 128000。
+def test_get_context_window_mapping_for_gpt_4o() -> None:
+    provider = _provider_with_model("gpt-4o-2024")
+
+    assert provider.get_context_window() == 128_000
+
+
+# 验证第 3 层 fallback 对 1m 后缀模型返回 1000000。
+def test_get_context_window_mapping_for_1m_suffix() -> None:
+    provider = _provider_with_model("claude-sonnet-4-1m")
+
+    assert provider.get_context_window() == 1_000_000
+
+
+# 验证第 4 层 fallback：未知模型且无显式无缓存时返回 DEFAULT_CONTEXT_WINDOW。
+# 构造 model="totally-unknown"，断言返回 DEFAULT_CONTEXT_WINDOW。
+def test_get_context_window_falls_back_to_default() -> None:
+    provider = _provider_with_model("totally-unknown-model")
+
+    assert provider.get_context_window() == DEFAULT_CONTEXT_WINDOW
+
+
+# 验证 set_fetched_context_window 写入正值。
+# 调用后断言 _fetched_context_window 与 get_context_window 都返回该值。
+def test_set_fetched_context_window_stores_positive_value() -> None:
+    provider = _provider_with_model("unknown-model")
+
+    provider.set_fetched_context_window(250_000)
+
+    assert provider._fetched_context_window == 250_000
+    assert provider.get_context_window() == 250_000
+
+
+# 验证 set_fetched_context_window 忽略非正值，避免失败拉取污染缓存。
+# 调用 set 0 与负数，断言 _fetched_context_window 保持 0。
+def test_set_fetched_context_window_ignores_non_positive() -> None:
+    provider = _provider_with_model("unknown-model")
+
+    provider.set_fetched_context_window(0)
+    assert provider._fetched_context_window == 0
+
+    provider.set_fetched_context_window(-100)
+    assert provider._fetched_context_window == 0
+
+
+# 验证 set_fetched_context_window 可覆盖已有缓存（拉取到更大值时更新）。
+# 先 set 100000，再 set 200000，断言最终返回 200000。
+def test_set_fetched_context_window_can_overwrite() -> None:
+    provider = _provider_with_model("unknown-model")
+    provider.set_fetched_context_window(100_000)
+
+    provider.set_fetched_context_window(200_000)
+
+    assert provider._fetched_context_window == 200_000
+
+
+# 验证 _fetched_context_window 不参与相等比较与 hash（运行时缓存语义）。
+# 两个 provider 仅 _fetched_context_window 不同时仍应相等。
+def test_fetched_context_window_excluded_from_equality() -> None:
+    provider_a = _provider_with_model("claude-3")
+    provider_b = _provider_with_model("claude-3")
+    provider_a.set_fetched_context_window(100_000)
+    provider_b.set_fetched_context_window(200_000)
+
+    assert provider_a == provider_b
+    assert hash(provider_a) == hash(provider_b)
+
+
+# 验证 _fetched_context_window 不出现在 repr 中（避免泄漏运行时缓存）。
+def test_fetched_context_window_excluded_from_repr() -> None:
+    provider = _provider_with_model("claude-3")
+    provider.set_fetched_context_window(300_000)
+
+    assert "300000" not in repr(provider)
+    assert "_fetched_context_window" not in repr(provider)

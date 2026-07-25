@@ -282,3 +282,208 @@ def _extract_tool_ids(result: list[dict[str, Any]], protocol: str) -> list[str]:
             elif item.get("role") == "tool":
                 ids.append(item["tool_call_id"])
     return ids
+
+
+# ---------------------------------------------------------------------------
+# 连续 user 纯文本消息合并（压缩后摘要 user 与尾部 user 相邻时的协议合法化）
+# ---------------------------------------------------------------------------
+
+
+# 验证 Anthropic 协议合并连续 user 纯文本消息。
+# 构造两条相邻 user 消息，断言序列化后合并为一条并以 \n 分隔。
+def test_anthropic_merges_consecutive_plain_user_messages() -> None:
+    messages = [
+        Message(role="user", content="summary from compact"),
+        Message(role="user", content="continue work"),
+    ]
+
+    result = build_messages(messages, protocol="anthropic")
+
+    assert result == [
+        {"role": "user", "content": "summary from compact\ncontinue work"},
+    ]
+
+
+# 验证 Anthropic 协议不在 user 与 assistant 之间合并。
+# 构造 user → assistant → user，断言三条独立消息不被合并。
+def test_anthropic_does_not_merge_across_assistant() -> None:
+    messages = [
+        Message(role="user", content="first"),
+        Message(role="assistant", content="reply"),
+        Message(role="user", content="second"),
+    ]
+
+    result = build_messages(messages, protocol="anthropic")
+
+    assert result == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "second"},
+    ]
+
+
+# 验证 Anthropic 协议不把 user 纯文本合并到 user(tool_results) 消息中。
+# 构造 user(plain) → user(tool_results)，断言两条消息独立保留。
+def test_anthropic_does_not_merge_plain_user_into_tool_result_user() -> None:
+    messages = [
+        Message(role="user", content="plain"),
+        Message(
+            role="user",
+            tool_results=[
+                ToolResultBlock(tool_use_id="c1", content="result"),
+            ],
+        ),
+    ]
+
+    result = build_messages(messages, protocol="anthropic")
+
+    # 第一条 plain user 保留；第二条 user 含 tool_result content 块，不合并。
+    assert len(result) == 2
+    assert result[0] == {"role": "user", "content": "plain"}
+    assert result[1]["role"] == "user"
+    assert isinstance(result[1]["content"], list)
+    assert result[1]["content"][0]["type"] == "tool_result"
+
+
+# 验证 OpenAI Responses 协议合并连续 user 纯文本消息。
+# 构造两条相邻 user 消息，断言序列化后合并为一条并以 \n 分隔。
+def test_openai_merges_consecutive_plain_user_messages() -> None:
+    messages = [
+        Message(role="user", content="summary from compact"),
+        Message(role="user", content="continue work"),
+    ]
+
+    result = build_messages(messages, protocol="openai")
+
+    assert result == [
+        {"role": "user", "content": "summary from compact\ncontinue work"},
+    ]
+
+
+# 验证 OpenAI Responses 协议不把含 thinking_blocks 的 user 消息参与合并。
+# 构造 user(plain) → user(thinking_blocks)，断言两条独立保留。
+def test_openai_does_not_merge_user_with_thinking_blocks() -> None:
+    messages = [
+        Message(role="user", content="plain"),
+        Message(
+            role="user",
+            content="with-thinking",
+            thinking_blocks=[ThinkingBlock(thinking="thoughts", signature="s1")],
+        ),
+    ]
+
+    result = build_messages(messages, protocol="openai")
+
+    # 第二条 user 含 thinking_blocks，不参与合并，作为独立 message + reasoning 项。
+    # 第一条 plain user 不应被合并到含 thinking 的消息中。
+    user_plain_count = sum(
+        1 for item in result
+        if item.get("role") == "user" and item.get("content") == "plain"
+    )
+    assert user_plain_count == 1
+
+
+# 验证 OpenAI Responses 协议不把 user 纯文本合并到 assistant 消息之后。
+# 构造 user → assistant → user，断言三条独立消息不被合并。
+def test_openai_does_not_merge_across_assistant() -> None:
+    messages = [
+        Message(role="user", content="first"),
+        Message(role="assistant", content="reply"),
+        Message(role="user", content="second"),
+    ]
+
+    result = build_messages(messages, protocol="openai")
+
+    # user → assistant → user，三条独立消息。
+    assert {"role": "user", "content": "first"} in result
+    assert {"role": "assistant", "content": "reply"} in result
+    assert {"role": "user", "content": "second"} in result
+
+
+# 验证 OpenAI-compatible Chat Completions 协议合并连续 user 纯文本消息。
+# 构造两条相邻 user 消息，断言序列化后合并为一条并以 \n 分隔。
+def test_openai_compat_merges_consecutive_plain_user_messages() -> None:
+    messages = [
+        Message(role="user", content="summary from compact"),
+        Message(role="user", content="continue work"),
+    ]
+
+    result = build_messages(messages, protocol="openai-compat")
+
+    assert result == [
+        {"role": "user", "content": "summary from compact\ncontinue work"},
+    ]
+
+
+# 验证兼容协议不把含 reasoning_content 的 user 消息参与合并。
+# 构造 user(plain) → user(thinking_blocks)，断言 plain 不被合并到含 reasoning 的消息。
+def test_openai_compat_does_not_merge_user_with_reasoning_content() -> None:
+    messages = [
+        Message(role="user", content="plain"),
+        Message(
+            role="user",
+            content="with-reasoning",
+            thinking_blocks=[ThinkingBlock(thinking="thoughts", signature="s1")],
+        ),
+    ]
+
+    result = build_messages(messages, protocol="openai-compat")
+
+    # 第一条 plain user 不应被合并到含 reasoning_content 的消息中。
+    user_plain_count = sum(
+        1 for item in result
+        if item.get("role") == "user" and item.get("content") == "plain"
+    )
+    assert user_plain_count == 1
+
+
+# 验证兼容协议不把 user 纯文本合并到 user(tool_results) 消息中。
+# 构造 user(plain) → assistant(tool_use) → user(tool_results) → user(plain)，
+# 断言尾部 plain 不合并到 tool 消息。
+def test_openai_compat_does_not_merge_plain_user_into_tool_role() -> None:
+    messages = [
+        Message(role="user", content="plain"),
+        Message(
+            role="assistant",
+            tool_uses=[
+                ToolUseBlock(tool_use_id="c1", tool_name="Bash", arguments={})
+            ],
+        ),
+        Message(
+            role="user",
+            tool_results=[
+                ToolResultBlock(tool_use_id="c1", content="result"),
+            ],
+        ),
+        Message(role="user", content="follow-up"),
+    ]
+
+    result = build_messages(messages, protocol="openai-compat")
+
+    # tool 消息（role=tool）不应被合并 plain user；follow-up plain user 独立保留。
+    tool_msgs = [item for item in result if item.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["content"] == "result"
+    follow_up_count = sum(
+        1 for item in result
+        if item.get("role") == "user" and item.get("content") == "follow-up"
+    )
+    assert follow_up_count == 1
+
+
+# 验证三协议对三条连续 user 纯文本消息都合并为一条。
+# 构造三条相邻 user 消息，断言各协议结果都只剩一条 user 消息。
+def test_all_protocols_merge_three_consecutive_plain_user_messages() -> None:
+    messages = [
+        Message(role="user", content="first"),
+        Message(role="user", content="second"),
+        Message(role="user", content="third"),
+    ]
+
+    for protocol in ("anthropic", "openai", "openai-compat"):
+        result = build_messages(messages, protocol=protocol)
+        user_msgs = [item for item in result if item.get("role") == "user"]
+        assert len(user_msgs) == 1, f"protocol {protocol} should merge to one user"
+        assert user_msgs[0]["content"] == "first\nsecond\nthird", (
+            f"protocol {protocol} should join with \\n"
+        )

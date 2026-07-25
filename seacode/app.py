@@ -22,6 +22,7 @@ from textual.widgets.option_list import Option
 
 from .agent import (
     Agent,
+    CompactNotification,
     ErrorEvent,
     LoopComplete,
     MCPConnectEvent,
@@ -593,6 +594,7 @@ class SeaCodeApp(App[None]):
                 max_iterations=self._max_steps,
                 permission_checker=self._permission_checker,
                 mcp_manager=self._mcp_manager,
+                context_window=provider.get_context_window(),
             )
             async for event in agent.run(self._conversation):
                 if isinstance(event, StreamText):
@@ -643,6 +645,10 @@ class SeaCodeApp(App[None]):
                     if event.errors:
                         for err in event.errors:
                             await self._show_system_message(f"MCP: {err}")
+                elif isinstance(event, CompactNotification):
+                    # Layer 2 压缩完成：以系统消息呈现压缩前 token 数，不重排既有界面结构。
+                    await self._show_system_message(f"⚙ {event.message}")
+                    chat.scroll_end(animate=False)
                 elif isinstance(event, ErrorEvent):
                     await self._append_error(event.message)
                 elif isinstance(event, TurnComplete):
