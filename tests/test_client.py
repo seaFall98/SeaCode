@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from seacode.client import (
+    ANTHROPIC_MODEL_FETCH_TIMEOUT,
     AnthropicClient,
     OpenAIClient,
     OpenAICompatClient,
@@ -15,6 +16,7 @@ from seacode.client import (
     ThinkingComplete,
     ThinkingDelta,
     create_client,
+    resolve_context_window,
 )
 from seacode.config import ProviderConfig
 from seacode.conversation import Message
@@ -213,3 +215,255 @@ def test_create_client_uses_declared_protocol(protocol: str, expected_type: type
     client = create_client(_provider(protocol))
 
     assert isinstance(client, expected_type)
+
+
+# ---------------------------------------------------------------------------
+# AnthropicClient.fetch_model_context_window
+# ---------------------------------------------------------------------------
+
+
+# 记录 models.retrieve 调用并可返回预设值或抛异常的最小 SDK 客户端。
+class _FakeModelsRetrieve:
+    def __init__(
+        self, info: Any | None = None, error: Exception | None = None
+    ) -> None:
+        self.info = info
+        self.error = error
+        self.retrieve_calls: list[tuple[str, dict[str, Any]]] = []
+
+    # 保存调用参数以验证 model 与 timeout 透传；按构造期预设决定返回或抛异常。
+    async def retrieve(self, model: str, **kwargs: Any) -> Any:
+        self.retrieve_calls.append((model, dict(kwargs)))
+        if self.error is not None:
+            raise self.error
+        return self.info
+
+
+# 暴露 models 命名空间的最小测试客户端，供 AnthropicClient 注入。
+class _FakeAnthropicModelsClient:
+    def __init__(
+        self, info: Any | None = None, error: Exception | None = None
+    ) -> None:
+        self.models = _FakeModelsRetrieve(info=info, error=error)
+
+
+# 创建带 anthropic 协议与可选 context_window 的测试 Provider。
+def _anthropic_provider(*, context_window: int = 0) -> ProviderConfig:
+    return ProviderConfig(
+        name="anthropic-profile",
+        protocol="anthropic",
+        model="claude-test",
+        base_url="https://api.anthropic.test",
+        api_key="test-key",
+        thinking=True,
+        context_window=context_window,
+    )
+
+
+# 验证 fetch_model_context_window 把 SDK 返回的 max_input_tokens 转成正整数。
+# 注入返回 max_input_tokens=200000 的假 SDK 客户端，断言返回值与 model 透传。
+@pytest.mark.asyncio
+async def test_fetch_model_context_window_returns_max_input_tokens() -> None:
+    info = SimpleNamespace(max_input_tokens=200_000)
+    fake = _FakeAnthropicModelsClient(info=info)
+    client = AnthropicClient(_anthropic_provider(), client=fake)
+
+    window = await client.fetch_model_context_window()
+
+    assert window == 200_000
+    # model 字段透传给 retrieve。
+    assert fake.models.retrieve_calls[0][0] == "claude-test"
+    # timeout 透传为模块常量。
+    assert fake.models.retrieve_calls[0][1]["timeout"] == ANTHROPIC_MODEL_FETCH_TIMEOUT
+
+
+# 验证 fetch_model_context_window 在 SDK 异常时返回 None 而不抛出。
+# 注入抛 RuntimeError 的假 SDK 客户端，断言返回 None。
+@pytest.mark.asyncio
+async def test_fetch_model_context_window_returns_none_on_sdk_error() -> None:
+    fake = _FakeAnthropicModelsClient(error=RuntimeError("network down"))
+    client = AnthropicClient(_anthropic_provider(), client=fake)
+
+    window = await client.fetch_model_context_window()
+
+    assert window is None
+
+
+# 验证 fetch_model_context_window 在 info 缺失 max_input_tokens 时返回 None。
+# 注入返回空 SimpleNamespace 的假 SDK 客户端，断言返回 None。
+@pytest.mark.asyncio
+async def test_fetch_model_context_window_returns_none_when_field_missing() -> None:
+    info = SimpleNamespace()  # 无 max_input_tokens 属性
+    fake = _FakeAnthropicModelsClient(info=info)
+    client = AnthropicClient(_anthropic_provider(), client=fake)
+
+    window = await client.fetch_model_context_window()
+
+    assert window is None
+
+
+# 验证 fetch_model_context_window 在 max_input_tokens 非正整数时返回 None。
+# 注入返回 max_input_tokens=0 的假 SDK 客户端，断言返回 None。
+@pytest.mark.asyncio
+async def test_fetch_model_context_window_returns_none_when_non_positive() -> None:
+    info = SimpleNamespace(max_input_tokens=0)
+    fake = _FakeAnthropicModelsClient(info=info)
+    client = AnthropicClient(_anthropic_provider(), client=fake)
+
+    window = await client.fetch_model_context_window()
+
+    assert window is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_context_window
+# ---------------------------------------------------------------------------
+
+
+# 验证 resolve_context_window 在显式 context_window > 0 时跳过网络请求。
+# 构造 context_window=100000 的 provider，断言 create_client 不被调用且缓存不变。
+@pytest.mark.asyncio
+async def test_resolve_context_window_skips_when_explicit_config_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[ProviderConfig] = []
+
+    def _fake_create_client(config: ProviderConfig) -> Any:
+        calls.append(config)
+        raise AssertionError("create_client should not be called")
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    provider = _anthropic_provider(context_window=100_000)
+
+    await resolve_context_window(provider)
+
+    assert calls == []
+    assert provider._fetched_context_window == 0
+
+
+# 验证 resolve_context_window 在已缓存 _fetched_context_window > 0 时跳过网络请求。
+# 先手动 set_fetched_context_window，断言 create_client 不被调用且缓存保留原值。
+@pytest.mark.asyncio
+async def test_resolve_context_window_skips_when_already_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[ProviderConfig] = []
+
+    def _fake_create_client(config: ProviderConfig) -> Any:
+        calls.append(config)
+        raise AssertionError("create_client should not be called")
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    provider = _anthropic_provider()
+    provider.set_fetched_context_window(150_000)
+
+    await resolve_context_window(provider)
+
+    assert calls == []
+    assert provider._fetched_context_window == 150_000
+
+
+# 验证 resolve_context_window 对非 anthropic 协议直接返回，不发起拉取。
+# 构造 openai 协议 provider，断言 create_client 不被调用。
+@pytest.mark.asyncio
+async def test_resolve_context_window_skips_non_anthropic_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[ProviderConfig] = []
+
+    def _fake_create_client(config: ProviderConfig) -> Any:
+        calls.append(config)
+        raise AssertionError("create_client should not be called")
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    provider = ProviderConfig(
+        name="openai-profile",
+        protocol="openai",
+        model="gpt-4o",
+        base_url="https://api.openai.test",
+        api_key="test-key",
+    )
+
+    await resolve_context_window(provider)
+
+    assert calls == []
+    assert provider._fetched_context_window == 0
+
+
+# 验证 resolve_context_window 成功时把窗口大小写入 _fetched_context_window。
+# 用 monkeypatch 替换 create_client 返回注入了假 SDK 的 AnthropicClient。
+@pytest.mark.asyncio
+async def test_resolve_context_window_caches_window_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = SimpleNamespace(max_input_tokens=300_000)
+    fake_sdk = _FakeAnthropicModelsClient(info=info)
+    fake_client = AnthropicClient(_anthropic_provider(), client=fake_sdk)
+
+    def _fake_create_client(config: ProviderConfig) -> Any:
+        return fake_client
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    provider = _anthropic_provider()
+
+    await resolve_context_window(provider)
+
+    assert provider._fetched_context_window == 300_000
+
+
+# 验证 resolve_context_window 在 fetch 抛异常时静默降级、不写缓存。
+# 用 monkeypatch 返回 fetch 会抛异常的假客户端，断言 _fetched_context_window 保持 0。
+@pytest.mark.asyncio
+async def test_resolve_context_window_silently_handles_fetch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_sdk = _FakeAnthropicModelsClient(error=RuntimeError("timeout"))
+    fake_client = AnthropicClient(_anthropic_provider(), client=fake_sdk)
+
+    def _fake_create_client(config: ProviderConfig) -> Any:
+        return fake_client
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    provider = _anthropic_provider()
+
+    await resolve_context_window(provider)
+
+    assert provider._fetched_context_window == 0
+
+
+# 验证 resolve_context_window 在 create_client 抛异常时静默降级。
+# 用 monkeypatch 让 create_client 抛异常，断言不向上传播且缓存不变。
+@pytest.mark.asyncio
+async def test_resolve_context_window_silently_handles_create_client_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_create_client(config: ProviderConfig) -> Any:
+        raise RuntimeError("no api key")
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    provider = _anthropic_provider()
+
+    await resolve_context_window(provider)
+
+    assert provider._fetched_context_window == 0
+
+
+# 验证 resolve_context_window 在 fetch 返回 None 时不写缓存。
+# 用 monkeypatch 返回 fake_sdk（无 max_input_tokens），断言缓存保持 0。
+@pytest.mark.asyncio
+async def test_resolve_context_window_does_not_cache_when_fetch_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = SimpleNamespace()  # 无 max_input_tokens
+    fake_sdk = _FakeAnthropicModelsClient(info=info)
+    fake_client = AnthropicClient(_anthropic_provider(), client=fake_sdk)
+
+    def _fake_create_client(config: ProviderConfig) -> Any:
+        return fake_client
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    provider = _anthropic_provider()
+
+    await resolve_context_window(provider)
+
+    assert provider._fetched_context_window == 0

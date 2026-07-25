@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -22,6 +23,18 @@ from .client import (
     ToolCallDelta,
     ToolCallStart,
 )
+from .context import (
+    CompactBoundary,
+    CompactCircuitBreaker,
+    CompactEvent,
+    ContentReplacementState,
+    RecoveryState,
+    append_replacement_records,
+    apply_tool_result_budget,
+    auto_compact,
+    create_replacement_state,
+    ensure_session_dir,
+)
 from .conversation import (
     ConversationManager,
     ThinkingBlock,
@@ -33,7 +46,7 @@ from .permissions import PermissionChecker, PermissionMode
 from .permissions.rules import Rule, extract_content
 from .prompts import build_environment_context, build_system_prompt
 from .tools import ToolRegistry
-from .tools.base import ToolResult
+from .tools.base import MAX_OUTPUT_CHARS, ToolResult
 from .tools.tool_search import ToolSearchTool
 
 # ---------------------------------------------------------------------------
@@ -121,6 +134,17 @@ class MCPConnectEvent:
     errors: list[str]
 
 
+@dataclass
+class CompactNotification:
+    """Layer 2 压缩完成事件；携带压缩前 token 数与可选结构化边界供 TUI/session 层消费。"""
+
+    before_tokens: int
+    message: str
+    # 结构化 boundary（摘要 + 原文保留尾部），UI/session 层用它持久化 compact_boundary 记录。
+    # 失败路径下为 None。
+    boundary: CompactBoundary | None = None
+
+
 class PermissionResponse(Enum):
     """用户对权限请求的三种回复；由 TUI 通过 future.resolve 传回 Agent。"""
 
@@ -150,6 +174,7 @@ type AgentEvent = (
     | ErrorEvent
     | PermissionRequest
     | MCPConnectEvent
+    | CompactNotification
 )
 
 
@@ -176,7 +201,9 @@ class LLMResponse:
     stop_reason: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
-
+    # 缓存用量分量，供 record_usage_anchor 计算 baseline 使用。
+    cache_read: int = 0
+    cache_creation: int = 0
 
 class StreamCollector:
     """消费 LLM 流事件并累积成完整响应，同时转发给上层 UI。"""
@@ -216,6 +243,8 @@ class StreamCollector:
                 self.response.stop_reason = event.stop_reason
                 self.response.input_tokens = event.input_tokens
                 self.response.output_tokens = event.output_tokens
+                self.response.cache_read = event.cache_read
+                self.response.cache_creation = event.cache_creation
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +328,7 @@ class Agent:
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
         permission_checker: PermissionChecker | None = None,
         mcp_manager: MCPManager | None = None,
+        context_window: int = 200_000,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -323,6 +353,16 @@ class Agent:
             self.registry.register(
                 ToolSearchTool(registry=self.registry, protocol=protocol)
             )
+        # 上下文治理：context_window 用于阈值判断；session_dir 隔离落盘文件；
+        # compact_breaker 防止压缩连续失败卡死；replacement_state 保证 prompt cache 前缀稳定；
+        # recovery_state 记录文件读取快照，压缩后重新附加到摘要 user 消息。
+        self.context_window = context_window
+        self.session_dir: Path = ensure_session_dir(work_dir)
+        self.compact_breaker = CompactCircuitBreaker()
+        self.replacement_state: ContentReplacementState = create_replacement_state()
+        self.recovery_state: RecoveryState = RecoveryState()
+        # 会话记录路径只作为字符串拼进压缩后摘要提示，本步不读写会话 JSONL（第 08 步交付）。
+        self._transcript_path: str = ""
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -409,6 +449,43 @@ class Agent:
 
             # 每轮重新获取工具 Schema，使 mark_discovered 后的新工具立即纳入。
             tools = self.registry.get_all_schemas(self.protocol)
+
+            # Layer 1：工具结果预算——就地修改 conversation 中超限的 ToolResultBlock.content，
+            # 替换为落盘预览。返回本轮新产生的替换记录，追加到 jsonl 支持 resume 重建。
+            new_records = apply_tool_result_budget(
+                conversation, self.session_dir, self.replacement_state
+            )
+            if new_records:
+                append_replacement_records(self.session_dir, new_records)
+
+            # Layer 2：接近 context window 上限时自动 compact。
+            # tool-result budget 已就地修改 conversation，直接用 conversation.history 估算。
+            # 压缩成功后重新注入环境并重新 apply budget（保留的尾部 tool_result 仍可能超限）。
+            compact_result = await auto_compact(
+                conversation,
+                self.client,
+                self.context_window,
+                self.session_dir,
+                protocol=self.protocol,
+                breaker=self.compact_breaker,
+                recovery=self.recovery_state,
+                tool_schemas=self.registry.get_all_schemas(self.protocol),
+                transcript_path=self._transcript_path,
+            )
+            if isinstance(compact_result, CompactEvent):
+                yield CompactNotification(
+                    before_tokens=compact_result.before_tokens,
+                    message=f"上下文已压缩（压缩前 {compact_result.before_tokens:,} tokens）",
+                    boundary=compact_result.boundary,
+                )
+                # 压缩后重新注入环境上下文（replace_history 已重置 env_injected）。
+                conversation.inject_environment(env_context)
+                # 压缩后重新应用 budget，保证尾部保留的 tool_result 也走预算替换。
+                apply_tool_result_budget(
+                    conversation, self.session_dir, self.replacement_state
+                )
+            elif isinstance(compact_result, str):
+                yield ErrorEvent(message=compact_result)
 
             collector = StreamCollector()
             executor = StreamingExecutor()
@@ -501,6 +578,15 @@ class Agent:
             conversation.add_assistant_message(
                 response.text, tool_uses=tool_uses, thinking_blocks=conv_thinking
             )
+            # 在 assistant 回复加入历史后锚定实际用量：基准值（input + cache_read +
+            # cache_creation + output）覆盖到当前位置，因此下一轮迭代顶部的 auto-compact
+            # 检查只需对接下来追加的 tool results 做字符估算。
+            conversation.record_usage_anchor(
+                response.input_tokens,
+                response.output_tokens,
+                response.cache_read,
+                response.cache_creation,
+            )
 
             # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）。
             tool_results: list[ToolResultBlock] = []
@@ -511,10 +597,12 @@ class Agent:
                     consecutive_unknown += 1
                 else:
                     consecutive_unknown = 0
+                # 即时落盘：超过 MAX_OUTPUT_CHARS 的输出持久化到磁盘，对话里只保留预览。
+                content = self._maybe_persist_or_truncate(br.tool_id, br.result.content)
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=br.tool_id,
-                        content=br.result.content,
+                        content=content,
                         is_error=br.result.is_error,
                     )
                 )
@@ -548,10 +636,12 @@ class Agent:
                     consecutive_unknown += 1
                 else:
                     consecutive_unknown = 0
+                # 即时落盘：延迟执行的工具结果同样走 MAX_OUTPUT_CHARS 即时落盘。
+                content = self._maybe_persist_or_truncate(tc.tool_id, result.content)
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=tc.tool_id,
-                        content=result.content,
+                        content=content,
                         is_error=result.is_error,
                     )
                 )
@@ -714,3 +804,15 @@ class Agent:
     ) -> list[_ToolExecResult]:
         tasks = [self._execute_single_tool_direct(tc) for tc in calls]
         return list(await asyncio.gather(*tasks))
+
+    # 工具结果进入历史前的即时落盘：超过 MAX_OUTPUT_CHARS 的输出持久化到 session 目录，
+    # 对话里只保留 <persisted-output> 预览。这是 Layer 1 的早期拦截线，发生在
+    # apply_tool_result_budget 的预算替换之前；未被即时落盘的结果（如流式执行器收集
+    # 的结果在收集阶段未走此路径）由循环顶部的预算替换兜底。
+    def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
+        from seacode.context.manager import make_persisted_preview, persist_tool_result
+
+        if len(text) > MAX_OUTPUT_CHARS:
+            fp = persist_tool_result(tool_use_id, text, self.session_dir)
+            return make_persisted_preview(text, fp)
+        return text

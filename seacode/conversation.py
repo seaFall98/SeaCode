@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -15,9 +16,13 @@ class ToolUseBlock:
     arguments: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass
 class ToolResultBlock:
-    """表示一次工具执行结果回灌给模型的块。"""
+    """表示一次工具执行结果回灌给模型的块。
+
+    非 frozen：上下文治理的 Layer 1 预算需要就地替换 content，
+    以保证 prompt cache 前缀稳定。
+    """
 
     tool_use_id: str
     content: str
@@ -43,6 +48,34 @@ class Message:
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
 
 
+# 锚点之后追加消息的 token 估算使用的字符/token 比率。
+# 与上下文治理模块的恢复附件启发值保持一致，全代码库统一使用同一比率。
+_CHARS_PER_TOKEN: float = 3.5
+
+
+def _message_chars(m: Message) -> int:
+    """统计一条消息中所有可见文本的字符数，作为 token 估算的输入。"""
+    n = len(m.content)
+    for tb in m.thinking_blocks:
+        n += len(tb.thinking)
+    for tu in m.tool_uses:
+        n += len(tu.tool_name) + len(json.dumps(tu.arguments, ensure_ascii=False))
+    for tr in m.tool_results:
+        n += len(tr.content)
+    return n
+
+
+def estimate_tokens(messages: list[Message]) -> int:
+    """基于字符数对一组消息做 token 估算。
+
+    刻意做得粗略——它只覆盖那些尚未锚定到真实 API 用量数值的消息，这部分的
+    精确度本就无关紧要。统计内容包括消息正文、thinking、工具调用参数以及
+    工具结果内容。
+    """
+    total = sum(_message_chars(m) for m in messages)
+    return int(total / _CHARS_PER_TOKEN)
+
+
 class ConversationManager:
     """维护已完成回合的历史并支持单活动回合的暂存与回滚。"""
 
@@ -51,11 +84,58 @@ class ConversationManager:
         self._messages: list[Message] = []
         self._pending_user: Message | None = None
         self.env_injected: bool = False
+        # 真实用量锚点：baseline_tokens 是上一轮 API 计费的完整 prompt+output 大小
+        # （input + cache_read + cache_creation + output）；anchor_count 是记录该数值时的
+        # 消息数量。两者配合让 current_tokens() 在锚点以内信任 API 数据，只对之后追加
+        # 的消息做字符估算。baseline_tokens == 0 表示"尚无锚点"（冷启动或刚压缩清空）。
+        self.baseline_tokens: int = 0
+        self.anchor_count: int = 0
+        # API 报告的每轮真实 prompt 大小，保留用于向后兼容。
+        # 现在与 baseline_tokens 一致（input + cache_read + cache_creation + output）。
+        self.last_input_tokens: int = 0
+
+    # 暴露底层消息列表引用，供上下文治理就地修改 ToolResultBlock.content。
+    # 同时支持赋值替换整个历史（auto_compact 重建对话时使用）。
+    @property
+    def history(self) -> list[Message]:
+        return self._messages
+
+    # 赋值替换整个历史并重置 env_injected 与用量锚点。
+    @history.setter
+    def history(self, new_messages: list[Message]) -> None:
+        self.replace_history(new_messages)
 
     # 返回已经完成的消息，供测试和界面读取。
     @property
     def messages(self) -> tuple[Message, ...]:
         return tuple(self._messages)
+
+    # 根据一次 API 响应钉下一个真实用量锚点。
+    # baseline = input + cache_read + cache_creation + output；各家服务商返回的
+    # input_tokens 已排除命中缓存的 token，所以三个 input 分量相加才是真正的 prompt
+    # 大小；再加上 output 是因为 assistant 回复此刻已成为历史的一部分。anchor_count
+    # 对齐到当前消息数量，后续新追加的消息就成了唯一需要估算的部分。
+    def record_usage_anchor(
+        self,
+        input_tokens: int,
+        output_tokens: int = 0,
+        cache_read: int = 0,
+        cache_creation: int = 0,
+    ) -> None:
+        self.baseline_tokens = (
+            input_tokens + cache_read + cache_creation + output_tokens
+        )
+        self.anchor_count = len(self._messages)
+        self.last_input_tokens = self.baseline_tokens
+
+    # 对当前对话中的 token 数量做出最佳估算。
+    # 有锚点时：baseline（真实用量）+ 仅对锚点之后追加的消息做字符估算。
+    # 无锚点时（冷启动或刚压缩重置）：对整个历史做字符估算。
+    def current_tokens(self) -> int:
+        if self.baseline_tokens <= 0:
+            return estimate_tokens(self._messages)
+        tail = self._messages[self.anchor_count:]
+        return self.baseline_tokens + estimate_tokens(tail)
 
     # 开始一个尚未确认成功的用户回合。
     def begin_turn(self, content: str) -> None:
@@ -120,10 +200,15 @@ class ConversationManager:
             self._messages.insert(0, Message(role="user", content=context))
             self.env_injected = True
 
-    # 替换整个历史并重置 env_injected，支持第 07 步压缩后重新注入环境上下文。
+    # 替换整个历史并重置 env_injected 与用量锚点，支持第 07 步压缩后重新注入环境上下文。
+    # 旧的锚点描述的是压缩前的对话记录，这里清零使 current_tokens() 退化为字符估算，
+    # 直到下次 API 响应基于压缩后的历史重新锚定。
     def replace_history(self, new_messages: list[Message]) -> None:
         self._messages = new_messages
         self.env_injected = False
+        self.baseline_tokens = 0
+        self.anchor_count = 0
+        self.last_input_tokens = 0
 
     # 返回当前完整历史，供调度器发起请求使用。
     def get_messages(self) -> list[Message]:

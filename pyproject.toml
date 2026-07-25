@@ -45,6 +45,7 @@ select = ["E", "F", "I", "UP"]
 # 提示词段落常量是长文本字符串，行长度限制不适用。
 [tool.ruff.lint.per-file-ignores]
 "seacode/prompts.py" = ["E501"]
+"seacode/context/manager.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

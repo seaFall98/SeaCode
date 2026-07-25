@@ -157,6 +157,10 @@ def _api_key(config: ProviderConfig) -> str:
     return api_key
 
 
+# Anthropic /v1/models 拉取上下文窗口的超时秒数；超时不抛异常，降级到下一层。
+ANTHROPIC_MODEL_FETCH_TIMEOUT: float = 3.0
+
+
 class AnthropicClient(LLMClient):
     """通过 Anthropic Messages 协议流式传输文本、思考与工具调用。"""
 
@@ -172,6 +176,21 @@ class AnthropicClient(LLMClient):
     # 更新后续请求的最大输出 token 数。
     def set_max_output_tokens(self, n: int) -> None:
         self._max_output_tokens = n
+
+    # 向 Anthropic 兼容的 /v1/models/{model} 端点查询模型的 max_input_tokens
+    # （context window 解析的第 2 层）。尽力而为：遇到任何错误都返回 None 而非抛异常，
+    # 阻塞时间不超过 ANTHROPIC_MODEL_FETCH_TIMEOUT，让调用方安全降级。
+    async def fetch_model_context_window(self) -> int | None:
+        try:
+            info = await self._client.models.retrieve(
+                self._config.model, timeout=ANTHROPIC_MODEL_FETCH_TIMEOUT
+            )
+            window = getattr(info, "max_input_tokens", None)
+            if isinstance(window, int) and window > 0:
+                return window
+            return None
+        except Exception:
+            return None
 
     # 调用 Messages API 并归一化文本、思考、工具调用与完成事件。
     async def stream(
@@ -561,3 +580,30 @@ def create_client(config: ProviderConfig) -> LLMClient:
     if config.protocol == "openai-compat":
         return OpenAICompatClient(config)
     raise ProtocolError("The selected provider protocol is unsupported.")
+
+
+# context window 解析的第 2 层：对 anthropic 协议的 provider 从 /v1/models/{model}
+# 自动拉取一次 max_input_tokens，并通过 set_fetched_context_window 缓存到 config 上。
+# 完全尽力而为，绝不抛异常：非 anthropic provider、客户端构造失败、拉取失败或超时，
+# 都让缓存保持不变，由 get_context_window() 降级到内置映射表 / 默认值。在启动时调用安全。
+async def resolve_context_window(config: ProviderConfig) -> None:
+    # 显式配置或已缓存的值优先级更高，跳过网络请求。
+    if config.context_window > 0 or config._fetched_context_window > 0:
+        return
+    if config.protocol != "anthropic":
+        return
+
+    try:
+        client = create_client(config)
+    except Exception:
+        return
+    fetch = getattr(client, "fetch_model_context_window", None)
+    if fetch is None:
+        return
+
+    try:
+        window = await fetch()
+    except Exception:
+        window = None
+    if window:
+        config.set_fetched_context_window(window)

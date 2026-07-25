@@ -70,7 +70,8 @@ def build_openai_input(messages: list[Message]) -> list[dict[str, Any]]:
     """生成 OpenAI Responses 协议的 input 请求体。
 
     thinking_blocks 作为 reasoning item 回传；tool_uses 作为 function_call；
-    tool_results 作为 function_call_output。
+    tool_results 作为 function_call_output。合并连续纯文本 user 消息，
+    保证压缩后摘要 user 与尾部 user 相邻时协议合法。
     """
     result: list[dict[str, Any]] = []
     for m in messages:
@@ -113,7 +114,19 @@ def build_openai_input(messages: list[Message]) -> list[dict[str, Any]]:
                         "summary": [{"type": "summary_text", "text": tb.thinking}],
                     }
                 )
-            result.append({"role": m.role, "content": m.content})
+            # 合并连续纯文本 user 消息（压缩后摘要 user 可能与尾部 user 相邻）。
+            if (
+                m.role == "user"
+                and result
+                and result[-1].get("role") == "user"
+                and "content" in result[-1]
+                and not m.thinking_blocks
+            ):
+                prev = result[-1]
+                prev_content = prev.get("content", "") or ""
+                prev["content"] = prev_content + "\n" + m.content if prev_content else m.content
+            else:
+                result.append({"role": m.role, "content": m.content})
     return result
 
 
@@ -121,7 +134,8 @@ def build_chat_completion_messages(messages: list[Message]) -> list[dict[str, An
     """生成 OpenAI-compatible Chat Completions 协议的 messages 请求体。
 
     助手工具调用使用 tool_calls 字段；工具结果使用 role=tool；
-    thinking_blocks 作为 reasoning_content 回传。
+    thinking_blocks 作为 reasoning_content 回传。合并连续纯文本 user 消息，
+    保证压缩后摘要 user 与尾部 user 相邻时协议合法。
     """
     result: list[dict[str, Any]] = []
     for m in messages:
@@ -158,10 +172,23 @@ def build_chat_completion_messages(messages: list[Message]) -> list[dict[str, An
                     }
                 )
         else:
-            msg = {"role": m.role, "content": m.content}
-            if reasoning:
-                msg["reasoning_content"] = reasoning
-            result.append(msg)
+            # 合并连续纯文本 user 消息（压缩后摘要 user 可能与尾部 user 相邻）。
+            # 不合并到含 reasoning_content 的消息或 assistant 消息。
+            if (
+                m.role == "user"
+                and result
+                and result[-1].get("role") == "user"
+                and "content" in result[-1]
+                and not reasoning
+            ):
+                prev = result[-1]
+                prev_content = prev.get("content", "") or ""
+                prev["content"] = prev_content + "\n" + m.content if prev_content else m.content
+            else:
+                msg = {"role": m.role, "content": m.content}
+                if reasoning:
+                    msg["reasoning_content"] = reasoning
+                result.append(msg)
     return result
 
 
