@@ -32,3 +32,24 @@ mcp_servers:
   #   url: https://mcp.example.com/sse
   #   headers:
   #     Authorization: "Bearer ${MCP_TOKEN}"
+
+# 生命周期 Hook 配置（可选）；三层配置叠加合并，用户级 + 项目级 + 本地级 Hook 全部累加。
+# event 取值见 LifecycleEvent；action.type 支持 command/prompt/http/agent 四类。
+# reject 仅 pre_tool_use 可用；async 仅非 pre_tool_use 可用；once 控制单次执行。
+# if 条件支持 ==/!=/=~/~= 四操作符与 &&/|| 组合（不可混用）。
+hooks:
+  # 拦截写 JSON 文件：pre_tool_use + reject + if 条件匹配 WriteFile 且 file_path 以 .json 结尾
+  - id: block-json-write
+    event: pre_tool_use
+    if: 'tool == "WriteFile" && args.file_path =~ "/\\.json$/"'
+    reject: true
+    action:
+      type: prompt
+      message: "禁止写入 JSON 文件：$TOOL_ARGS.file_path"
+  # 会话开始时注入提示词：session_start + once 确保只执行一次
+  - id: session-start-read-arch
+    event: session_start
+    once: true
+    action:
+      type: prompt
+      message: "会话开始，请阅读 ARCHITECTURE.md 了解项目结构。"

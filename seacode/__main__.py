@@ -7,6 +7,7 @@ import os
 import sys
 
 from .config import ConfigError, ProviderConfig, load_config
+from .hooks import HookConfigError, HookEngine, load_hooks
 
 # Agent Loop 默认最大迭代次数，与 SEA_MAX_STEPS 未设置时的回退值一致。
 _DEFAULT_MAX_STEPS: int = 100
@@ -46,6 +47,15 @@ def main() -> None:
         print(f"SeaCode configuration error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
 
+    # 加载 Hook 配置；字段级校验失败打印错误并退出，不让 SeaCode 带着错误配置启动。
+    try:
+        hooks = load_hooks(config.raw_hooks)
+    except HookConfigError as error:
+        print(f"SeaCode hook configuration error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    # 无 Hook 配置时 hook_engine 为 None，Agent 与 App 的注入点都跳过零开销。
+    hook_engine = HookEngine(hooks) if hooks else None
+
     # 启动前尽力拉取 anthropic Provider 的 context window；失败静默降级。
     # 同步入口里跑一次事件循环，拉取超时由 ANTHROPIC_MODEL_FETCH_TIMEOUT 兜底。
     try:
@@ -55,7 +65,11 @@ def main() -> None:
 
     from .app import SeaCodeApp
 
-    SeaCodeApp(providers=config.providers, max_steps=_read_max_steps()).run()
+    SeaCodeApp(
+        providers=config.providers,
+        max_steps=_read_max_steps(),
+        hook_engine=hook_engine,
+    ).run()
 
 
 if __name__ == "__main__":

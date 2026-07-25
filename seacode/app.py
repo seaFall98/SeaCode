@@ -25,6 +25,7 @@ from .agent import (
     Agent,
     CompactNotification,
     ErrorEvent,
+    HookEvent,
     LoopComplete,
     MCPConnectEvent,
     PermissionRequest,
@@ -60,6 +61,7 @@ from .commands.handlers.skill_register import (
 )
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig
 from .conversation import ConversationManager, Message
+from .hooks import HookContext, HookEngine
 from .mcp import MCPManager
 from .memory import (
     MemoryManager,
@@ -576,6 +578,7 @@ class SeaCodeApp(App[None]):
         max_steps: int = 100,
         sandbox_cfg: SandboxAppConfig | None = None,
         mcp_servers: tuple[MCPServerConfig, ...] | list[MCPServerConfig] | None = None,
+        hook_engine: HookEngine | None = None,
     ) -> None:
         super().__init__()
         self._providers = tuple(providers)
@@ -589,6 +592,10 @@ class SeaCodeApp(App[None]):
         self._max_steps = max_steps
         # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，默认全关闭。
         self._sandbox_cfg = sandbox_cfg or SandboxAppConfig()
+        # batch11：生命周期 Hook 引擎；为 None 时所有注入点零开销。
+        # 由 __main__.py 通过 load_hooks(config.raw_hooks) 构造后注入；
+        # on_mount 时触发 startup 事件，on_unmount 时触发 shutdown 事件。
+        self._hook_engine: HookEngine | None = hook_engine
         # 权限检查器；在 _select_provider 中装配，为 None 时跳过权限检查。
         self._permission_checker: PermissionChecker | None = None
         # 当前权限模式；与 permission_checker.mode 同步，供 TUI 状态栏展示。
@@ -683,11 +690,29 @@ class SeaCodeApp(App[None]):
             self.query_one(ChatInput).load_history(Path(os.getcwd()))
         except Exception:
             pass
+        # batch11：触发 startup 事件；ensure_future 后台执行避免阻塞 TUI 启动。
+        # Hook 抛异常由 _run_single 兜底捕获记 warning，不影响 TUI 主流程。
+        if self._hook_engine is not None:
+            asyncio.ensure_future(self._trigger_startup_hooks())
         if len(self._providers) == 1:
             self._select_provider(self._providers[0])
         else:
             self.query_one("#chat-area").display = False
             self.query_one("#input-area").display = False
+
+    # batch11：触发 startup Hook 并把累积通知渲染到对话区作为状态行。
+    async def _trigger_startup_hooks(self) -> None:
+        if self._hook_engine is None:
+            return
+        try:
+            await self._hook_engine.run_hooks(
+                "startup", HookContext(event_name="startup")
+            )
+            for n in self._hook_engine.drain_notifications():
+                await self._render_hook_notification(n)
+        except Exception:
+            # 启动 Hook 异常不阻断 TUI；记静默即可。
+            pass
 
     # 接收键盘选择并切换到相应模型配置。
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -1072,6 +1097,8 @@ class SeaCodeApp(App[None]):
                 context_window=provider.get_context_window(),
                 instructions_content=self._instructions_content,
                 memory_manager=self._memory_manager,
+                # batch11：注入 HookEngine；Agent.run 在 8 个注入点触发对应生命周期事件。
+                hook_engine=self._hook_engine,
             )
             # 保存当前回合 Agent 引用，供命令路径（/status /compact /plan 等）访问。
             self._agent = agent
@@ -1146,6 +1173,16 @@ class SeaCodeApp(App[None]):
                     # 历史末尾，避免 TurnComplete/LoopComplete 把已压缩前缀重复写入。
                     self._persist_compact_boundary(event)
                     history_cursor = len(self._conversation.messages)
+                elif isinstance(event, HookEvent):
+                    # batch11：Hook 执行结果在对话区呈现状态行，与 CompactNotification 同层级。
+                    status = "OK" if event.success else "FAIL"
+                    output = event.output
+                    if len(output) > 200:
+                        output = output[:200] + "…"
+                    await self._show_system_message(
+                        f"Hook [{event.hook_id}] {status} {output}"
+                    )
+                    chat.scroll_end(animate=False)
                 elif isinstance(event, ErrorEvent):
                     await self._append_error(event.message)
                 elif isinstance(event, TurnComplete):
@@ -1399,6 +1436,36 @@ class SeaCodeApp(App[None]):
         chat.scroll_end(animate=False)
 
     # 应用退出时关闭当前 session 文件句柄，避免句柄泄露。
+    # batch11：触发 shutdown 事件；用 ensure_future 后台执行，避免 on_unmount
+    # 等待 Hook 完成（shutdown Hook 异常由 _run_single 兜底捕获记 warning）。
     def on_unmount(self) -> None:
+        if self._hook_engine is not None:
+            try:
+                asyncio.ensure_future(self._trigger_shutdown_hooks())
+            except RuntimeError:
+                # 事件循环已关闭时静默跳过；shutdown Hook 仍可在循环关闭前执行。
+                pass
         if self._session is not None:
             self._session.close()
+
+    # batch11：触发 shutdown Hook；只 await 完成，渲染通知由 drain 后异步处理。
+    async def _trigger_shutdown_hooks(self) -> None:
+        if self._hook_engine is None:
+            return
+        try:
+            await self._hook_engine.run_hooks(
+                "shutdown", HookContext(event_name="shutdown")
+            )
+        except Exception:
+            # shutdown Hook 异常不阻断退出流程。
+            pass
+
+    # batch11：把 HookNotification 渲染到对话区作为状态行。
+    # 与 CompactNotification / MCPConnectEvent 呈现层级一致，不重排已有 TUI 布局。
+    async def _render_hook_notification(self, notification: Any) -> None:
+        status = "OK" if notification.success else "FAIL"
+        output = notification.output
+        if len(output) > 200:
+            output = output[:200] + "…"
+        line = f"Hook [{notification.hook_id}] {status} {output}"
+        await self._show_system_message(line)

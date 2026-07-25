@@ -1,6 +1,8 @@
-"""模型相关常量与内置映射表，服务于上下文窗口的四层降级解析。"""
+"""模型相关常量与内置映射表，服务于上下文窗口的四层降级解析；并校验 hooks 段结构。"""
 
 from __future__ import annotations
+
+from typing import Any
 
 # 上下文窗口的保守默认值（第 4 层 fallback）。
 # 与主流 Claude 模型的窗口对齐；其它模型由映射表或显式配置覆盖。
@@ -30,3 +32,14 @@ def lookup_model_context_window(model: str) -> int:
         if substr in m:
             return window
     return 0
+
+
+# 校验 hooks 配置段结构；只做 list 或 None 校验，字段级校验在 hooks.loader.load_hooks。
+# None 视为未配置返回空 list；非 list 抛 ConfigError。ConfigError 延迟导入避免循环依赖。
+def validate_hooks(raw_hooks: Any) -> list[dict]:
+    if raw_hooks is None:
+        return []
+    if isinstance(raw_hooks, list):
+        return raw_hooks
+    from seacode.config import ConfigError
+    raise ConfigError("'hooks' must be a list of hook definitions")

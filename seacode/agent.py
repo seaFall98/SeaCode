@@ -41,6 +41,7 @@ from .conversation import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from .hooks import HookContext, HookEngine
 from .mcp import ConnectResult, MCPManager
 from .memory.auto_memory import MemoryManager
 from .memory.consolidation import MemoryConsolidator
@@ -152,6 +153,16 @@ class CompactNotification:
     boundary: CompactBoundary | None = None
 
 
+@dataclass
+class HookEvent:
+    """Hook 执行结果事件；供 TUI 在对话区呈现 Hook [id] OK/FAIL output 状态行。"""
+
+    hook_id: str
+    event: str
+    output: str
+    success: bool
+
+
 class PermissionResponse(Enum):
     """用户对权限请求的三种回复；由 TUI 通过 future.resolve 传回 Agent。"""
 
@@ -182,6 +193,7 @@ type AgentEvent = (
     | PermissionRequest
     | MCPConnectEvent
     | CompactNotification
+    | HookEvent
 )
 
 
@@ -338,6 +350,7 @@ class Agent:
         context_window: int = 200_000,
         instructions_content: str = "",
         memory_manager: MemoryManager | None = None,
+        hook_engine: HookEngine | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -395,6 +408,10 @@ class Agent:
         self.active_skills: dict[str, str] = {}
         self.skill_catalog: str = ""
         self.skill_loader: Any = None
+        # batch11：生命周期 Hook 引擎；为 None 时所有注入点零开销。
+        # 由 __main__.py 在创建 Agent 时注入，或由 app.py 在 _run_turn 中通过
+        # set_hook_engine 注入。8 个注入点在 run() 中按生命周期顺序触发。
+        self.hook_engine: HookEngine | None = hook_engine
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -418,6 +435,32 @@ class Agent:
     # batch10：注入 SkillLoader 引用，供 /skill 命令与 LoadSkill 工具访问。
     def set_skill_loader(self, loader: Any) -> None:
         self.skill_loader = loader
+
+    # batch11：注入 HookEngine；为 None 时关闭所有注入点（零开销）。
+    def set_hook_engine(self, engine: HookEngine | None) -> None:
+        self.hook_engine = engine
+
+    # 从工具调用参数推断 file_path；支持 file_path/path 两种常见字段名。
+    def _infer_file_path(self, arguments: dict[str, Any]) -> str:
+        return arguments.get("file_path") or arguments.get("path") or ""
+
+    # 构造 HookContext；event 标识事件名，其余字段按场景传入。
+    def _build_hook_context(self, event: str, **kwargs: Any) -> HookContext:
+        return HookContext(event_name=event, **kwargs)
+
+    # 取出 HookEngine 累积的通知并转为 HookEvent 列表；无 engine 时返回空。
+    def _drain_hook_events(self) -> list[HookEvent]:
+        if not self.hook_engine:
+            return []
+        return [
+            HookEvent(
+                hook_id=n.hook_id,
+                event=n.event,
+                output=n.output,
+                success=n.success,
+            )
+            for n in self.hook_engine.drain_notifications()
+        ]
 
     # 为 HITL 确认生成人类可读的工具操作描述。
     def _build_permission_description(self, tc: ToolCallComplete) -> str:
@@ -464,6 +507,14 @@ class Agent:
                 errors=connect_result.errors,
             )
 
+        # batch11: session_start hook — run 开始时触发一次（env/memory/MCP 注入后）。
+        if self.hook_engine:
+            await self.hook_engine.run_hooks(
+                "session_start", self._build_hook_context("session_start")
+            )
+            for he in self._drain_hook_events():
+                yield he
+
         iteration = 0
         consecutive_unknown = 0
         max_tokens_escalated = False
@@ -472,12 +523,32 @@ class Agent:
         while True:
             iteration += 1
 
+            # batch11: turn_start hook — 每轮迭代开头触发。
+            if self.hook_engine:
+                await self.hook_engine.run_hooks(
+                    "turn_start", self._build_hook_context("turn_start")
+                )
+                for he in self._drain_hook_events():
+                    yield he
+
             # 停止条件 1：迭代上限。
             if self.max_iterations > 0 and iteration > self.max_iterations:
                 yield ErrorEvent(
                     message=f"Agent reached maximum iterations ({self.max_iterations})"
                 )
                 break
+
+            # batch11: pre_send hook — LLM 调用前触发；
+            # 取出 prompt 注入消息传给 build_system_prompt。
+            if self.hook_engine:
+                await self.hook_engine.run_hooks(
+                    "pre_send", self._build_hook_context("pre_send")
+                )
+                for he in self._drain_hook_events():
+                    yield he
+            hook_prompts = (
+                self.hook_engine.get_prompt_messages() if self.hook_engine else None
+            )
 
             # 每轮动态拼装系统提示词，包含 Environment 段落与条件段落。
             # mcp_manager 装配时插入 ToolSearch 段落，引导模型先发现再调用 MCP 工具。
@@ -486,6 +557,7 @@ class Agent:
                 work_dir=self.work_dir,
                 mcp_enabled=self.mcp_manager is not None,
                 skill_section=self.skill_catalog,
+                hook_prompts=hook_prompts,
             )
 
             # 延迟工具名 reminder：每轮注入未发现的延迟工具名，引导模型用 ToolSearch 发现。
@@ -547,6 +619,8 @@ class Agent:
             collector = StreamCollector()
             executor = StreamingExecutor()
             deferred_tool_calls: list[ToolCallComplete] = []
+            # batch11: pre_tool_use 拒绝的工具结果累积到此，随后并入 tool_results 回灌对话。
+            rejected_results: list[ToolResultBlock] = []
 
             messages = conversation.get_messages()
             llm_stream = self.client.stream(messages, system=system, tools=tools)
@@ -555,6 +629,36 @@ class Agent:
             async for event in collector.consume(llm_stream):
                 if isinstance(event, ToolUseEvent):
                     tc = collector.response.tool_calls[-1]
+                    # batch11: pre_tool_use hook — 工具执行前拦截；reject 则跳过执行，
+                    # 把拒绝原因作为 is_error=True 的 ToolResult 回灌，模型据此调整策略。
+                    if self.hook_engine:
+                        hook_ctx = self._build_hook_context(
+                            "pre_tool_use",
+                            tool_name=tc.tool_name,
+                            tool_args=tc.arguments,
+                            file_path=self._infer_file_path(tc.arguments),
+                        )
+                        rejection = await self.hook_engine.run_pre_tool_hooks(hook_ctx)
+                        for he in self._drain_hook_events():
+                            yield he
+                        if rejection is not None:
+                            rejection_msg = f"Hook rejected: {rejection.reason}"
+                            rejected_results.append(
+                                ToolResultBlock(
+                                    tool_use_id=tc.tool_id,
+                                    content=rejection_msg,
+                                    is_error=True,
+                                )
+                            )
+                            yield event
+                            yield ToolResultEvent(
+                                tool_id=tc.tool_id,
+                                tool_name=tc.tool_name,
+                                output=rejection_msg,
+                                is_error=True,
+                                elapsed=0.0,
+                            )
+                            continue
                     # ask 决策的工具延迟到流后顺序执行（需要 HITL 同步）；
                     # allow/deny 立即提交，deny 在 _execute_single_tool_direct 内处理。
                     tool = self.registry.get(tc.tool_name)
@@ -576,6 +680,17 @@ class Agent:
                 input_tokens=self.total_input_tokens,
                 output_tokens=self.total_output_tokens,
             )
+
+            # batch11: post_receive hook — LLM 响应后触发，携带响应文本。
+            if self.hook_engine:
+                await self.hook_engine.run_hooks(
+                    "post_receive",
+                    self._build_hook_context(
+                        "post_receive", message=response.text
+                    ),
+                )
+                for he in self._drain_hook_events():
+                    yield he
 
             conv_thinking = [
                 ThinkingBlock(thinking=tb.thinking, signature=tb.signature)
@@ -659,7 +774,11 @@ class Agent:
 
             # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）。
             tool_results: list[ToolResultBlock] = []
+            # batch11: 并入 pre_tool_use 拒绝的工具结果，让模型看到拒绝原因并调整策略。
+            tool_results.extend(rejected_results)
             streaming_results = await executor.collect_results()
+            # batch11: post_tool_use 需要原始 tool_call 的 arguments，按 tool_id 建索引。
+            tool_call_by_id = {tc.tool_id: tc for tc in response.tool_calls}
 
             for br in streaming_results:
                 if br.is_unknown:
@@ -682,6 +801,20 @@ class Agent:
                     is_error=br.result.is_error,
                     elapsed=br.elapsed,
                 )
+                # batch11: post_tool_use hook — 工具执行后触发，携带工具名与参数。
+                if self.hook_engine and br.tool_id in tool_call_by_id:
+                    orig_tc = tool_call_by_id[br.tool_id]
+                    await self.hook_engine.run_hooks(
+                        "post_tool_use",
+                        self._build_hook_context(
+                            "post_tool_use",
+                            tool_name=orig_tc.tool_name,
+                            tool_args=orig_tc.arguments,
+                            file_path=self._infer_file_path(orig_tc.arguments),
+                        ),
+                    )
+                    for he in self._drain_hook_events():
+                        yield he
 
             # 延迟工具（需要交互式权限确认）：顺序执行，yield PermissionRequest 等待 HITL 回复。
             # ask 工具需要 HITL 同步，不能并发；并发路径在第 06 步 MCP 后启用。
@@ -721,6 +854,19 @@ class Agent:
                     is_error=result.is_error,
                     elapsed=elapsed,
                 )
+                # batch11: post_tool_use hook — 延迟工具执行后同样触发。
+                if self.hook_engine:
+                    await self.hook_engine.run_hooks(
+                        "post_tool_use",
+                        self._build_hook_context(
+                            "post_tool_use",
+                            tool_name=tc.tool_name,
+                            tool_args=tc.arguments,
+                            file_path=self._infer_file_path(tc.arguments),
+                        ),
+                    )
+                    for he in self._drain_hook_events():
+                        yield he
 
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
@@ -731,6 +877,22 @@ class Agent:
 
             conversation.add_tool_results_message(tool_results)
             yield TurnComplete(turn=iteration)
+
+            # batch11: turn_end hook — 每轮迭代结束触发（仅未命中停止条件的轮次）。
+            if self.hook_engine:
+                await self.hook_engine.run_hooks(
+                    "turn_end", self._build_hook_context("turn_end")
+                )
+                for he in self._drain_hook_events():
+                    yield he
+
+        # batch11: session_end hook — run 结束时触发一次（while 循环退出后）。
+        if self.hook_engine:
+            await self.hook_engine.run_hooks(
+                "session_end", self._build_hook_context("session_end")
+            )
+            for he in self._drain_hook_events():
+                yield he
 
     # 直接执行单个工具调用，返回结构化结果与耗时；未知/禁用工具返回错误结果。
     # 权限 deny 决策在此处直接转为错误结果；ask 决策由 _execute_tool_with_permission 处理。
