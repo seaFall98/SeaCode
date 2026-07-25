@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import tempfile
 import time
 from collections.abc import Callable
@@ -43,6 +44,15 @@ from .client import (
     RateLimitError,
     create_client,
 )
+from .commands import (
+    CommandContext,
+    CommandRegistry,
+    CompletionPopup,
+    Selected,
+    complete,
+    parse_command,
+)
+from .commands.handlers import register_all_commands
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig
 from .conversation import ConversationManager, Message
 from .mcp import MCPManager
@@ -117,6 +127,71 @@ _MODE_COLORS: dict[PermissionMode, str] = {
     PermissionMode.PLAN: "#d9a441",
     PermissionMode.BYPASS: "#ff9c9c",
 }
+
+# batch09：@ 文件引用展开相关常量与函数。
+# 单个 @path 文件内容块的最大字节，超过则截断，避免大文件撑爆上下文。
+MAX_AT_REF_BYTES: int = 100_000
+
+# @ 文件引用正则：匹配 @ 后跟非空白字符序列。
+_AT_REF_RE = re.compile(r"@(\S+)")
+
+# scan_files_for_at 跳过的目录名，避免扫描运行时产物与依赖目录。
+_AT_SKIP_DIRS: frozenset[str] = frozenset({
+    ".seacode", ".git", "__pycache__", ".venv", "node_modules",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
+})
+
+
+# 把文本中的 @path 引用替换为文件内容块，便于 LLM 直接读取文件内容。
+# 文件不存在、读取异常或路径逃逸时保留原文，不崩溃。
+def expand_at_refs(text: str, work_dir: Path) -> str:
+    if "@" not in text:
+        return text
+
+    def _replace(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        # 解析路径并限制在工作目录可达范围，避免 ../../etc/passwd 逃逸。
+        target = (work_dir / raw).resolve()
+        try:
+            target.relative_to(work_dir.resolve())
+        except (ValueError, OSError):
+            return match.group(0)
+        if not target.is_file():
+            return match.group(0)
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return match.group(0)
+        if len(content.encode("utf-8")) > MAX_AT_REF_BYTES:
+            content = content.encode("utf-8")[:MAX_AT_REF_BYTES].decode(
+                "utf-8", errors="replace"
+            )
+        return f"[File: {raw}]\n```\n{content}\n```"
+
+    return _AT_REF_RE.sub(_replace, text)
+
+
+# 扫描工作目录下文件名前缀匹配的候选，供 @ 文件引用补全使用。
+# 跳过运行时产物与依赖目录；返回相对工作目录的路径，最多 limit 条。
+def scan_files_for_at(prefix: str, work_dir: Path, limit: int = 8) -> list[str]:
+    result: list[str] = []
+    prefix_lower = prefix.lower()
+    for path in work_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        # 跳过 .seacode / .git / __pycache__ / .venv / node_modules 等目录下的文件。
+        if any(part in _AT_SKIP_DIRS for part in path.parts):
+            continue
+        name = path.name
+        if name.lower().startswith(prefix_lower):
+            try:
+                rel = path.relative_to(work_dir)
+            except ValueError:
+                continue
+            result.append(str(rel).replace("\\", "/"))
+            if len(result) >= limit:
+                break
+    return result
 
 
 # 把现在进行时动词转换为过去式，用于 thinking-done 行。
@@ -294,33 +369,178 @@ class ToolGroupSummary(Static, can_focus=True):
 
 
 class ChatInput(TextArea):
-    """提供 Enter 发送与 Shift+Enter 换行的对话输入框。"""
+    """提供 Enter 发送、Shift+Enter 换行、Tab 补全、方向键历史导航的对话输入框。"""
 
     BINDINGS = [
         Binding("enter", "submit", "Send", priority=True),
         Binding("shift+enter", "newline", "New line", priority=True),
+        Binding("tab", "complete", "Complete", priority=True),
+        Binding("escape", "dismiss_popup", "Close popup", priority=True),
+        Binding("up", "nav_up", "Prev", priority=True),
+        Binding("down", "nav_down", "Next", priority=True),
     ]
 
+    # 携带已确认发送的非空用户文本。
     class Submitted(TextualMessage):
-        """携带已确认发送的非空用户文本。"""
-
         # 保存本次提交的纯文本内容。
         def __init__(self, text: str) -> None:
             super().__init__()
             self.text = text
 
-    # 发送非空输入，避免主要操作依赖鼠标按钮。
+    # 请求 Tab 补全：父组件查注册中心，单匹配填入、多匹配弹窗。
+    class TabComplete(TextualMessage):
+        def __init__(self, prefix: str) -> None:
+            super().__init__()
+            self.prefix = prefix
+
+    # 实时刷新斜杠命令补全弹窗；prefix 为 None 时关闭弹窗。
+    class SlashMenuUpdate(TextualMessage):
+        def __init__(self, prefix: str | None) -> None:
+            super().__init__()
+            self.prefix = prefix
+
+    # 请求 @ 文件引用补全：父组件扫描工作目录返回候选。
+    class AtFileRequest(TextualMessage):
+        def __init__(self, prefix: str) -> None:
+            super().__init__()
+            self.prefix = prefix
+
+    # 初始化命令历史导航状态；history_file 在 SeaCodeApp.on_mount 后通过 load_history 注入。
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._history: list[str] = []
+        self._history_index: int = -1
+        self._history_draft: str = ""
+        self._history_file: Path | None = None
+
+    # 从 <work_dir>/.seacode/history 加载非空历史行；文件不存在不抛异常。
+    def load_history(self, work_dir: Path) -> None:
+        self._history_file = work_dir / ".seacode" / "history"
+        self._history = []
+        if not self._history_file.exists():
+            return
+        try:
+            for line in self._history_file.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    self._history.append(line)
+        except OSError:
+            self._history = []
+
+    # 追加一行到历史文件；空文本不写入；异常静默避免污染主流程。
+    def _persist_entry(self, text: str) -> None:
+        if not text.strip() or self._history_file is None:
+            return
+        try:
+            self._history_file.parent.mkdir(parents=True, exist_ok=True)
+            with self._history_file.open("a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError:
+            pass
+
+    # 弹窗可见时选择当前项作为提交文本发出；不可见时走 Batch 01 既定提交逻辑。
+    # 提交非空文本后持久化到历史文件。
     def action_submit(self) -> None:
         if self.disabled:
             return
+        app = self.app
+        popup = _get_completion_popup(app)
+        if popup is not None and popup.is_visible:
+            selected = popup.get_selected()
+            if selected is not None:
+                popup.hide()
+                self._persist_entry(selected)
+                self.post_message(self.Submitted(selected))
+                self.clear()
+            return
         text = self.text.strip()
         if text:
+            self._persist_entry(text)
             self.post_message(self.Submitted(text))
             self.clear()
+            self._history_index = -1
+            self._history_draft = ""
 
     # 在多行提示中保留显式换行行为。
     def action_newline(self) -> None:
         self.insert("\n")
+
+    # Tab 补全：弹窗可见时选择当前项填入；否则 / 开头发 TabComplete，其它插入制表符。
+    def action_complete(self) -> None:
+        app = self.app
+        popup = _get_completion_popup(app)
+        if popup is not None and popup.is_visible:
+            selected = popup.get_selected()
+            if selected is not None:
+                self.text = selected
+                self.cursor_location = (0, len(selected))
+                popup.hide()
+            return
+        if self.text.startswith("/"):
+            self.post_message(self.TabComplete(self.text))
+        else:
+            self.insert("\t")
+
+    # ESC 关闭补全弹窗；弹窗不可见时不响应（避免与 SeaCodeApp 的取消回合冲突）。
+    def action_dismiss_popup(self) -> None:
+        popup = _get_completion_popup(self.app)
+        if popup is not None and popup.is_visible:
+            popup.hide()
+
+    # 上键：弹窗可见时移动光标，否则遍历命令历史。
+    def action_nav_up(self) -> None:
+        popup = _get_completion_popup(self.app)
+        if popup is not None and popup.is_visible:
+            popup.move_up()
+            return
+        if not self._history:
+            return
+        if self._history_index == -1:
+            self._history_draft = self.text
+            self._history_index = len(self._history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        else:
+            return
+        self.text = self._history[self._history_index]
+        self.cursor_location = (0, len(self.text))
+
+    # 下键：弹窗可见时移动光标，否则遍历命令历史，到末尾恢复草稿。
+    def action_nav_down(self) -> None:
+        popup = _get_completion_popup(self.app)
+        if popup is not None and popup.is_visible:
+            popup.move_down()
+            return
+        if not self._history or self._history_index == -1:
+            return
+        if self._history_index < len(self._history) - 1:
+            self._history_index += 1
+            self.text = self._history[self._history_index]
+        else:
+            self._history_index = -1
+            self.text = self._history_draft
+        self.cursor_location = (0, len(self.text))
+
+    # 文本变化时检测 / 与 @ 前缀，发出 SlashMenuUpdate 或 AtFileRequest 让父组件刷新弹窗。
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        del event
+        text = self.text
+        if text.startswith("/") and " " not in text and "\n" not in text:
+            self.post_message(self.SlashMenuUpdate(text))
+        else:
+            self.post_message(self.SlashMenuUpdate(None))
+        # @ 文件引用：取最后一个 @ 后的前缀。
+        at_idx = text.rfind("@")
+        if at_idx != -1:
+            tail = text[at_idx + 1:]
+            if tail and " " not in tail and "\n" not in tail:
+                self.post_message(self.AtFileRequest(tail))
+
+
+# 安全获取 SeaCodeApp 的 CompletionPopup；非 SeaCodeApp 环境返回 None。
+def _get_completion_popup(app: Any) -> CompletionPopup | None:
+    if not isinstance(app, SeaCodeApp):
+        return None
+    return app._completion_popup
 
 
 class SeaCodeApp(App[None]):
@@ -382,6 +602,13 @@ class SeaCodeApp(App[None]):
         self._session: Session | None = None
         self._memory_manager: MemoryManager | None = None
         self._instructions_content: str = ""
+        # batch09：本地命令框架。registry 集中注册 11 条内置命令；
+        # CompletionPopup 在 compose 中挂载到 input-area，由 ChatInput 触发显示/隐藏。
+        # _agent 保存当前回合 Agent 引用，供命令路径访问（首次回合前为 None）。
+        self._command_registry = CommandRegistry()
+        register_all_commands(self._command_registry)
+        self._completion_popup = CompletionPopup()
+        self._agent: Agent | None = None
 
     # 生成三行品牌标题，保留终端对话的既定信息层级。
     @staticmethod
@@ -410,6 +637,7 @@ class SeaCodeApp(App[None]):
         yield VerticalScroll(id="chat-area")
         with Vertical(id="input-area"):
             yield ChatInput(id="chat-input")
+            yield self._completion_popup
             with Horizontal(id="status-bar"):
                 yield Static("Preparing configuration", id="turn-status")
                 yield Static("", id="model-label")
@@ -419,6 +647,11 @@ class SeaCodeApp(App[None]):
     # 根据 Provider 数量进入选择状态或直接准备单一配置。
     def on_mount(self) -> None:
         self.query_one(ChatInput).disabled = True
+        # 加载命令历史；无文件不抛异常。
+        try:
+            self.query_one(ChatInput).load_history(Path(os.getcwd()))
+        except Exception:
+            pass
         if len(self._providers) == 1:
             self._select_provider(self._providers[0])
         else:
@@ -528,12 +761,166 @@ class SeaCodeApp(App[None]):
         self._set_status("Configuration error")
         self.call_after_refresh(self._append_error, self._error_message(error))
 
-    # 接收输入消息并把单个活动回合交给异步任务执行，支持 ESC 取消。
+    # 接收输入消息：先展开 @ 文件引用，再判断 / 开头走命令分发，否则进入 Agent Loop。
+    # 命令路径不进入 Agent Loop，避免本地操作消耗 token；流式期间命令仍可执行（如 /clear）。
     def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
+        if self._client is None:
+            return
+        text = event.text
+        if "@" in text:
+            text = expand_at_refs(text, Path(os.getcwd()))
+        if text.startswith("/"):
+            asyncio.create_task(self._dispatch_command(text))
+            return
+        if self._streaming:
+            return
+        self._streaming = True
+        self._agent_task = asyncio.create_task(self._run_turn(text))
+
+    # 分发斜杠命令：解析 → 空命令名列出全部 → 查找 → 未找到提示 → 缺参数提示 →
+    # 执行 handler → 异常显示错误。返回是否走命令路径（始终 True，因为只在 / 开头时调用）。
+    async def _dispatch_command(self, text: str) -> bool:
+        name, args, is_command = parse_command(text)
+        if not is_command:
+            return False
+        if not name:
+            cmds = self._command_registry.list_commands()
+            lines = ["可用命令："]
+            for c in cmds:
+                lines.append(f"  /{c.name:<12} - {c.description}")
+            await self._show_system_message("\n".join(lines))
+            return True
+        cmd = self._command_registry.find(name)
+        if cmd is None:
+            await self._show_system_message(
+                f"未知命令：{name}，输入 /help 查看可用命令"
+            )
+            return True
+        if cmd.arg_prompt and not args.strip():
+            await self._show_system_message(
+                f"参数不足：{cmd.arg_prompt}\n用法：{cmd.usage}"
+            )
+            return True
+        ctx = self._build_command_context(args)
+        try:
+            await cmd.handler(ctx)
+        except Exception as exc:
+            await self._show_system_message(f"命令执行失败：{exc}")
+        return True
+
+    # 构造命令执行上下文：注入业务对象与 UI 状态回调。
+    def _build_command_context(self, args: str) -> CommandContext:
+        return CommandContext(
+            args=args,
+            agent=self._agent,
+            conversation=self._conversation,
+            session=self._session,
+            session_manager=self._session_manager,
+            memory_manager=self._memory_manager,
+            ui=self,  # SeaCodeApp 实现 UIController Protocol
+            config={
+                "registry": self._command_registry,
+                "set_session": self._set_session,
+                "set_conversation": self._set_conversation,
+                "clear_chat": self._clear_chat,
+                "render_restored": lambda msgs: asyncio.create_task(
+                    self._render_restored_messages(msgs)
+                ),
+            },
+        )
+
+    # UIController: 在对话区追加系统消息（同步入口，内部异步调度）。
+    def add_system_message(self, text: str) -> None:
+        self.call_after_refresh(self._show_system_message, text)
+
+    # UIController: 把构造好的提示词当作用户消息发给 LLM，触发 Agent Loop。
+    def send_user_message(self, text: str) -> None:
         if self._streaming or self._client is None:
             return
         self._streaming = True
-        self._agent_task = asyncio.create_task(self._run_turn(event.text))
+        self._agent_task = asyncio.create_task(self._run_turn(text))
+
+    # UIController: 切换 Plan 模式；同步 permission_checker.mode 保持一致。
+    def set_plan_mode(self, enabled: bool) -> None:
+        new_mode = PermissionMode.PLAN if enabled else PermissionMode.DEFAULT
+        self._permission_mode = new_mode
+        if self._permission_checker is not None:
+            self._permission_checker.mode = new_mode
+        self._update_mode_label()
+
+    # UIController: 返回当前 token 用量与上限，供 /status 与 /compact 使用。
+    def get_token_count(self) -> tuple[int, int]:
+        used = getattr(self._conversation, "estimated_tokens", 0)
+        limit = 0
+        if self._selected_provider is not None:
+            limit = self._selected_provider.get_context_window()
+        return (used, limit)
+
+    # UIController: 刷新状态栏。
+    def refresh_status(self) -> None:
+        self._update_mode_label()
+        self._refresh_mcp_status()
+
+    # 会话状态回调：供 /clear 与 /session new/resume 切换当前会话句柄。
+    def _set_session(self, session: Session) -> None:
+        self._session = session
+
+    # 会话状态回调：供 /session resume 替换当前对话历史。
+    def _set_conversation(self, conversation: ConversationManager) -> None:
+        self._conversation = conversation
+
+    # 会话状态回调：清空对话区与对话历史，供 /clear 与 /session new 使用。
+    def _clear_chat(self) -> None:
+        self._conversation = ConversationManager()
+        try:
+            chat = self.query_one("#chat-area", VerticalScroll)
+            for child in list(chat.children):
+                child.remove()
+        except Exception:
+            pass
+
+    # ChatInput.TabComplete 消息处理：单匹配填入输入框，多匹配弹窗，无匹配不响应。
+    def on_chat_input_tab_complete(self, event: ChatInput.TabComplete) -> None:
+        pairs = complete(self._command_registry, event.prefix)
+        if not pairs:
+            return
+        if len(pairs) == 1:
+            value = pairs[0][1]
+            input_widget = self.query_one(ChatInput)
+            input_widget.text = value
+            input_widget.cursor_location = (0, len(value))
+            self._completion_popup.hide()
+            return
+        self._completion_popup.show_pairs(pairs)
+
+    # ChatInput.SlashMenuUpdate 消息处理：prefix 为 None 或无匹配时关闭弹窗，否则刷新。
+    def on_chat_input_slash_menu_update(self, event: ChatInput.SlashMenuUpdate) -> None:
+        if event.prefix is None:
+            self._completion_popup.hide()
+            return
+        pairs = complete(self._command_registry, event.prefix)
+        if not pairs:
+            self._completion_popup.hide()
+            return
+        self._completion_popup.show_pairs(pairs)
+
+    # ChatInput.AtFileRequest 消息处理：扫描工作目录，有候选显示弹窗，无候选关闭。
+    def on_chat_input_at_file_request(self, event: ChatInput.AtFileRequest) -> None:
+        candidates = scan_files_for_at(event.prefix, Path(os.getcwd()))
+        if not candidates:
+            self._completion_popup.hide()
+            return
+        # @ 文件引用补全的 value 带 @ 前缀，便于直接填入输入框。
+        pairs = [(f"@{c}", f"@{c} ") for c in candidates]
+        self._completion_popup.show_pairs(pairs)
+
+    # CompletionPopup.Selected 消息处理：把选中值填入输入框并关闭弹窗。
+    def on_completion_popup_selected(self, event: Selected) -> None:
+        input_widget = self.query_one(ChatInput)
+        input_widget.text = event.value
+        input_widget.cursor_location = (0, len(event.value))
+        self._completion_popup.hide()
+        input_widget.focus()
 
     # ESC 取消正在进行的回合；权限对话框活动时由对话框处理（拒绝），不取消整个回合。
     def action_cancel(self) -> None:
@@ -634,6 +1021,8 @@ class SeaCodeApp(App[None]):
                 instructions_content=self._instructions_content,
                 memory_manager=self._memory_manager,
             )
+            # 保存当前回合 Agent 引用，供命令路径（/status /compact /plan 等）访问。
+            self._agent = agent
             # 同步当前会话 ID 给 Agent，仅用于压缩摘要里的 transcript_path 提示。
             if self._session is not None:
                 agent.session_id = self._session.session_id

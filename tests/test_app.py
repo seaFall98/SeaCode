@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -10,7 +11,14 @@ from pydantic import BaseModel
 from textual.containers import Horizontal
 from textual.widgets import Button, OptionList, Static
 
-from seacode.app import ChatInput, SeaCodeApp, ToolGroupSummary
+from seacode.app import (
+    MAX_AT_REF_BYTES,
+    ChatInput,
+    SeaCodeApp,
+    ToolGroupSummary,
+    expand_at_refs,
+    scan_files_for_at,
+)
 from seacode.client import (
     LLMClient,
     NetworkError,
@@ -21,6 +29,7 @@ from seacode.client import (
     ToolCallComplete,
     ToolCallStart,
 )
+from seacode.commands.registry import Command, CommandContext, CommandType
 from seacode.config import ProviderConfig
 from seacode.conversation import Message
 from seacode.permission_dialog import InlinePermissionWidget
@@ -684,3 +693,349 @@ async def test_bypass_mode_skips_permission_dialog() -> None:
         assert app._pending_permission is None
         assert not _has_permission_dialog(app)
         assert not app.query(".tool-block-error")
+
+
+# ---------------------------------------------------------------------------
+# batch09：命令框架集成测试
+# （expand_at_refs / scan_files_for_at 纯函数 + _dispatch_command 分支 +
+#  Pilot 端到端 /help /clear /status /review /unknown + ChatInput 历史持久化与重载）
+# ---------------------------------------------------------------------------
+
+
+# 异常 handler，用于验证 _dispatch_command 捕获 handler 异常的分支。
+async def _raise_handler(ctx: CommandContext) -> None:
+    raise RuntimeError("boom for test")
+
+
+# 轮询等待包含 needle 的系统消息出现在聊天区，超时返回 False。
+async def _wait_for_system_message(
+    app: SeaCodeApp, pilot: Any, needle: str, max_pauses: int = 40
+) -> bool:
+    for _ in range(max_pauses):
+        await pilot.pause(0.05)
+        msgs = app.query(".system-message")
+        if any(needle in str(m.render()) for m in msgs):
+            return True
+    return False
+
+
+# === expand_at_refs 纯函数测试 ===
+
+# 验证 expand_at_refs 把 @path 替换为文件内容块。
+# 测试设计为在临时目录创建 a.txt 含 hello，断言展开结果含 [File: a.txt] 与 hello。
+def test_expand_at_refs_replaces_with_file_content(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    result = expand_at_refs("@a.txt", tmp_path)
+    assert "[File: a.txt]" in result
+    assert "hello" in result
+
+
+# 验证 expand_at_refs 对不存在的文件保留原文，不抛异常。
+# 测试设计为引用不存在文件，断言原文保留且不含 [File: 标记。
+def test_expand_at_refs_preserves_nonexistent_file(tmp_path: Path) -> None:
+    result = expand_at_refs("@nonexistent.txt", tmp_path)
+    assert "@nonexistent.txt" in result
+    assert "[File:" not in result
+
+
+# 验证 expand_at_refs 对超过 MAX_AT_REF_BYTES 的文件截断到上限。
+# 测试设计为创建大文件，断言展开内容恰为 MAX_AT_REF_BYTES 字节，不含完整原文。
+def test_expand_at_refs_truncates_large_file(tmp_path: Path) -> None:
+    big_content = "A" * (MAX_AT_REF_BYTES + 5000)
+    (tmp_path / "big.txt").write_text(big_content, encoding="utf-8")
+    result = expand_at_refs("@big.txt", tmp_path)
+    assert "[File: big.txt]" in result
+    assert ("A" * MAX_AT_REF_BYTES) in result
+    assert ("A" * (MAX_AT_REF_BYTES + 1)) not in result
+
+
+# 验证 expand_at_refs 一次展开多个 @ 引用。
+# 测试设计为创建两个文件并引用，断言两个文件内容都出现在结果中。
+def test_expand_at_refs_expands_multiple_refs(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("content_a", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("content_b", encoding="utf-8")
+    result = expand_at_refs("@a.txt @b.txt", tmp_path)
+    assert "[File: a.txt]" in result
+    assert "content_a" in result
+    assert "[File: b.txt]" in result
+    assert "content_b" in result
+
+
+# 验证 expand_at_refs 拒绝展开工作目录外的路径，保留原文。
+# 测试设计为把工作目录设为 tmp_path 子目录，引用父目录文件，断言原文保留。
+def test_expand_at_refs_blocks_path_traversal(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (tmp_path / "outside_secret.txt").write_text("SECRET_CONTENT", encoding="utf-8")
+    result = expand_at_refs("@../outside_secret.txt", work_dir)
+    assert "@../outside_secret.txt" in result
+    assert "SECRET_CONTENT" not in result
+
+
+# 验证 expand_at_refs 对无 @ 的文本原样返回。
+# 测试设计为传入普通文本，断言返回值与原文完全相等。
+def test_expand_at_refs_no_at_returns_original(tmp_path: Path) -> None:
+    assert expand_at_refs("hello world", tmp_path) == "hello world"
+
+
+# === scan_files_for_at 纯函数测试 ===
+
+# 验证 scan_files_for_at 按文件名前缀返回匹配候选。
+# 测试设计为创建 app.py / apple.py / banana.py，断言前缀 app 命中前两者、不含 banana。
+def test_scan_files_for_at_prefix_match(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("", encoding="utf-8")
+    (tmp_path / "apple.py").write_text("", encoding="utf-8")
+    (tmp_path / "banana.py").write_text("", encoding="utf-8")
+    result = scan_files_for_at("app", tmp_path)
+    assert "app.py" in result
+    assert "apple.py" in result
+    assert "banana.py" not in result
+
+
+# 验证 scan_files_for_at 跳过运行时产物与依赖目录下的文件。
+# 测试设计为在跳过目录中放置匹配文件，断言结果只含根目录匹配文件。
+def test_scan_files_for_at_skips_ignored_dirs(tmp_path: Path) -> None:
+    (tmp_path / "match_root.txt").write_text("", encoding="utf-8")
+    for skip_dir in (".seacode", ".git", "__pycache__", ".venv", "node_modules"):
+        d = tmp_path / skip_dir
+        d.mkdir()
+        (d / "match_skip.txt").write_text("", encoding="utf-8")
+    result = scan_files_for_at("match", tmp_path)
+    assert "match_root.txt" in result
+    assert not any("match_skip" in r for r in result)
+
+
+# 验证 scan_files_for_at 的 limit 参数限制返回数量。
+# 测试设计为创建 10 个匹配文件并设 limit=3，断言结果长度恰为 3。
+def test_scan_files_for_at_respects_limit(tmp_path: Path) -> None:
+    for i in range(10):
+        (tmp_path / f"file_{i:02d}.txt").write_text("", encoding="utf-8")
+    result = scan_files_for_at("file", tmp_path, limit=3)
+    assert len(result) == 3
+    assert all(r.startswith("file_") for r in result)
+
+
+# 验证 scan_files_for_at 无匹配时返回空列表。
+# 测试设计为传入不匹配的前缀，断言结果为空列表。
+def test_scan_files_for_at_no_match_returns_empty(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("", encoding="utf-8")
+    assert scan_files_for_at("zzz", tmp_path) == []
+
+
+# === _dispatch_command 分支测试（直接调用，避免弹窗时序干扰） ===
+
+# 验证 _dispatch_command 对仅斜杠输入列出全部命令。
+# 测试设计为直接调用 _dispatch_command("/")，断言返回 True 且系统消息含命令列表。
+@pytest.mark.asyncio
+async def test_dispatch_slash_only_lists_all_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        result = await app._dispatch_command("/")
+        assert result is True
+        ok = await _wait_for_system_message(app, pilot, "可用命令")
+        assert ok
+        text = "\n".join(str(m.render()) for m in app.query(".system-message"))
+        assert "/help" in text
+        assert "/clear" in text
+
+
+# 验证 _dispatch_command 对非斜杠输入返回 False 不走命令路径。
+# 测试设计为直接调用 _dispatch_command("hello")，断言返回 False。
+@pytest.mark.asyncio
+async def test_dispatch_non_command_returns_false() -> None:
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    result = await app._dispatch_command("hello world")
+    assert result is False
+
+
+# 验证 _dispatch_command 捕获 handler 异常并显示失败提示。
+# 测试设计为注册一个抛异常的命令，直接调用 _dispatch_command 并断言错误提示出现。
+@pytest.mark.asyncio
+async def test_dispatch_command_handler_exception_shows_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    boom_cmd = Command(
+        name="boom",
+        description="raise for test",
+        type=CommandType.LOCAL,
+        handler=_raise_handler,
+    )
+    app._command_registry.register_sync(boom_cmd)
+    async with app.run_test() as pilot:
+        result = await app._dispatch_command("/boom")
+        assert result is True
+        ok = await _wait_for_system_message(app, pilot, "命令执行失败")
+        assert ok
+        text = "\n".join(str(m.render()) for m in app.query(".system-message"))
+        assert "命令执行失败" in text
+
+
+# === TUI 集成测试（Pilot 驱动输入 + 断言聊天区） ===
+
+# 验证通过 Pilot 输入 /help 回车后聊天区显示命令列表。
+# 测试设计为 load_text("/help") 后回车，断言系统消息含 "可用命令" 与若干命令名。
+@pytest.mark.asyncio
+async def test_pilot_help_command_lists_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("/help")
+        await pilot.press("enter")
+        ok = await _wait_for_system_message(app, pilot, "可用命令")
+        assert ok
+        text = "\n".join(str(m.render()) for m in app.query(".system-message"))
+        assert "/help" in text
+        assert "/clear" in text
+
+
+# 验证通过 Pilot 输入 /clear 回车后聊天区被清空并创建新会话。
+# 测试设计为先 /status 制造消息，再 /clear，断言只剩 "已清空" 且会话已切换。
+@pytest.mark.asyncio
+async def test_pilot_clear_command_clears_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        # 先发 /status 制造一条系统消息。
+        input_widget.load_text("/status")
+        await pilot.press("enter")
+        await _wait_for_system_message(app, pilot, "SeaCode 当前状态")
+        session_before = app._session
+
+        # 提交 /clear 清空聊天并创建新会话。
+        input_widget.load_text("/clear")
+        await pilot.press("enter")
+        ok = await _wait_for_system_message(app, pilot, "已清空")
+        assert ok
+        await pilot.pause()
+
+        # 旧消息已移除，仅剩 "已清空"。
+        text = "\n".join(str(m.render()) for m in app.query(".system-message"))
+        assert "已清空" in text
+        assert "SeaCode 当前状态" not in text
+        # 新会话已创建。
+        assert app._session is not None
+        assert app._session is not session_before
+
+
+# 验证通过 Pilot 输入 /status 回车后聊天区显示状态信息。
+# 测试设计为 load_text("/status") 后回车，断言系统消息含状态标题与字段。
+@pytest.mark.asyncio
+async def test_pilot_status_command_shows_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("/status")
+        await pilot.press("enter")
+        ok = await _wait_for_system_message(app, pilot, "SeaCode 当前状态")
+        assert ok
+        text = "\n".join(str(m.render()) for m in app.query(".system-message"))
+        assert "模型：" in text
+        assert "会话 ID：" in text
+
+
+# 验证通过 Pilot 输入 /review 回车后构造审查提示词并发给 LLM。
+# 测试设计为 load_text("/review 关注并发安全") 后回车，断言 fake client 收到含提示词的请求。
+@pytest.mark.asyncio
+async def test_pilot_review_command_triggers_llm_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient(
+        [[TextDelta("审查完成"), StreamComplete(input_tokens=1, output_tokens=1)]]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("/review 关注并发安全")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+        # /review 通过 send_user_message 把审查提示词发给 LLM。
+        requests = _strip_env_from_requests(client.requests)
+        assert any(
+            any(m.content.startswith("请对当前工作目录的代码变更进行审查") for m in req)
+            for req in requests
+        )
+        assert any(
+            any("关注并发安全" in m.content for m in req) for req in requests
+        )
+
+
+# 验证通过 Pilot 输入未知命令后聊天区显示未知命令提示。
+# 测试设计为 load_text("/unknown") 后回车，断言系统消息含 "未知命令：unknown"。
+@pytest.mark.asyncio
+async def test_pilot_unknown_command_shows_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("/unknown")
+        await pilot.press("enter")
+        ok = await _wait_for_system_message(app, pilot, "未知命令")
+        assert ok
+        text = "\n".join(str(m.render()) for m in app.query(".system-message"))
+        assert "未知命令：unknown" in text
+
+
+# === ChatInput 历史持久化与重载 ===
+
+# 验证提交命令后历史写入 .seacode/history 文件。
+# 测试设计为在临时工作目录提交 /help，断言 history 文件含 /help。
+@pytest.mark.asyncio
+async def test_command_history_persisted_after_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("/help")
+        await pilot.press("enter")
+        await _wait_for_system_message(app, pilot, "可用命令")
+    history_file = tmp_path / ".seacode" / "history"
+    assert history_file.exists()
+    assert "/help" in history_file.read_text(encoding="utf-8")
+
+
+# 验证启动时从 .seacode/history 加载历史并支持上键回填最后一条。
+# 测试设计为预写 history 文件，启动 app 后断言 _history 列表与上键回填文本。
+@pytest.mark.asyncio
+async def test_command_history_loaded_on_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    history_file = tmp_path / ".seacode" / "history"
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    history_file.write_text("cmd1\ncmd2\n", encoding="utf-8")
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_widget = app.query_one(ChatInput)
+        assert input_widget._history == ["cmd1", "cmd2"]
+        # 直接调用 action_nav_up 避免键盘模拟不稳定。
+        input_widget.action_nav_up()
+        assert input_widget.text == "cmd2"
