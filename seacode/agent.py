@@ -388,6 +388,13 @@ class Agent:
             self._consolidator = MemoryConsolidator(work_dir)
         # 当前会话 ID；由 app.py 在创建/恢复会话时设置，仅用于 transcript_path 提示。
         self.session_id: str = ""
+        # batch10：Skill 系统。
+        # active_skills 记录已激活 Skill 的 SOP（用于 /skill 查看与压缩恢复）。
+        # skill_catalog 是 Skill 目录摘要文本（name: description 列表），注入环境上下文。
+        # skill_loader 由 app.py 注入，供 /skill 命令与 LoadSkill 工具访问。
+        self.active_skills: dict[str, str] = {}
+        self.skill_catalog: str = ""
+        self.skill_loader: Any = None
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -399,6 +406,18 @@ class Agent:
     @property
     def plan_mode(self) -> bool:
         return self.permission_mode == PermissionMode.PLAN
+
+    # batch10：激活 Skill，把 SOP 存入 active_skills 供压缩恢复与 /skill 查看。
+    def activate_skill(self, name: str, prompt: str) -> None:
+        self.active_skills[name] = prompt
+
+    # batch10：设置 Skill 目录摘要文本，每轮注入环境上下文。
+    def set_skill_catalog(self, text: str) -> None:
+        self.skill_catalog = text
+
+    # batch10：注入 SkillLoader 引用，供 /skill 命令与 LoadSkill 工具访问。
+    def set_skill_loader(self, loader: Any) -> None:
+        self.skill_loader = loader
 
     # 为 HITL 确认生成人类可读的工具操作描述。
     def _build_permission_description(self, tc: ToolCallComplete) -> str:
@@ -462,9 +481,11 @@ class Agent:
 
             # 每轮动态拼装系统提示词，包含 Environment 段落与条件段落。
             # mcp_manager 装配时插入 ToolSearch 段落，引导模型先发现再调用 MCP 工具。
+            # skill_catalog 非空时注入 # Skills 段落，让模型知道可用 Skill。
             system = build_system_prompt(
                 work_dir=self.work_dir,
                 mcp_enabled=self.mcp_manager is not None,
+                skill_section=self.skill_catalog,
             )
 
             # 延迟工具名 reminder：每轮注入未发现的延迟工具名，引导模型用 ToolSearch 发现。
