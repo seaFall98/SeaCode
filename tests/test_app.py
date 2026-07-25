@@ -36,6 +36,9 @@ class _FakeClient(LLMClient):
         self.requests: list[tuple[Message, ...]] = []
 
     # 记录请求历史并交付预设事件，不连接真实 Provider。
+    # batch08 后 LoopComplete 会异步触发记忆提取与会话摘要生成，
+    # 两者通过同一 client.stream 发起请求；这些后台请求以特定提示词
+    # 开头，返回空流不消耗 outcome，避免抢占主对话的预设结果。
     async def stream(
         self,
         messages: Sequence[Message],
@@ -44,6 +47,11 @@ class _FakeClient(LLMClient):
     ) -> AsyncIterator[StreamEvent]:
         del system, tools
         self.requests.append(tuple(messages))
+        first = messages[0].content if messages else ""
+        if first.startswith("Analyze the conversation below"):
+            return
+        if first.startswith("你是一个对话摘要助手"):
+            return
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -103,21 +111,39 @@ async def _settle(pilot: Any) -> None:
     await pilot.pause(0.05)
 
 
-# 过滤请求中的环境上下文消息，便于断言用户/助手消息序列。
-# agent.run 会通过 inject_environment 在 position 0 插入会话级环境上下文，
-# 该消息 content 以 "Current working directory" 开头，时间戳会变，故过滤后再断言。
+# 过滤请求中的环境上下文与长期记忆注入消息，便于断言用户/助手消息序列。
+# agent.run 会通过 inject_environment 在 position 0 插入会话级环境上下文
+# （content 以 "Current working directory" 开头），并通过 inject_long_term_memory
+# 在 position 1 插入 <system-reminder> 包裹的指令+MEMORY.md+日期（content 以
+# "<system-reminder>" 开头）。两者时间戳会变且与断言无关，故过滤后再断言。
 def _strip_env_context(messages: tuple[Message, ...]) -> tuple[Message, ...]:
     return tuple(
         m for m in messages
         if not m.content.startswith("Current working directory")
+        and not m.content.startswith("<system-reminder>")
     )
 
 
-# 批量过滤多个请求的环境上下文消息。
+# 批量过滤多个请求的环境上下文消息，并排除后台 LLM 请求。
+# batch08 后 LoopComplete 会异步触发记忆提取与会话摘要生成，
+# 两者都通过同一 client.stream 发起，与主对话流无关：
+# - 记忆提取：首条消息以 "Analyze the conversation below" 开头
+# - 会话摘要：首条消息以 "你是一个对话摘要助手" 开头
 def _strip_env_from_requests(
     requests: list[tuple[Message, ...]],
 ) -> list[tuple[Message, ...]]:
-    return [_strip_env_context(r) for r in requests]
+    result: list[tuple[Message, ...]] = []
+    for r in requests:
+        stripped = _strip_env_context(r)
+        if not stripped:
+            continue
+        first = stripped[0].content
+        if first.startswith("Analyze the conversation below"):
+            continue
+        if first.startswith("你是一个对话摘要助手"):
+            continue
+        result.append(stripped)
+    return result
 
 
 # 验证单 Provider 进入既定 TUI 壳层，Enter 提交且没有主要 Send 按钮。

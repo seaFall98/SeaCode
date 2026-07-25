@@ -124,3 +124,19 @@ Screen {
     text-align: right;
     padding: 0 1;
 }
+
+/* batch08：会话恢复内联视图 */
+#resume-inline {
+    width: 100%;
+    height: auto;
+    max-height: 24;
+    margin: 1 0;
+    padding: 1 2;
+    border: solid #303030;
+    background: #1a1f22;
+}
+
+#resume-content {
+    width: 100%;
+    height: auto;
+}

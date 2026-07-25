@@ -84,6 +84,9 @@ class ConversationManager:
         self._messages: list[Message] = []
         self._pending_user: Message | None = None
         self.env_injected: bool = False
+        # 长期记忆（指令 + MEMORY.md 索引 + 当前日期）是否已注入会话头部。
+        # 与 env_injected 平行管理，replace_history 后一并重置以支持压缩后重新注入。
+        self.ltm_injected: bool = False
         # 真实用量锚点：baseline_tokens 是上一轮 API 计费的完整 prompt+output 大小
         # （input + cache_read + cache_creation + output）；anchor_count 是记录该数值时的
         # 消息数量。两者配合让 current_tokens() 在锚点以内信任 API 数据，只对之后追加
@@ -200,12 +203,52 @@ class ConversationManager:
             self._messages.insert(0, Message(role="user", content=context))
             self.env_injected = True
 
+    # 在环境上下文之后插入长期记忆（项目指令 + MEMORY.md 索引 + 当前日期）。
+    # ltm_injected 标记确保只注入一次；插入位置在 env 之后（若已注入），
+    # 否则在 history[0]。整体用 <system-reminder> 包裹并附"may or may not be relevant"提示，
+    # 避免模型对长期记忆过度反应。空 instructions 与 memories 时跳过不注入。
+    def inject_long_term_memory(self, instructions: str, memories: str) -> None:
+        if self.ltm_injected:
+            return
+        sections: list[str] = []
+        if instructions:
+            sections.append(
+                "# seacodeMd\n"
+                "Codebase and user instructions are shown below. "
+                "Be sure to adhere to these instructions. "
+                "IMPORTANT: These instructions OVERRIDE any default behavior "
+                "and you MUST follow them exactly as written.\n\n" + instructions
+            )
+        if memories:
+            sections.append("# autoMemory\n" + memories)
+        if not sections:
+            return
+
+        # 当前日期单独成段，让模型在引用"今天"时有权威来源。
+        from datetime import date
+
+        sections.append(f"# currentDate\nToday's date is {date.today().isoformat()}.")
+        body = "\n\n".join(sections)
+        wrapped = (
+            "<system-reminder>\n"
+            "As you answer the user's questions, you can use the following context:\n"
+            + body
+            + "\n\n      IMPORTANT: this context may or may not be relevant to your tasks."
+            " You should not respond to this context unless it is highly relevant to your task.\n"
+            "</system-reminder>"
+        )
+        # env 已注入时插在 env 之后（pos=1），否则插在头部（pos=0）。
+        pos = 1 if self.env_injected else 0
+        self._messages.insert(pos, Message(role="user", content=wrapped))
+        self.ltm_injected = True
+
     # 替换整个历史并重置 env_injected 与用量锚点，支持第 07 步压缩后重新注入环境上下文。
     # 旧的锚点描述的是压缩前的对话记录，这里清零使 current_tokens() 退化为字符估算，
     # 直到下次 API 响应基于压缩后的历史重新锚定。
     def replace_history(self, new_messages: list[Message]) -> None:
         self._messages = new_messages
         self.env_injected = False
+        self.ltm_injected = False
         self.baseline_tokens = 0
         self.anchor_count = 0
         self.last_input_tokens = 0

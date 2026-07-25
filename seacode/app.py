@@ -44,8 +44,16 @@ from .client import (
     create_client,
 )
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig
-from .conversation import ConversationManager
+from .conversation import ConversationManager, Message
 from .mcp import MCPManager
+from .memory import (
+    MemoryManager,
+    Session,
+    SessionManager,
+    generate_session_summary,
+    load_instructions,
+    make_compact_boundary,
+)
 from .permission_dialog import InlinePermissionWidget
 from .permissions import (
     DangerousCommandDetector,
@@ -55,6 +63,7 @@ from .permissions import (
     RuleEngine,
 )
 from .sandbox import SandboxConfig, create_sandbox
+from .session_dialog import InlineResumeWidget
 from .tools import create_default_registry
 from .tools.base import ToolResult
 from .tools.bash import Bash
@@ -324,6 +333,10 @@ class SeaCodeApp(App[None]):
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("ctrl+o", "toggle_tool_blocks", "Toggle tools", priority=True),
         Binding("shift+tab", "cycle_mode", "Cycle mode", priority=True),
+        # Ctrl+R 打开会话恢复视图；Ctrl+M 展示当前自动记忆索引。
+        # 流式回合期间禁用，避免与活动 Agent Loop 竞争对话历史。
+        Binding("ctrl+r", "open_resume", "Resume session", priority=True),
+        Binding("ctrl+m", "show_memory", "Show memory", priority=True),
     ]
 
     # 初始化当前配置、客户端、工具注册中心和单回合状态。
@@ -361,6 +374,14 @@ class SeaCodeApp(App[None]):
             self._mcp_manager.load_configs(list(mcp_servers))
         # MCP 连接摘要；首轮 Agent.run 通过 MCPConnectEvent 回填，供状态栏展示。
         self._mcp_summary: str = ""
+        # 跨会话记忆与持久化：在 _select_provider 中按工作目录装配。
+        # session_manager 创建/列举/恢复/删除 .seacode/sessions 下的 JSONL；
+        # memory_manager 提供指令加载与 MEMORY.md 索引；session 是当前活跃句柄。
+        # _instructions_content 缓存 load_instructions 的拼接结果，供 Agent 注入。
+        self._session_manager: SessionManager | None = None
+        self._session: Session | None = None
+        self._memory_manager: MemoryManager | None = None
+        self._instructions_content: str = ""
 
     # 生成三行品牌标题，保留终端对话的既定信息层级。
     @staticmethod
@@ -424,11 +445,26 @@ class SeaCodeApp(App[None]):
 
         self._selected_provider = provider
         self._assemble_permission_system()
+        # 装配跨会话能力：load_instructions 拼接项目/用户级 SEACODE.md 与 AGENTS.md；
+        # MemoryManager 提供双目录记忆索引；SessionManager 创建新 JSONL 并清理过期会话。
+        # 失败均不阻断启动——记忆/会话功能降级为不可用，但 Provider 仍可正常对话。
+        work_dir = os.getcwd()
+        try:
+            self._instructions_content = load_instructions(work_dir)
+            self._memory_manager = MemoryManager(work_dir)
+            self._session_manager = SessionManager(work_dir)
+            self._session_manager.cleanup()
+            self._session = self._session_manager.create()
+        except Exception:
+            self._instructions_content = ""
+            self._memory_manager = None
+            self._session_manager = None
+            self._session = None
         self.query_one("#chat-area").display = True
         self.query_one("#input-area").display = True
         if len(self._providers) > 1:
             self.query_one("#provider-select").display = False
-        self.query_one("#title-bar", Static).update(self._make_banner(os.getcwd()))
+        self.query_one("#title-bar", Static).update(self._make_banner(work_dir))
         self.query_one("#model-label", Static).update(Text(provider.model))
         self._set_status("Ready")
         self._update_mode_label()
@@ -595,7 +631,15 @@ class SeaCodeApp(App[None]):
                 permission_checker=self._permission_checker,
                 mcp_manager=self._mcp_manager,
                 context_window=provider.get_context_window(),
+                instructions_content=self._instructions_content,
+                memory_manager=self._memory_manager,
             )
+            # 同步当前会话 ID 给 Agent，仅用于压缩摘要里的 transcript_path 提示。
+            if self._session is not None:
+                agent.session_id = self._session.session_id
+            # 持久化游标：记录已写入 JSONL 的历史末尾位置。
+            # TurnComplete 增量追加新消息；CompactNotification 先写 boundary 再推进游标。
+            history_cursor = len(self._conversation.messages)
             async for event in agent.run(self._conversation):
                 if isinstance(event, StreamText):
                     answer += event.text
@@ -649,6 +693,11 @@ class SeaCodeApp(App[None]):
                     # Layer 2 压缩完成：以系统消息呈现压缩前 token 数，不重排既有界面结构。
                     await self._show_system_message(f"⚙ {event.message}")
                     chat.scroll_end(animate=False)
+                    # 持久化 compact_boundary：将摘要 + 原样保留的尾部内联成一条记录，
+                    # resume 时只需这一条即可重建压缩后状态。然后推进游标到重建后的
+                    # 历史末尾，避免 TurnComplete/LoopComplete 把已压缩前缀重复写入。
+                    self._persist_compact_boundary(event)
+                    history_cursor = len(self._conversation.messages)
                 elif isinstance(event, ErrorEvent):
                     await self._append_error(event.message)
                 elif isinstance(event, TurnComplete):
@@ -663,6 +712,12 @@ class SeaCodeApp(App[None]):
                         for _, blk in collapsible:
                             blk.display = False
                         await ai_row.mount(summary)
+                    # 增量持久化：把本回合新增的消息（user + assistant
+                    # + tool_results）追加到 JSONL。
+                    if self._session is not None:
+                        for msg in self._conversation.messages[history_cursor:]:
+                            self._session.append(msg)
+                        history_cursor = len(self._conversation.messages)
                     # 重置工具块字典，开新 ai_row 供下一轮工具调用。
                     tool_blocks.clear()
                     ai_row = Vertical(classes="ai-row")
@@ -679,6 +734,16 @@ class SeaCodeApp(App[None]):
                     )
                     await ai_row.mount(done_label)
                     chat.scroll_end(animate=False)
+                    # 收尾持久化：把最后一轮 assistant 回复追加到 JSONL，
+                    # 并更新 meta.total_tokens 与 summary（后台异步生成）。
+                    if self._session is not None:
+                        for msg in self._conversation.messages[history_cursor:]:
+                            self._session.append(msg)
+                        history_cursor = len(self._conversation.messages)
+                        self._session.meta.total_tokens = (
+                            agent.total_input_tokens + agent.total_output_tokens
+                        )
+                        asyncio.ensure_future(self._update_session_summary())
 
             # 收尾：渲染剩余的累积文本。
             await live_answer.remove()
@@ -775,3 +840,117 @@ class SeaCodeApp(App[None]):
             label.update(Text(f"⟂ {self._mcp_summary}", style="#a3be8c"))
         else:
             label.update(Text(""))
+
+    # -----------------------------------------------------------------
+    # batch08：会话持久化、记忆索引与 session_dialog 集成
+    # -----------------------------------------------------------------
+
+    # 将 CompactNotification 携带的 boundary 持久化为一条 COMPACT_BOUNDARY 记录。
+    # boundary 内联了摘要 + 原样保留的尾部，resume 时只需这一条即可重建压缩后状态。
+    # 没有活跃 session 或 compact 未产出 boundary 时直接跳过。
+    def _persist_compact_boundary(self, notification: CompactNotification) -> None:
+        if self._session is None or notification.boundary is None:
+            return
+        record = make_compact_boundary(
+            summary=notification.boundary.summary,
+            keep=notification.boundary.keep,
+        )
+        self._session.append_record(record)
+
+    # 后台异步生成会话摘要并写入 .meta；失败静默不影响主循环。
+    # 摘要取最近 10 条消息裸 LLM 调用一句话总结，用于 session_dialog 列表展示。
+    async def _update_session_summary(self) -> None:
+        if self._session is None or self._client is None or self._selected_provider is None:
+            return
+        try:
+            summary = await generate_session_summary(
+                self._client, self._conversation, self._selected_provider.protocol
+            )
+            if summary and self._session is not None:
+                self._session.meta.summary = summary
+                self._session.meta.save(
+                    self._session._sessions_dir / f"{self._session.session_id}.meta"
+                )
+        except Exception:
+            pass
+
+    # Ctrl+R：打开内联会话恢复视图。流式回合期间禁用避免与活动 Agent Loop 竞争历史。
+    # 视图挂载到 chat-area 顶部并获取焦点；空列表时直接关闭。
+    async def action_open_resume(self) -> None:
+        if self._streaming or self._session_manager is None:
+            return
+        sessions = self._session_manager.list()
+        widget = InlineResumeWidget(sessions, project_name=os.getcwd())
+        chat = self.query_one("#chat-area", VerticalScroll)
+        await chat.mount(widget)
+        widget.focus()
+
+    # Ctrl+M：展示当前自动记忆索引与目录路径。无 memory_manager 时给出降级提示。
+    async def action_show_memory(self) -> None:
+        if self._memory_manager is None:
+            await self._show_system_message("记忆系统未启用（工作目录不可写）")
+            return
+        text = self._memory_manager.get_display_text()
+        await self._show_system_message(text)
+
+    # 接收 InlineResumeWidget 的选择结果：None 表示取消，非空则恢复该会话。
+    # 恢复时关闭旧 session 句柄、替换对话历史、重新渲染已有消息，并重置游标。
+    async def on_inline_resume_widget_selected(
+        self, event: InlineResumeWidget.Selected
+    ) -> None:
+        # 先移除 widget，无论是否真的恢复会话。
+        try:
+            widget = self.query_one("#resume-inline", InlineResumeWidget)
+            await widget.remove()
+        except Exception:
+            pass
+
+        if event.session_id is None or self._session_manager is None:
+            return
+
+        # 流式回合期间不允许恢复，避免与活动 Agent Loop 竞争历史。
+        if self._streaming:
+            await self._show_system_message("回合进行中，无法恢复会话")
+            return
+
+        result = self._session_manager.resume(event.session_id)
+        if result is None:
+            await self._show_system_message("会话恢复失败：文件已损坏或被删除")
+            return
+
+        # 关闭旧 session 句柄，替换为恢复的句柄；重置对话历史并渲染已恢复的消息。
+        if self._session is not None:
+            self._session.close()
+        self._session = result.session
+        new_conv = ConversationManager()
+        for msg in result.messages:
+            new_conv.history.append(msg)
+        self._conversation = new_conv
+        await self._render_restored_messages(result.messages)
+        await self._show_system_message(
+            f"已恢复会话 {result.session.session_id}（{len(result.messages)} 条消息）"
+        )
+
+    # 把恢复的消息渲染到 chat-area；先清空旧内容再按角色挂载用户/助手行。
+    # tool_results 与空内容消息跳过，避免渲染工具调用回灌噪音。
+    async def _render_restored_messages(self, messages: list[Message]) -> None:
+        chat = self.query_one("#chat-area", VerticalScroll)
+        await chat.remove_children()
+        for msg in messages:
+            if msg.tool_results or not msg.content:
+                continue
+            if msg.role == "user":
+                user_message = Text()
+                user_message.append("❯ ", style="bold #71b8bc")
+                user_message.append(msg.content, style="bold #f2f5f5")
+                await chat.mount(Static(user_message, classes="message user-message"))
+            elif msg.role == "assistant":
+                await chat.mount(
+                    Markdown(msg.content, classes="message assistant-markdown")
+                )
+        chat.scroll_end(animate=False)
+
+    # 应用退出时关闭当前 session 文件句柄，避免句柄泄露。
+    def on_unmount(self) -> None:
+        if self._session is not None:
+            self._session.close()
