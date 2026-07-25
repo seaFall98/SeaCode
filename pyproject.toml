@@ -53,6 +53,7 @@ select = ["E", "F", "I", "UP"]
 "seacode/context/manager.py" = ["E501"]
 "seacode/memory/auto_memory.py" = ["E501"]
 "seacode/memory/consolidation.py" = ["E501"]
+"seacode/teams/coordinator.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

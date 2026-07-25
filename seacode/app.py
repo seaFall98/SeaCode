@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import re
@@ -10,6 +11,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from rich.markup import escape
@@ -94,6 +96,8 @@ from .permissions import (
 from .sandbox import SandboxConfig, create_sandbox
 from .session_dialog import InlineResumeWidget
 from .skills import SkillExecutor, SkillLoader
+from .teammate_tree import TeammateTree
+from .teams.manager import TeamManager
 from .tools import create_default_registry
 from .tools.agent_tool import AgentTool
 from .tools.ask_user import AskUserTool
@@ -103,8 +107,15 @@ from .tools.enter_worktree import EnterWorktreeTool
 from .tools.exit_worktree import ExitWorktreeTool
 from .tools.install_skill import InstallSkill
 from .tools.load_skill import LoadSkill
+
+# batch14：团队协调工具；TeamCreate/TeamDelete/SendMessage 在装配阶段注册到 Lead 工具集。
+from .tools.send_message import SendMessageTool
+from .tools.team_create import TeamCreateTool
+from .tools.team_delete import TeamDeleteTool
 from .worktree.cleanup import start_stale_cleanup_task
 from .worktree.manager import WorktreeManager
+
+log = logging.getLogger(__name__)
 
 # 工具调用详情展示的最大行数，超过则截断并提示剩余行数。
 MAX_TRUNCATED_LINES: int = 20
@@ -705,6 +716,10 @@ class SeaCodeApp(App[None]):
         enable_verification_agent: bool = False,
         # batch13：Worktree 隔离工作区配置；从 .seacode/config.yaml 的 worktree 段加载。
         worktree_cfg: WorktreeConfig | None = None,
+        # batch14：团队协调配置；teammate_mode 指定 spawn 后端，enable_coordinator_mode
+        # 开启 Lead 工具收敛与协调者提示词。两层字段由 __main__ 从 AppConfig 透传。
+        teammate_mode: str = "",
+        enable_coordinator_mode: bool = False,
     ) -> None:
         super().__init__()
         self._providers = tuple(providers)
@@ -798,6 +813,19 @@ class SeaCodeApp(App[None]):
             self._command_registry, self._skill_loader, self._skill_executor
         )
         self._skill_loader.register_reload_callback(self._make_skill_register_callback())
+        # batch14：团队协调。team_manager 在 _select_provider 装配阶段初始化，
+        # 依赖 worktree_manager 与 trace_manager；为 None 时关闭团队路径。
+        # teammate_tree 在 compose 中挂载，周期刷新 task 每秒拉取 progress。
+        # _teams_config 持 teammate_mode / enable_coordinator_mode 供 TeamCreateTool 读取。
+        self._teammate_mode = teammate_mode
+        self._enable_coordinator_mode = enable_coordinator_mode
+        self._teams_config = SimpleNamespace(
+            teammate_mode=teammate_mode,
+            enable_coordinator_mode=enable_coordinator_mode,
+        )
+        self.team_manager: TeamManager | None = None
+        self.teammate_tree: TeammateTree | None = None
+        self._teammate_refresh_task: asyncio.Task[None] | None = None
 
     # 生成三行品牌标题，保留终端对话的既定信息层级。
     @staticmethod
@@ -811,6 +839,8 @@ class SeaCodeApp(App[None]):
         return banner
 
     # 构造标题、选择、聊天、输入和横向状态栏五个既定区域。
+    # batch14：在 chat-area 之前挂载 TeammateTree；初始 display=False 避免占用空间，
+    # 周期刷新 task 在检测到 teammates 时切换 display=True。
     def compose(self) -> ComposeResult:
         yield Static(self._make_banner(), id="title-bar")
         if len(self._providers) > 1:
@@ -823,6 +853,9 @@ class SeaCodeApp(App[None]):
                     ],
                     id="provider-list",
                 )
+        # batch14：TeammateTree 占位；空 teammates 时渲染空 Text 不影响既有布局。
+        self.teammate_tree = TeammateTree(id="teammate-tree")
+        yield self.teammate_tree
         yield VerticalScroll(id="chat-area")
         with Vertical(id="input-area"):
             yield ChatInput(id="chat-input")
@@ -836,6 +869,9 @@ class SeaCodeApp(App[None]):
     # 根据 Provider 数量进入选择状态或直接准备单一配置。
     def on_mount(self) -> None:
         self.query_one(ChatInput).disabled = True
+        # batch14：TeammateTree 初始隐藏；周期刷新 task 在检测到 teammates 时显示。
+        if self.teammate_tree is not None:
+            self.teammate_tree.display = False
         # 加载命令历史；无文件不抛异常。
         try:
             self.query_one(ChatInput).load_history(Path(os.getcwd()))
@@ -944,6 +980,11 @@ class SeaCodeApp(App[None]):
         # 与 /worktree /rewind 命令注册到对应注册中心。后台清理 task 按 interval/cutoff
         # 自动回收 stale worktree。失败不阻断启动——worktree 能力降级为不可用。
         self._assemble_worktree_system(work_dir)
+        # batch14：装配团队协调系统。TeamManager 依赖 worktree_manager 与 trace_manager，
+        # 任一为 None 时仍可工作（路径降级）。TeamCreate/TeamDelete/SendMessage 工具注册到
+        # Lead 工具集；Lead Agent 的 _team_manager 与 notification_fn 在 _run_turn 中注入。
+        # 周期刷新 task 每秒拉取 teammates progress 并刷新 TeammateTree。失败不阻断启动。
+        self._assemble_teams_system()
         # 启动后台任务通知轮询；on_unmount 时取消。
         if self.task_manager is not None and self._notification_polling_task is None:
             try:
@@ -1034,6 +1075,80 @@ class SeaCodeApp(App[None]):
                             continue
         except Exception:
             self.file_history = None
+
+    # batch14：装配 TeamManager 与团队协调工具，并启动 TeammateTree 周期刷新 task。
+    # 任一步失败静默降级，不阻断 Provider 选择主流程；team_manager 为 None 时
+    # TeamCreate/TeamDelete/SendMessage 工具不注册，Lead 不会进入 Coordinator 模式。
+    # Lead Agent 的 _team_manager / notification_fn 在 _run_turn 创建 Agent 后注入，
+    # 因为 agent 在每个回合重建，且 notification_fn 需绑定当回合 agent_id 作为 lead_agent_id。
+    def _assemble_teams_system(self) -> None:
+        try:
+            team_manager = TeamManager(
+                worktree_manager=self.worktree_manager,
+                trace_manager=self.trace_manager,
+            )
+        except Exception:
+            team_manager = None
+        if team_manager is None:
+            self.team_manager = None
+            return
+        self.team_manager = team_manager
+        try:
+            # 注入 TeamManager 到 AgentTool 让 _execute_as_teammate 路径可用。
+            if self._agent_tool is not None:
+                self._agent_tool.set_team_manager(team_manager)
+            # 注册 TeamCreate / TeamDelete / SendMessage 工具。
+            # parent_agent 在 _run_turn 中刷新为当前回合 Agent；此处传 None 仅作占位，
+            # TeamCreateTool.execute 通过 _parent_agent.agent_id 访问 Lead，由 _run_turn 注入。
+            self._tool_registry.register(
+                TeamCreateTool(None, team_manager, self._teams_config)
+            )
+            self._tool_registry.register(
+                TeamDeleteTool(None, team_manager)
+            )
+            self._tool_registry.register(
+                SendMessageTool(None, team_manager)
+            )
+        except Exception:
+            # 工具注册失败不撤销 team_manager；Lead 仍可消费邮箱，只是无法新建团队。
+            pass
+        # 启动 TeammateTree 周期刷新 task；on_unmount 时取消。
+        if self._teammate_refresh_task is None:
+            try:
+                self._teammate_refresh_task = asyncio.create_task(
+                    self._refresh_teammate_tree()
+                )
+            except RuntimeError:
+                # 事件循环尚未启动（如测试环境）；on_mount 会再次尝试。
+                self._teammate_refresh_task = None
+
+    # batch14：每秒拉取所有团队成员 progress 并刷新 TeammateTree。
+    # team_manager / teammate_tree 为 None 时静默跳过；异常只记 warning 不中断循环。
+    # 检测到非空 teammates 时显示 widget，空时隐藏，避免占用 TUI 空间。
+    async def _refresh_teammate_tree(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(1)
+                if self.team_manager is None or self.teammate_tree is None:
+                    continue
+                try:
+                    progress = self.team_manager.get_all_teammate_progress()
+                    self.teammate_tree.teammates = progress
+                    # lead token 累计取当前回合 Agent；_agent 为 None 时用 0。
+                    lead_tokens = 0
+                    if self._agent is not None:
+                        lead_tokens = (
+                            getattr(self._agent, "total_input_tokens", 0)
+                            + getattr(self._agent, "total_output_tokens", 0)
+                        )
+                    self.teammate_tree.leader_tokens = lead_tokens
+                    # 有 teammates 时显示 widget，空时隐藏。
+                    self.teammate_tree.display = bool(progress)
+                except Exception as e:
+                    log.warning("refresh teammate tree failed: %s", e)
+        except asyncio.CancelledError:
+            # on_unmount 取消时静默退出。
+            return
 
     # 装配权限检查器与 OS 级沙箱：三层规则文件 + 危险命令检测 + 路径沙箱 + 模式 + 沙箱挂载。
     def _assemble_permission_system(self) -> None:
@@ -1495,6 +1610,23 @@ class SeaCodeApp(App[None]):
             agent.set_full_registry(self._tool_registry)
             if self._agent_tool is not None:
                 self._agent_tool.parent_agent = agent
+            # batch14：注入 TeamManager 与 notification_fn 到当前回合 Lead Agent。
+            # notification_fn 绑定 lead_agent_id（即当回合 agent_id），
+            # 每轮消费 lead 邮箱中的未读消息并拼成 <team-notification> XML 注入对话历史。
+            # team_manager 为 None 时（装配失败或未启用）静默跳过，向后兼容 batch01-13。
+            if self.team_manager is not None:
+                agent._team_manager = self.team_manager
+                lead_agent_id = agent.agent_id
+                agent.notification_fn = (
+                    lambda: self.team_manager.drain_lead_mailbox(lead_agent_id)
+                    if self.team_manager is not None
+                    else []
+                )
+                # 同步刷新 TeamCreate/TeamDelete/SendMessage 工具的 parent_agent 引用。
+                # 每回合重建 Agent，故需刷新引用避免访问过期 Agent 的 agent_id。
+                for tool in self._tool_registry.list_tools():
+                    if hasattr(tool, "_parent_agent"):
+                        tool._parent_agent = agent
             # 同步当前会话 ID 给 Agent，仅用于压缩摘要里的 transcript_path 提示。
             if self._session is not None:
                 agent.session_id = self._session.session_id
@@ -1859,6 +1991,7 @@ class SeaCodeApp(App[None]):
     # 等待 Hook 完成（shutdown Hook 异常由 _run_single 兜底捕获记 warning）。
     # batch12：取消后台任务通知轮询协程，避免退出后仍尝试访问已关闭的对话历史。
     # batch13：取消 stale worktree 清理 task 与 restore_session task，避免退出后残留。
+    # batch14：取消 TeammateTree 周期刷新 task，避免退出后仍访问已销毁的 widget。
     def on_unmount(self) -> None:
         if self._notification_polling_task is not None:
             self._notification_polling_task.cancel()
@@ -1869,6 +2002,9 @@ class SeaCodeApp(App[None]):
         if self._restore_session_task is not None:
             self._restore_session_task.cancel()
             self._restore_session_task = None
+        if self._teammate_refresh_task is not None:
+            self._teammate_refresh_task.cancel()
+            self._teammate_refresh_task = None
         if self._hook_engine is not None:
             try:
                 asyncio.ensure_future(self._trigger_shutdown_hooks())

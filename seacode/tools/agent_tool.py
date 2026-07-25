@@ -1,4 +1,4 @@
-"""Agent 工具：定义式 + Fork + Worktree 隔离三路径子 Agent 调度。
+"""Agent 工具：定义式 + Fork + Worktree 隔离 + Teammate 四路径子 Agent 调度。
 
 按 ``params.subagent_type`` 分流：非空走定义式（从 AgentLoader 取 AgentDef，
 按 ``is_background`` 过滤工具），留空走 Fork（要求 ``enable_fork=true``，
@@ -6,7 +6,8 @@
 ``AgentDef.isolation == "worktree"`` 时走 Worktree 隔离路径：在独立 worktree
 中创建子 Agent 执行任务，结束后按变更检测结果自动清理或保留。
 
-``team_name`` 分支保留入口但内部直接返回 is_error，由第 14 步启用真实路由。
+``team_name`` 非空时走 Teammate 路径：在团队 worktree 中按后端（in-process /
+tmux / iTerm2）spawn 长驻 teammate，通过邮箱与 Lead 通信。
 """
 
 from __future__ import annotations
@@ -25,7 +26,11 @@ from seacode.agents.fork import (
 from seacode.agents.loader import AgentLoader
 from seacode.agents.parser import AgentDef
 from seacode.agents.task_manager import TaskManager
-from seacode.agents.tool_filter import clone_registry_for_fork, resolve_agent_tools
+from seacode.agents.tool_filter import (
+    build_teammate_tools,
+    clone_registry_for_fork,
+    resolve_agent_tools,
+)
 from seacode.agents.trace import TraceManager
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 from seacode.worktree.integration import build_worktree_notice, generate_worktree_name
@@ -41,16 +46,28 @@ _DEFAULT_MODEL_ALIASES: dict[str, str] = {
     "opus": "claude-opus-4-1",
 }
 
+# batch14：teammate 系统提示词附加段；告知 worker 文本回复对其它成员不可见，
+# 需用 SendMessage 通信，且工作在隔离 worktree 中需用相对路径。
+TEAMMATE_ADDENDUM = (
+    "\n[TEAMMATE CONTEXT]\n"
+    "You are a teammate in a team. Your text replies are NOT visible to other "
+    "teammates — use the SendMessage tool to communicate. You are working in an "
+    "isolated worktree; use relative paths for all file operations.\n"
+    "[/TEAMMATE CONTEXT]"
+)
+
 
 class AgentToolParams(BaseModel):
-    """Agent 工具参数；subagent_type 留空走 Fork 路径。"""
+    """Agent 工具参数；subagent_type 留空走 Fork 路径，team_name 非空走 Teammate 路径。"""
 
     subagent_type: str = ""
     description: str = ""
     prompt: str = ""
     run_in_background: bool = False
     model: str | None = None
+    # batch14：team_name 非空走 Teammate 路径；name 指定 teammate 显示名（缺省用 agent_type）。
     team_name: str | None = None
+    name: str | None = None
 
 
 class AgentTool(Tool):
@@ -106,9 +123,10 @@ class AgentTool(Tool):
         # 优先使用传入 parent_agent，回退到构造时保存的引用。
         parent = parent_agent if parent_agent is not None else self.parent_agent
 
+        # batch14：team_name 非空走 Teammate 路径（与 SubAgent / Fork 互斥）。
         if getattr(tool_params, "team_name", None):
-            return ToolResult(
-                content="team_name 路径在第 14 步启用", is_error=True
+            return await self._execute_as_teammate(
+                tool_params, conversation, parent
             )
 
         if tool_params.subagent_type:
@@ -336,6 +354,166 @@ class AgentTool(Tool):
     # 注入 WorktreeManager；app.py 在装配阶段调用，None 时关闭 worktree 隔离路径。
     def set_worktree_manager(self, manager: WorktreeManager | None) -> None:
         self.worktree_manager = manager
+
+    # batch14：注入 TeamManager；app.py 在装配阶段调用，None 时关闭 Teammate 路径。
+    def set_team_manager(self, manager: Any) -> None:
+        self.team_manager = manager
+
+    # batch14：为 teammate 生成唯一名称；同名时追加 -2 / -3 直到不冲突。
+    def _unique_teammate_name(self, name: str, team_name: str) -> str:
+        team = self.team_manager.get_team(team_name) if self.team_manager else None
+        if team is None or team.get_member(name) is None:
+            return name
+        i = 2
+        while True:
+            candidate = f"{name}-{i}"
+            if team.get_member(candidate) is None:
+                return candidate
+            i += 1
+
+    # batch14：Teammate 路径六步——加载定义 → 建 worktree → 选 LLM → 过滤工具 →
+    # 按后端 spawn → 注册名字与成员。in-process 长驻邮箱循环；pane 后端外进程执行。
+    async def _execute_as_teammate(
+        self,
+        params: AgentToolParams,
+        conversation: Any,
+        parent_agent: Any,
+    ) -> ToolResult:
+        del conversation  # teammate 不复用父对话历史，spawn_inprocess 自建 ConversationManager
+        from uuid import uuid4
+
+        from seacode.agent import Agent
+        from seacode.teams.models import BackendType, TeammateInfo
+        from seacode.teams.registry import AgentNameRegistry
+        from seacode.teams.spawn_inprocess import spawn_inprocess_teammate
+        from seacode.teams.spawn_iterm2 import spawn_iterm2_teammate
+        from seacode.teams.spawn_tmux import spawn_tmux_teammate
+
+        team_name = params.team_name or ""
+        # 前置检查：team_manager / worktree_manager 必须已装配。
+        if self.team_manager is None:
+            return ToolResult(content="team_manager 未初始化", is_error=True)
+        if self.worktree_manager is None:
+            return ToolResult(content="worktree manager 未初始化", is_error=True)
+
+        # 第 1 步：加载 AgentDef；无 subagent_type 时构造默认 teammate 定义。
+        if params.subagent_type:
+            agent_def = self.agent_loader.get(params.subagent_type)
+            if agent_def is None:
+                available = self.agent_loader.list_agents()
+                available_str = ", ".join(
+                    f"{n} ({d})" for n, d in available
+                )
+                return ToolResult(
+                    content=f"未知子 Agent 类型: {params.subagent_type}，可用: {available_str}",
+                    is_error=True,
+                )
+        else:
+            agent_def = AgentDef(
+                agent_type="teammate",
+                when_to_use="default teammate",
+                system_prompt="",
+                permission_mode="bypassPermissions",
+            )
+
+        # 第 2 步：创建 worktree；名称格式 team-<team>/<member>，便于清理时识别。
+        teammate_name = self._unique_teammate_name(
+            params.name or agent_def.agent_type, team_name
+        )
+        wt_name = f"team-{team_name}/{teammate_name}"
+        try:
+            wt = await self.worktree_manager.create(wt_name, "HEAD")
+        except WorktreeError as e:
+            return ToolResult(
+                content=f"创建 worktree 失败: {e}", is_error=True
+            )
+
+        # 第 3 步：选 LLM；按 agent_def.model 或父 Agent client。
+        client = self._select_llm(params, agent_def, parent_agent)
+
+        # 第 4 步：build_teammate_tools 按后端过滤工具集。
+        backend = self.team_manager.detect_backend("", True)
+        parent_registry = getattr(parent_agent, "_full_registry", None)
+        if parent_registry is None:
+            parent_registry = parent_agent.registry
+        teammate_registry = build_teammate_tools(parent_registry, backend)
+
+        # 第 5 步：构造 teammate Agent 并按后端 spawn。
+        teammate_agent = Agent(
+            client=client,
+            registry=teammate_registry,
+            protocol=getattr(parent_agent, "protocol", "anthropic"),
+            work_dir=wt.path,
+            max_iterations=agent_def.max_turns,
+            permission_checker=None,  # teammate 在隔离 worktree 中，bypass 权限
+            context_window=getattr(parent_agent, "context_window", 200_000),
+            agent_id=f"{teammate_name}-{uuid4().hex[:8]}",
+            team_name=team_name,
+            team_manager=self.team_manager,
+        )
+        # 注入 TEAMMATE_ADDENDUM 到系统提示词；通过 _current_definition 传递。
+        teammate_def = AgentDef(
+            agent_type=agent_def.agent_type,
+            when_to_use=agent_def.when_to_use,
+            system_prompt=agent_def.system_prompt + TEAMMATE_ADDENDUM,
+            tools=agent_def.tools,
+            disallowed_tools=agent_def.disallowed_tools,
+            model=agent_def.model,
+            max_turns=agent_def.max_turns,
+            permission_mode="bypassPermissions",
+            background=agent_def.background,
+            isolation=agent_def.isolation,
+            file_path=agent_def.file_path,
+            source=agent_def.source,
+        )
+        teammate_agent._current_definition = teammate_def
+
+        mailbox = self.team_manager.get_mailbox(team_name)
+
+        if backend == BackendType.IN_PROCESS:
+            handle = spawn_inprocess_teammate(
+                teammate_agent,
+                params.prompt,
+                teammate_name,
+                self.team_manager,
+                mailbox=mailbox,
+            )
+            self.team_manager.register_inprocess_handle(
+                team_name, teammate_name, handle
+            )
+        elif backend == BackendType.TMUX:
+            tmux_pane = spawn_tmux_teammate(team_name, teammate_name, wt.path)
+            self.team_manager.register_pane_id(
+                team_name, teammate_name, tmux_pane.pane_id
+            )
+        elif backend == BackendType.ITERM2:
+            iterm_pane = spawn_iterm2_teammate(team_name, teammate_name, wt.path)
+            self.team_manager.register_pane_id(
+                team_name, teammate_name, iterm_pane.session_id
+            )
+
+        # 第 6 步：注册名字到 AgentNameRegistry 并持久化成员到团队 config。
+        AgentNameRegistry.instance().register(
+            teammate_name, teammate_agent.agent_id
+        )
+        member = TeammateInfo(
+            name=teammate_name,
+            agent_id=teammate_agent.agent_id,
+            agent_type=agent_def.agent_type,
+            model=agent_def.model,
+            worktree_path=wt.path,
+            backend_type=backend,
+            is_active=None,
+        )
+        self.team_manager.register_member(team_name, member)
+
+        return ToolResult(
+            content=(
+                f"teammate {teammate_name} 已启动 "
+                f"(worktree={wt.path}, backend={backend.value})"
+            ),
+            is_error=False,
+        )
 
     # 在隔离 worktree 中执行子 Agent；任务文本前注入 worktree 上下文通知。
     # 子 Agent 复用父 client/protocol/context_window，work_dir 切换到 worktree 路径，

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 from seacode.agents.fork import FORK_QUERY_SOURCE
 from seacode.agents.parser import AgentDef
@@ -59,6 +60,42 @@ ASYNC_AGENT_ALLOWED_TOOLS: set[str] = {
     "EnterWorktree",
     "ExitWorktree",
 }
+
+# Coordinator 模式下 Lead 可用的工具白名单；只保留调度、只读探索与任务管理工具。
+# mcp__ 前缀工具由 apply_coordinator_filter 单独放行，不在此集合中。
+COORDINATOR_MODE_ALLOWED_TOOLS: set[str] = {
+    "Agent",
+    "SendMessage",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "TaskStop",
+    "SyntheticOutput",
+    "TeamCreate",
+    "TeamDelete",
+    "ReadFile",
+    "Glob",
+    "Grep",
+    "Bash",
+}
+
+# teammate 间协调工具；in-process 与 pane 后端均可用。
+TEAMMATE_COORDINATION_TOOLS: set[str] = {
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "SendMessage",
+}
+
+# in-process teammate 允许的工具白名单；在 ASYNC_AGENT_ALLOWED_TOOLS 基础上
+# 增加 TEAMMATE_COORDINATION_TOOLS 与 Cron 工具。
+IN_PROCESS_TEAMMATE_ALLOWED_TOOLS: set[str] = (
+    ASYNC_AGENT_ALLOWED_TOOLS
+    | TEAMMATE_COORDINATION_TOOLS
+    | {"CronCreate", "CronDelete", "CronList"}
+)
 
 
 # 按五层防线过滤父注册表工具，返回新的 ToolRegistry。
@@ -121,4 +158,46 @@ def clone_registry_for_fork(parent_registry: ToolRegistry) -> ToolRegistry:
             new_registry.register(fork_tool)
         else:
             new_registry.register(tool)
+    return new_registry
+
+
+# Coordinator 模式工具收敛：只保留 mcp__ 前缀工具 + COORDINATOR_MODE_ALLOWED_TOOLS 白名单。
+# 返回新的 ToolRegistry；原 registry 不变。
+def apply_coordinator_filter(parent_registry: ToolRegistry) -> ToolRegistry:
+    new_registry = ToolRegistry()
+    for tool in parent_registry.list_tools():
+        if tool.name.startswith("mcp__"):
+            new_registry.register(tool)
+        elif tool.name in COORDINATOR_MODE_ALLOWED_TOOLS:
+            new_registry.register(tool)
+    return new_registry
+
+
+# 按后端类型构造 teammate 工具注册表。
+# IN_PROCESS 后端用 IN_PROCESS_TEAMMATE_ALLOWED_TOOLS 白名单；
+# pane 后端（TMUX/ITERM2）保留全量工具但去掉 TeamCreate/TeamDelete，
+# 附加 TEAMMATE_COORDINATION_TOOLS。
+def build_teammate_tools(
+    parent_registry: ToolRegistry, backend_type: Any
+) -> ToolRegistry:
+    from seacode.teams.models import BackendType
+
+    new_registry = ToolRegistry()
+    if backend_type == BackendType.IN_PROCESS:
+        for tool in parent_registry.list_tools():
+            if tool.name.startswith("mcp__"):
+                new_registry.register(tool)
+            elif tool.name in IN_PROCESS_TEAMMATE_ALLOWED_TOOLS:
+                new_registry.register(tool)
+    else:
+        # pane 后端：去掉 TeamCreate/TeamDelete，保留其它 + 协调工具。
+        for tool in parent_registry.list_tools():
+            if tool.name in ("TeamCreate", "TeamDelete"):
+                continue
+            if tool.name.startswith("mcp__"):
+                new_registry.register(tool)
+            elif tool.name in TEAMMATE_COORDINATION_TOOLS:
+                new_registry.register(tool)
+            elif tool.name in ASYNC_AGENT_ALLOWED_TOOLS:
+                new_registry.register(tool)
     return new_registry

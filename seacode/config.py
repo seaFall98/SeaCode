@@ -137,6 +137,11 @@ class AppConfig:
     raw_hooks: list[dict] = field(default_factory=list)
     # batch13：Worktree 隔离工作区配置；三层合并按字段覆盖（与 sandbox 同语义）。
     worktree: WorktreeConfig = WorktreeConfig()
+    # batch14：团队协调配置；teammate_mode 指定 spawn 后端（空/ tmux / iterm2 / in-process），
+    # enable_coordinator_mode 开启 Lead 工具收敛与协调者提示词。
+    # 三层合并：后层非默认值覆盖前层（与 worktree 同语义，非 sandbox 的 OR 语义）。
+    teammate_mode: str = ""
+    enable_coordinator_mode: bool = False
 
 
 # 展开 ${VAR} 占位符；未定义变量保留原字面量，便于发现配置错误。
@@ -196,12 +201,15 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
     mcp_servers = _parse_mcp_servers(raw.get("mcp_servers"), path)
     raw_hooks = validate_hooks(raw.get("hooks"))
     worktree = _parse_worktree(raw.get("worktree"), path)
+    teammate_mode, enable_coordinator_mode = _parse_teammate_fields(raw, path)
     return AppConfig(
         providers=providers,
         sandbox=sandbox,
         mcp_servers=mcp_servers,
         raw_hooks=raw_hooks,
         worktree=worktree,
+        teammate_mode=teammate_mode,
+        enable_coordinator_mode=enable_coordinator_mode,
     )
 
 
@@ -298,6 +306,22 @@ def _parse_worktree(raw: Any, path: Path) -> WorktreeConfig:
         raise ConfigError(f"{e}: {path}") from e
 
 
+# batch14：解析 teammate_mode / enable_coordinator_mode 顶层字段。
+# 缺失用默认值（空串 / False）；teammate_mode 非 str 抛错，enable_coordinator_mode 非 bool 抛错。
+def _parse_teammate_fields(raw: Any, path: Path) -> tuple[str, bool]:
+    teammate_mode_raw = raw.get("teammate_mode", "")
+    if not isinstance(teammate_mode_raw, str):
+        raise ConfigError(f"teammate_mode must be a string: {path}")
+    teammate_mode = teammate_mode_raw.strip()
+
+    enable_coordinator_raw = raw.get("enable_coordinator_mode", False)
+    if not isinstance(enable_coordinator_raw, bool):
+        raise ConfigError(
+            f"enable_coordinator_mode must be a boolean: {path}"
+        )
+    return teammate_mode, enable_coordinator_raw
+
+
 # 校验单个 Provider 的公开字段与协议边界。
 def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
     if not isinstance(raw, dict):
@@ -368,6 +392,10 @@ def load_config(
     merged_symlinks: list[str] = []
     merged_interval: int = 3600
     merged_cutoff: int = 24
+    # batch14：团队字段合并；teammate_mode 后层非空覆盖前层，
+    # enable_coordinator_mode 后层 True 覆盖前层（与 sandbox 的 OR 语义一致，更安全）。
+    merged_teammate_mode: str = ""
+    merged_coordinator_mode: bool = False
     for candidate in config_candidates(cwd, home):
         if not candidate.is_file():
             continue
@@ -391,6 +419,12 @@ def load_config(
             merged_interval = layer.worktree.stale_cleanup_interval
         if layer.worktree.stale_cutoff_hours != 24:
             merged_cutoff = layer.worktree.stale_cutoff_hours
+        # batch14：团队字段合并。
+        # teammate_mode 后层完整替换前层（与 Provider 列表同语义，符合 task.md 规格）。
+        merged_teammate_mode = layer.teammate_mode
+        # enable_coordinator_mode 用 OR 语义（任一层开启即开启，与 sandbox 同语义，更安全）。
+        if layer.enable_coordinator_mode:
+            merged_coordinator_mode = True
 
     if loaded is None:
         raise ConfigError(
@@ -411,4 +445,6 @@ def load_config(
             stale_cleanup_interval=merged_interval,
             stale_cutoff_hours=merged_cutoff,
         ),
+        teammate_mode=merged_teammate_mode,
+        enable_coordinator_mode=merged_coordinator_mode,
     )
