@@ -424,6 +424,8 @@ def build_system_prompt(
 
 
 # 生成会话级环境上下文字符串，供 conversation.inject_environment 注入到消息历史头部。
+# batch12：agent_catalog 由 app.py 拼装为 ## Available Sub-Agent Types 段落注入；
+# 含子 Agent 列表与"不要 wait/sleep/poll"提醒，让主 Agent 知道可用子 Agent 与后台通知机制。
 def build_environment_context(
     work_dir: str,
     active_skills: dict[str, str] | None = None,
@@ -436,6 +438,7 @@ def build_environment_context(
         f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
 
+    # batch12：注入子 Agent 目录摘要（含可用类型与后台通知提醒）。
     if agent_catalog:
         parts.append("")
         parts.append(agent_catalog)

@@ -37,6 +37,13 @@ from .agent import (
     TurnComplete,
     UsageEvent,
 )
+from .agents import (
+    AgentLoader,
+    TaskManager,
+    TraceManager,
+    inject_task_notifications,
+)
+from .askuser_dialog import InlineAskUserWidget
 from .client import (
     AuthenticationError,
     LLMClient,
@@ -59,6 +66,8 @@ from .commands.handlers.skill_register import (
     make_skill_register_callback,
     register_skill_commands,
 )
+from .commands.handlers.tasks import create_tasks_command
+from .commands.handlers.trace import create_trace_command
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig
 from .conversation import ConversationManager, Message
 from .hooks import HookContext, HookEngine
@@ -83,6 +92,8 @@ from .sandbox import SandboxConfig, create_sandbox
 from .session_dialog import InlineResumeWidget
 from .skills import SkillExecutor, SkillLoader
 from .tools import create_default_registry
+from .tools.agent_tool import AgentTool
+from .tools.ask_user import AskUserTool
 from .tools.base import ToolResult
 from .tools.bash import Bash
 from .tools.install_skill import InstallSkill
@@ -378,6 +389,108 @@ class ToolGroupSummary(Static, can_focus=True):
         self.toggle()
 
 
+# batch12：子 Agent 调用展示块；与 ToolCallBlock 同层级但呈现风格不同。
+# 运行中显示品牌色圆点 + agent_type + description；完成后折叠为 "⎿  Done (N tool uses · X.Xs)"。
+# 点击或 ctrl+o 切换展开/折叠；展开态显示前 300 字符结果预览。
+class SubAgentBlock(Static, can_focus=True):
+    """子 Agent 调用的运行中/完成态展示块。"""
+
+    # description 截断上限；超过 60 字符截断保留前 60。
+    _DESC_LIMIT: int = 60
+    # 完成态展开时显示的结果预览字符数。
+    _PREVIEW_LIMIT: int = 300
+
+    def __init__(
+        self, agent_type: str, description: str, **kwargs: Any
+    ) -> None:
+        super().__init__(**kwargs)
+        self._agent_type = agent_type
+        # description 截断到 60 字符，避免状态行过长。
+        self._description = description[: self._DESC_LIMIT]
+        self._output = ""
+        self._is_error = False
+        self._elapsed = 0.0
+        self._tool_count = 0
+        self._collapsed = True
+        self._loading = True
+        self._render_running()
+
+    # 运行中态：品牌色圆点 + agent_type + description + "Running…"。
+    def _render_running(self) -> None:
+        line = f"  ● {self._agent_type}"
+        if self._description:
+            line += f" — {self._description}"
+        line += "  Running…"
+        self.update(line)
+        self.add_class("tool-block-loading")
+
+    # 接收子 Agent 执行结果；解析工具数并切换到完成态。
+    def set_result(self, output: str, is_error: bool, elapsed: float) -> None:
+        self._output = output
+        self._is_error = is_error
+        self._elapsed = elapsed
+        self._tool_count = self._parse_stats(output)
+        self._loading = False
+        self.remove_class("tool-block-loading")
+        if self._is_error:
+            self.add_class("tool-block-error")
+        self._collapsed = True
+        self._render_collapsed()
+
+    # 从子 Agent 输出文本中解析工具调用次数；匹配 "N tool uses" 模式。
+    def _parse_stats(self, output: str) -> int:
+        import re
+
+        match = re.search(r"(\d+)\s+tool\s+uses?", output, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return 0
+        return 0
+
+    # 折叠态：状态符号 + Done + 工具数 + 耗时 + 展开提示。
+    def _render_collapsed(self) -> None:
+        if self._is_error:
+            symbol = "✗"
+        else:
+            symbol = "⎿"
+        parts: list[str] = []
+        if self._tool_count > 0:
+            parts.append(f"{self._tool_count} tool uses")
+        parts.append(f"{self._elapsed:.1f}s")
+        stats = " · ".join(parts)
+        line = f"  {symbol}  Done ({stats})  (ctrl+o to expand)"
+        self.update(line)
+
+    # 展开态：状态符号 + Done + 工具数 + 耗时 + 前 300 字符结果预览。
+    def _render_expanded(self) -> None:
+        if self._is_error:
+            symbol = "✗"
+        else:
+            symbol = "⎿"
+        parts: list[str] = []
+        if self._tool_count > 0:
+            parts.append(f"{self._tool_count} tool uses")
+        parts.append(f"{self._elapsed:.1f}s")
+        stats = " · ".join(parts)
+        header = f"  {symbol}  Done ({stats})"
+        preview = self._output[: self._PREVIEW_LIMIT]
+        if len(self._output) > self._PREVIEW_LIMIT:
+            preview += "…"
+        self.update(f"{header}\n  {preview}")
+
+    # 点击切换展开/折叠；loading 态不响应。
+    def on_click(self) -> None:
+        if self._loading:
+            return
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            self._render_collapsed()
+        else:
+            self._render_expanded()
+
+
 class ChatInput(TextArea):
     """提供 Enter 发送、Shift+Enter 换行、Tab 补全、方向键历史导航的对话输入框。"""
 
@@ -579,6 +692,10 @@ class SeaCodeApp(App[None]):
         sandbox_cfg: SandboxAppConfig | None = None,
         mcp_servers: tuple[MCPServerConfig, ...] | list[MCPServerConfig] | None = None,
         hook_engine: HookEngine | None = None,
+        # batch12：子 Agent 系统；enable_fork 开启 Fork 路径，
+        # enable_verification_agent 加载内置 Verification 子 Agent。
+        enable_fork: bool = False,
+        enable_verification_agent: bool = False,
     ) -> None:
         super().__init__()
         self._providers = tuple(providers)
@@ -617,6 +734,21 @@ class SeaCodeApp(App[None]):
         self._session: Session | None = None
         self._memory_manager: MemoryManager | None = None
         self._instructions_content: str = ""
+        # batch12：子 Agent 系统。AgentLoader 三级搜索 + 热重载；
+        # TaskManager 后台任务状态机 + 通知队列；TraceManager 调用链追踪。
+        # _subagent_task 跟踪前台运行中的子 Agent（用于 ESC adopt_running）；
+        # _notification_polling_task 每 2 秒轮询完成的后台任务并注入通知。
+        # _ask_user_tool 持有 AskUserTool 引用供 _pending_event 检查；
+        # _enable_fork / _enable_verification_agent 由构造参数注入。
+        self._enable_fork = enable_fork
+        self._enable_verification_agent = enable_verification_agent
+        self.agent_loader: AgentLoader | None = None
+        self.task_manager: TaskManager | None = None
+        self.trace_manager: TraceManager | None = None
+        self._subagent_task: asyncio.Task[Any] | None = None
+        self._notification_polling_task: asyncio.Task[None] | None = None
+        self._ask_user_tool: AskUserTool | None = None
+        self._agent_tool: AgentTool | None = None
         # batch09：本地命令框架。registry 集中注册 11 条内置命令；
         # CompletionPopup 在 compose 中挂载到 input-area，由 ChatInput 触发显示/隐藏。
         # _agent 保存当前回合 Agent 引用，供命令路径访问（首次回合前为 None）。
@@ -749,6 +881,52 @@ class SeaCodeApp(App[None]):
             self._memory_manager = None
             self._session_manager = None
             self._session = None
+        # batch12：装配子 Agent 系统。AgentLoader 三级搜索 + 热重载；
+        # TaskManager 后台任务状态机；TraceManager 调用链追踪。
+        # AgentTool / AskUserTool 注入到 ToolRegistry；/tasks /trace 注册到命令注册中心。
+        # 失败不阻断启动——子 Agent 能力降级为不可用，但 Provider 仍可正常对话。
+        try:
+            self.agent_loader = AgentLoader(
+                Path(work_dir),
+                enable_verification=self._enable_verification_agent,
+            )
+            self.task_manager = TaskManager()
+            self.trace_manager = TraceManager()
+            # AgentTool 的 parent_agent 在 _run_turn 中刷新为当前回合 Agent；
+            # 此处传 None 仅作占位，execute 调用时由 agent 传入真实 parent_agent。
+            self._agent_tool = AgentTool(
+                agent_loader=self.agent_loader,
+                task_manager=self.task_manager,
+                trace_manager=self.trace_manager,
+                parent_agent=None,
+                enable_fork=self._enable_fork,
+                provider_config=provider,
+            )
+            self._ask_user_tool = AskUserTool()
+            self._tool_registry.register(self._agent_tool)
+            self._tool_registry.register(self._ask_user_tool)
+            # /tasks /trace 命令注册；lead_agent_id 在 _run_turn 中刷新。
+            self._command_registry.register_sync(
+                create_tasks_command(self.task_manager)
+            )
+            self._command_registry.register_sync(
+                create_trace_command(self.trace_manager, lead_agent_id=None)
+            )
+        except Exception:
+            self.agent_loader = None
+            self.task_manager = None
+            self.trace_manager = None
+            self._agent_tool = None
+            self._ask_user_tool = None
+        # 启动后台任务通知轮询；on_unmount 时取消。
+        if self.task_manager is not None and self._notification_polling_task is None:
+            try:
+                self._notification_polling_task = asyncio.create_task(
+                    self._start_notification_polling()
+                )
+            except RuntimeError:
+                # 事件循环尚未启动（如测试环境）；on_mount 会再次尝试。
+                self._notification_polling_task = None
         self.query_one("#chat-area").display = True
         self.query_one("#input-area").display = True
         if len(self._providers) > 1:
@@ -899,6 +1077,28 @@ class SeaCodeApp(App[None]):
             lines.append(f"- {name}: {desc}")
         return "\n".join(lines)
 
+    # batch12：拼装子 Agent 目录摘要文本，注入环境上下文让模型感知可用子 Agent。
+    # 含 ## Available Sub-Agent Types 标题、可用列表与"不要 wait/sleep/poll"提醒；
+    # enable_fork 时追加 fork 子 Agent 条目；空 loader 返回空字符串。
+    def _build_agent_catalog_text(self) -> str:
+        if self.agent_loader is None:
+            return ""
+        agents = self.agent_loader.list_agents()
+        if not agents and not self._enable_fork:
+            return ""
+        lines = ["## Available Sub-Agent Types"]
+        for agent_type, when_to_use in agents:
+            lines.append(f"- {agent_type}: {when_to_use}")
+        if self._enable_fork:
+            lines.append(
+                "- fork: 继承父对话历史的 fork 子 Agent（默认后台执行）"
+            )
+        lines.append("")
+        lines.append(
+            "注意：后台任务完成后会自动通知主对话，不要 wait/sleep/poll。"
+        )
+        return "\n".join(lines)
+
     # batch10：返回 register_skill_commands 的闭包回调。
     # InstallSkill 安装成功与 /skill reload 时调用，重新注册所有 Skill 为斜杠命令。
     def _make_skill_register_callback(self) -> Callable[[], None]:
@@ -1000,13 +1200,46 @@ class SeaCodeApp(App[None]):
         input_widget.focus()
 
     # ESC 取消正在进行的回合；权限对话框活动时由对话框处理（拒绝），不取消整个回合。
-    def action_cancel(self) -> None:
+    # batch12：若有前台运行中的子 Agent 任务，先尝试 adopt_running 切换为后台；
+    # 否则走原有 Agent Loop 取消路径。
+    async def action_cancel(self) -> None:
         if self._pending_permission is not None:
             return
+        # 前台子 Agent 任务切换为后台；adopt_running 返回 task_id 后清空引用。
+        if (
+            self._subagent_task is not None
+            and not self._subagent_task.done()
+            and self.task_manager is not None
+        ):
+            try:
+                # adopt_running 接收 agent 引用；_subagent_task 这里持 asyncio.Task，
+                # 取其内部 agent（通过 getattr 兼容包装）。
+                sub_agent = getattr(self._subagent_task, "_sub_agent", None)
+                if sub_agent is not None:
+                    task_id = await self.task_manager.adopt_running(
+                        sub_agent,
+                        task_description="background task",
+                        partial_result=getattr(sub_agent, "last_output", "") or "",
+                        name="foreground-to-background",
+                    )
+                    await self._show_system_message(
+                        f"Task moved to background (id: {task_id})"
+                    )
+                    self._subagent_task = None
+                    return
+            except Exception:
+                # adopt_running 失败时回退到原有取消路径。
+                pass
         if self._streaming and self._agent_task is not None:
             self._agent_task.cancel()
 
+    # batch12：判断工具名是否为子 Agent 调度工具（Agent）。
+    # 用于 ToolUseEvent 分发到 SubAgentBlock 渲染路径。
+    def _is_subagent_tool(self, tool_name: str) -> bool:
+        return tool_name == "Agent"
+
     # ctrl+o 切换当前回合 ToolGroupSummary 的展开/折叠，并同步隐藏工具块的显示。
+    # batch12：同时切换 SubAgentBlock 的展开/折叠。
     def action_toggle_tool_blocks(self) -> None:
         for summary in self.query(ToolGroupSummary):
             summary.toggle()
@@ -1017,6 +1250,10 @@ class SeaCodeApp(App[None]):
             for block in parent.query(ToolCallBlock):
                 if block.tool_name in COLLAPSIBLE_TOOLS:
                     block.display = expanded
+        # SubAgentBlock 的展开/折叠独立切换；loading 态不响应。
+        for sub_block in self.query(SubAgentBlock):
+            if not sub_block._loading:
+                sub_block.on_click()
 
     # Shift+Tab 循环切换权限模式：default → acceptEdits → plan → YOLO → default。
     def action_cycle_mode(self) -> None:
@@ -1052,6 +1289,26 @@ class SeaCodeApp(App[None]):
         except Exception:
             pass
 
+    # batch12：AskUser 表单提交回复：回填 future 让 AskUserTool.execute 继续，
+    # 移除表单组件并恢复 #chat-input 焦点。
+    async def on_inline_ask_user_widget_responded(
+        self, event: InlineAskUserWidget.Responded
+    ) -> None:
+        # future 已在 widget 提交时回填；此处只负责清理 UI 与恢复焦点。
+        try:
+            widget = self.query_one("#askuser-form")
+            if widget is not None:
+                # 找到父 InlineAskUserWidget 并移除。
+                parent = widget.parent
+                if parent is not None:
+                    await parent.remove()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            self.query_one(ChatInput).focus()
+        except Exception:
+            pass
+
     # 执行一条完整 Agent Loop 回合，消费 AgentEvent 流并管理 TUI 展示与取消。
     async def _run_turn(self, text: str) -> None:
         client = self._client
@@ -1081,7 +1338,9 @@ class SeaCodeApp(App[None]):
         answer = ""
         thinking_widget: Static | None = None
         thinking = ""
-        tool_blocks: dict[str, ToolCallBlock] = {}
+        # batch12：tool_blocks 同时容纳 ToolCallBlock 与 SubAgentBlock；
+        # SubAgentBlock 用于 "Agent" 工具调用，ToolCallBlock 用于其它工具。
+        tool_blocks: dict[str, ToolCallBlock | SubAgentBlock] = {}
         total_input = 0
         total_output = 0
 
@@ -1109,6 +1368,18 @@ class SeaCodeApp(App[None]):
             self._load_skill_tool.set_agent(agent)
             agent.set_skill_loader(self._skill_loader)
             agent.set_skill_catalog(self._build_skill_catalog_text())
+            # batch12：注入子 Agent 目录摘要与完整工具注册表引用。
+            # set_agent_catalog 让 agent.run 把 ## Available Sub-Agent Types 段落注入环境上下文；
+            # set_full_registry 让 AgentTool 在 fork/定义式路径克隆或过滤父 Agent 工具集。
+            # AgentTool.parent_agent 也在此刷新为当前回合 Agent（execute 时仍由 agent 传入覆盖）。
+            if self.agent_loader is not None:
+                agent.set_agent_catalog(
+                    self._build_agent_catalog_text(),
+                    self.agent_loader.list_agents(),
+                )
+            agent.set_full_registry(self._tool_registry)
+            if self._agent_tool is not None:
+                self._agent_tool.parent_agent = agent
             # 同步当前会话 ID 给 Agent，仅用于压缩摘要里的 transcript_path 提示。
             if self._session is not None:
                 agent.session_id = self._session.session_id
@@ -1133,18 +1404,47 @@ class SeaCodeApp(App[None]):
                     thinking_widget.update(Text(f"Thinking\n{thinking}"))
                     chat.scroll_end(animate=False)
                 elif isinstance(event, ToolUseEvent):
-                    block = ToolCallBlock(event.tool_name, event.arguments)
+                    # batch12：Agent 工具调用用 SubAgentBlock 呈现；其它工具用 ToolCallBlock。
+                    if self._is_subagent_tool(event.tool_name):
+                        agent_type = event.arguments.get("subagent_type", "") or "agent"
+                        description = event.arguments.get("description", "")
+                        block: ToolCallBlock | SubAgentBlock = SubAgentBlock(
+                            agent_type=agent_type, description=description
+                        )
+                    else:
+                        block = ToolCallBlock(event.tool_name, event.arguments)
                     tool_blocks[event.tool_id] = block
                     await ai_row.mount(block)
                     chat.scroll_end(animate=False)
                 elif isinstance(event, ToolResultEvent):
                     result_block = tool_blocks.get(event.tool_id)
                     if result_block is not None:
-                        result_block.set_result(
-                            ToolResult(content=event.output, is_error=event.is_error),
-                            event.elapsed,
-                        )
+                        # batch12：SubAgentBlock 与 ToolCallBlock 接口不同，按类型分发。
+                        if isinstance(result_block, SubAgentBlock):
+                            result_block.set_result(
+                                output=event.output,
+                                is_error=event.is_error,
+                                elapsed=event.elapsed,
+                            )
+                        else:
+                            result_block.set_result(
+                                ToolResult(
+                                    content=event.output, is_error=event.is_error
+                                ),
+                                event.elapsed,
+                            )
                     chat.scroll_end(animate=False)
+                    # batch12：AskUserTool 执行后检查 _pending_event 挂起 InlineAskUserWidget。
+                    if (
+                        self._ask_user_tool is not None
+                        and self._ask_user_tool._pending_event is not None
+                    ):
+                        widget: InlineAskUserWidget | InlinePermissionWidget = InlineAskUserWidget(
+                            self._ask_user_tool._pending_event.questions,
+                            self._ask_user_tool._pending_event.future,
+                        )
+                        await chat.mount(widget)
+                        chat.scroll_end(animate=False)
                 elif isinstance(event, RetryEvent):
                     await self._show_system_message(f"↻ Retrying: {event.reason}")
                 elif isinstance(event, UsageEvent):
@@ -1187,9 +1487,13 @@ class SeaCodeApp(App[None]):
                     await self._append_error(event.message)
                 elif isinstance(event, TurnComplete):
                     # 可折叠工具 >=2 个时 mount 摘要并隐藏工具块。
+                    # batch12：只对 ToolCallBlock 应用折叠逻辑；SubAgentBlock 不参与。
                     collapsible = [
-                        (tid, blk) for tid, blk in tool_blocks.items()
-                        if blk.tool_name in COLLAPSIBLE_TOOLS and not blk._loading
+                        (tid, blk)
+                        for tid, blk in tool_blocks.items()
+                        if isinstance(blk, ToolCallBlock)
+                        and blk.tool_name in COLLAPSIBLE_TOOLS
+                        and not blk._loading
                     ]
                     if len(collapsible) >= 2:
                         total_elapsed = sum(blk._elapsed for _, blk in collapsible)
@@ -1438,7 +1742,11 @@ class SeaCodeApp(App[None]):
     # 应用退出时关闭当前 session 文件句柄，避免句柄泄露。
     # batch11：触发 shutdown 事件；用 ensure_future 后台执行，避免 on_unmount
     # 等待 Hook 完成（shutdown Hook 异常由 _run_single 兜底捕获记 warning）。
+    # batch12：取消后台任务通知轮询协程，避免退出后仍尝试访问已关闭的对话历史。
     def on_unmount(self) -> None:
+        if self._notification_polling_task is not None:
+            self._notification_polling_task.cancel()
+            self._notification_polling_task = None
         if self._hook_engine is not None:
             try:
                 asyncio.ensure_future(self._trigger_shutdown_hooks())
@@ -1469,3 +1777,46 @@ class SeaCodeApp(App[None]):
             output = output[:200] + "…"
         line = f"Hook [{notification.hook_id}] {status} {output}"
         await self._show_system_message(line)
+
+    # -----------------------------------------------------------------
+    # batch12：子 Agent 后台任务通知轮询
+    # -----------------------------------------------------------------
+
+    # 后台任务通知轮询循环：每 2 秒检查一次是否有已完成的后台任务。
+    # 流式回合期间跳过避免与活动 Agent Loop 竞争对话历史；
+    # 检测到完成任务时注入 <task-notification> 并触发新一轮 Agent Loop。
+    async def _start_notification_polling(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(2)
+                # 流式回合期间不处理通知，避免与活动 Agent Loop 竞争对话历史。
+                if self._streaming:
+                    continue
+                if self.task_manager is None:
+                    continue
+                await self._process_task_notifications()
+        except asyncio.CancelledError:
+            # on_unmount 取消时静默退出。
+            return
+
+    # 处理已完成的后台任务：注入 <task-notification> 到主对话，
+    # 渲染状态行提示用户，并触发新一轮 Agent Loop 让模型基于通知回复。
+    async def _process_task_notifications(self) -> None:
+        if self.task_manager is None:
+            return
+        completed = self.task_manager.poll_completed()
+        if not completed:
+            return
+        # 把 <task-notification> XML 块以 user message 注入主对话。
+        inject_task_notifications(self._conversation, completed)
+        # 在对话区渲染状态行提示用户后台任务完成。
+        for task in completed:
+            icon = "✓" if task.status == "completed" else "✗"
+            await self._show_system_message(
+                f"{icon} 后台任务完成: [{task.id}] {task.name} — {task.status}"
+            )
+        # 触发新一轮 Agent Loop 让模型基于通知回复；
+        # 用空 user message 占位（实际通知已注入到对话历史）。
+        if self._client is not None and not self._streaming:
+            self._streaming = True
+            self._agent_task = asyncio.create_task(self._run_turn(""))
