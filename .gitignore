@@ -3,6 +3,11 @@
 /.seacode/config.local.yaml
 # 本地权限规则文件可被 Agent 写入，不能进入版本控制。
 /.seacode/permissions.local.yaml
+# 运行时生成的会话、记忆、历史与锁文件，不进入版本控制。
+/.seacode/sessions/
+/.seacode/memory/
+/.seacode/history
+/.seacode/history.*
 
 __pycache__/
 *.py[cod]
