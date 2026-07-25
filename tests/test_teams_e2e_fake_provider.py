@@ -100,12 +100,8 @@ async def test_send_message_and_drain_lead_mailbox(
         is_active=None,
     )
     mgr.register_member("demo", member)
-    # lead agent 的 team_name 需设置才能让 SendMessageTool 找到团队。
-    lead.team_name = "demo"
-
-    # alice 发消息给 lead。
-    send_tool = SendMessageTool(lead, mgr)
-    lead.agent_id = alice_id  # 模拟 alice 为发送者
+    # alice 发消息给 lead；SendMessageTool 直接绑定 alice 身份。
+    send_tool = SendMessageTool(mgr, "demo", alice_id, "alice")
     result = await send_tool.execute(
         SendMessageParams(
             to="lead",

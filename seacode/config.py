@@ -41,6 +41,9 @@ class ProviderConfig:
     # 0 表示"未设置" — get_context_window() 通过四层 fallback 解析真实窗口大小。
     # 正数表示配置文件里显式指定的覆盖值（最高优先级）。
     context_window: int = 0
+    # 单回合最大输出 token 数；0 表示"未设置"，由 client 内部默认值兜底。
+    # 显式配置（正数）会覆盖默认值，用于精细控制长输出场景的 token 上限。
+    max_output_tokens: int = 0
     # 运行时 cache，存放从 provider 的 /v1/models 端点自动拉取的 context window
     # （get_context_window 的第 2 层）。通过 set_fetched_context_window() 写入一次；
     # 0 表示"尚未拉取"。不参与相等比较与哈希，避免缓存更新影响身份判断。
@@ -51,6 +54,12 @@ class ProviderConfig:
         if self.api_key:
             return self.api_key
         return os.environ.get(_ENV_KEY_NAMES[self.protocol], "")
+
+    # 返回配置或默认的最大输出 token 数；未配置时回退到 8192。
+    def get_max_output_tokens(self) -> int:
+        if self.max_output_tokens > 0:
+            return self.max_output_tokens
+        return 8192
 
     # 记录从 provider 自动拉取到的 context window（第 2 层）。
     # 非正数会被忽略，这样一次失败的拉取就不会污染 cache。
@@ -356,6 +365,13 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
             f"Provider #{index + 1} field context_window must be a non-negative integer: {path}"
         )
 
+    # max_output_tokens 为可选正整数；0 或缺失表示由 client 内部默认值兜底。
+    max_output_tokens = raw.get("max_output_tokens", 0)
+    if not isinstance(max_output_tokens, int) or max_output_tokens < 0:
+        raise ConfigError(
+            f"Provider #{index + 1} field max_output_tokens must be a non-negative integer: {path}"
+        )
+
     return ProviderConfig(
         name=values["name"],
         protocol=protocol,
@@ -364,6 +380,7 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
         api_key=values["api_key"],
         thinking=thinking,
         context_window=context_window,
+        max_output_tokens=max_output_tokens,
     )
 
 

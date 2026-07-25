@@ -142,7 +142,7 @@ class AgentTeam:
             return None
 
 
-# 把任意名字清洗为安全 slug：非 [a-zA-Z0-9_-] 替换为 '-'，连续 '-' 合并，空串回退 "team"。
+# 把任意名字规整为安全 slug：非 [a-zA-Z0-9_-] 替换为 '-'，连续 '-' 合并，空串回退 "team"。
 def _sanitize_name(name: str) -> str:
     if not name:
         return "team"

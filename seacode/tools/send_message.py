@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 from seacode.teams.mailbox import create_message
-from seacode.teams.manager import TeamManager
 from seacode.teams.registry import AgentNameRegistry
 from seacode.tools.base import Tool, ToolCategory, ToolResult
+
+if TYPE_CHECKING:
+    from seacode.teams.manager import TeamManager
 
 
 class SendMessageParams(BaseModel):
@@ -33,9 +35,17 @@ class SendMessageTool(Tool):
     # 合法 message_type 集合；非法值返回 is_error。
     VALID_MESSAGE_TYPES = {"text", "shutdown_request", "shutdown_response"}
 
-    def __init__(self, parent_agent: Any, team_manager: TeamManager) -> None:
-        self._parent_agent = parent_agent
+    def __init__(
+        self,
+        team_manager: TeamManager,
+        team_name: str,
+        from_agent_id: str,
+        from_agent_name: str = "",
+    ) -> None:
         self._team_manager = team_manager
+        self._team_name = team_name
+        self._from_agent_id = from_agent_id
+        self._from_agent_name = from_agent_name
 
     async def execute(self, params: BaseModel) -> ToolResult:
         tool_params: SendMessageParams = params  # type: ignore[assignment]
@@ -53,30 +63,29 @@ class SendMessageTool(Tool):
                 content="text 消息必须提供 summary", is_error=True
             )
 
-        # 优先用 parent_agent.team_name，回退到 team_manager 反查。
-        team_name = (
-            getattr(self._parent_agent, "team_name", None)
-            or self._team_manager.get_team_for_teammate(self._parent_agent.agent_id)
-            or ""
-        )
-        if not team_name:
-            return ToolResult(content="未找到当前团队", is_error=True)
+        team = self._team_manager.get_team(self._team_name)
+        if team is None:
+            return ToolResult(
+                content=f"团队不存在: {self._team_name}", is_error=True
+            )
 
-        mailbox = self._team_manager.get_mailbox(team_name)
-        from_agent = self._parent_agent.agent_id
+        mailbox = self._team_manager.get_mailbox(self._team_name)
+        if mailbox is None:
+            return ToolResult(
+                content=f"邮箱不存在: {self._team_name}", is_error=True
+            )
+
+        from_agent = self._from_agent_id
 
         if tool_params.to == "*":
             # 广播：排除发送者；非 lead 发送时带 lead。
-            team = self._team_manager.get_team(team_name)
-            if team is None:
-                return ToolResult(content="团队不存在", is_error=True)
             recipients = [
                 m.agent_id for m in team.members if m.agent_id != from_agent
             ]
             if from_agent != team.lead_agent_id:
                 recipients.append(team.lead_agent_id)
             msg = create_message(
-                from_agent=from_agent,
+                from_agent=self._from_agent_name or from_agent,
                 to_agent="*",
                 content=tool_params.message,
                 summary=tool_params.summary,
@@ -92,7 +101,7 @@ class SendMessageTool(Tool):
                     content=f"未知名称: {tool_params.to}", is_error=True
                 )
             msg = create_message(
-                from_agent=from_agent,
+                from_agent=self._from_agent_name or from_agent,
                 to_agent=agent_id,
                 content=tool_params.message,
                 summary=tool_params.summary,
@@ -106,15 +115,15 @@ class SendMessageTool(Tool):
                     content=f"写入邮箱失败: {e}", is_error=True
                 )
             # pane 后端唤醒：in-process 无需唤醒。
-            self._wake_pane(team_name, tool_params.to)
+            self._wake_pane(tool_params.to)
 
         return ToolResult(
             content=f"消息已发送给 {tool_params.to}", is_error=False
         )
 
     # 唤醒 pane 后端的 teammate；in-process 后端无 pane_id 时跳过。
-    def _wake_pane(self, team_name: str, member_name: str) -> None:
-        pane_id = self._team_manager.get_pane_id(team_name, member_name)
+    def _wake_pane(self, member_name: str) -> None:
+        pane_id = self._team_manager.get_pane_id(self._team_name, member_name)
         if pane_id:
             try:
                 from seacode.teams.spawn_tmux import send_keys_to_pane

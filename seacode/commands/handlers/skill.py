@@ -35,12 +35,14 @@ async def handle_skill(ctx: CommandContext) -> None:
         if skill is None:
             ctx.ui.add_system_message(f"未知 Skill：{arg}")
             return
+        source = loader.get_source_label(arg)
         text = (
             f"name: {skill.name}\n"
             f"description: {skill.description}\n"
             f"mode: {skill.mode}\n"
             f"context: {skill.context}\n"
             f"model: {skill.model or 'default'}\n"
+            f"source: {source}\n"
             f"source_path: {skill.source_path}\n"
             f"is_directory: {skill.is_directory}"
         )
@@ -62,13 +64,13 @@ async def handle_skill(ctx: CommandContext) -> None:
         )
 
 
-# 命令定义：LOCAL 类型，管理命令本身是本地操作。
+# 命令定义：LOCAL 类型，管理命令本身是本地操作；/skills 是 /skill 的别名。
 SKILL_COMMAND = Command(
     name="skill",
     description="Skill 管理（list / info / reload）",
     type=CommandType.LOCAL,
     handler=handle_skill,
-    aliases=[],
+    aliases=["skills"],
     usage="/skill [list|info|reload]",
     arg_prompt="子命令",
 )

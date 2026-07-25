@@ -245,9 +245,18 @@ class AgentTool(Tool):
 
         # 前台同步路径：直接 await run_to_completion 并把结果回灌。
         if not is_background:
-            result_text = await sub_agent.run_to_completion(
-                params.prompt, conversation=fork_conversation
-            )
+            try:
+                result_text = await sub_agent.run_to_completion(
+                    params.prompt, conversation=fork_conversation
+                )
+            except Exception as e:
+                log.error("子 Agent 执行失败: %s", e)
+                self.trace_manager.complete(
+                    trace_node.agent_id, status="failed"
+                )
+                return ToolResult(
+                    content=f"子 Agent 执行失败: {e}", is_error=True
+                )
             self.trace_manager.update(
                 trace_node.agent_id,
                 input_tokens=getattr(sub_agent, "total_input_tokens", 0),
@@ -431,12 +440,23 @@ class AgentTool(Tool):
         # 第 3 步：选 LLM；按 agent_def.model 或父 Agent client。
         client = self._select_llm(params, agent_def, parent_agent)
 
-        # 第 4 步：build_teammate_tools 按后端过滤工具集。
+        # 第 4 步：build_teammate_tools 按后端过滤工具集并实例化绑定身份的协调工具。
+        # 传入 teammate_agent 的 agent_id 与 teammate_name，让协调工具绑定正确身份。
         backend = self.team_manager.detect_backend("", True)
         parent_registry = getattr(parent_agent, "_full_registry", None)
         if parent_registry is None:
             parent_registry = parent_agent.registry
-        teammate_registry = build_teammate_tools(parent_registry, backend)
+        # 先生成 agent_id 供 build_teammate_tools 绑定协调工具身份。
+        teammate_agent_id = f"{teammate_name}-{uuid4().hex[:8]}"
+        teammate_registry = build_teammate_tools(
+            parent_registry,
+            self.team_manager,
+            team_name,
+            teammate_agent_id,
+            teammate_name,
+            backend,
+            definition=agent_def,
+        )
 
         # 第 5 步：构造 teammate Agent 并按后端 spawn。
         teammate_agent = Agent(
@@ -447,7 +467,7 @@ class AgentTool(Tool):
             max_iterations=agent_def.max_turns,
             permission_checker=None,  # teammate 在隔离 worktree 中，bypass 权限
             context_window=getattr(parent_agent, "context_window", 200_000),
-            agent_id=f"{teammate_name}-{uuid4().hex[:8]}",
+            agent_id=teammate_agent_id,
             team_name=team_name,
             team_manager=self.team_manager,
         )
@@ -481,16 +501,46 @@ class AgentTool(Tool):
             self.team_manager.register_inprocess_handle(
                 team_name, teammate_name, handle
             )
-        elif backend == BackendType.TMUX:
-            tmux_pane = spawn_tmux_teammate(team_name, teammate_name, wt.path)
-            self.team_manager.register_pane_id(
-                team_name, teammate_name, tmux_pane.pane_id
-            )
-        elif backend == BackendType.ITERM2:
-            iterm_pane = spawn_iterm2_teammate(team_name, teammate_name, wt.path)
-            self.team_manager.register_pane_id(
-                team_name, teammate_name, iterm_pane.session_id
-            )
+        elif backend in (BackendType.TMUX, BackendType.ITERM2):
+            # pane 后端：spawn 前先把初始任务投进队友邮箱，
+            # 新进程启动后第一次空闲轮询就能看到工作。
+            if mailbox is not None and params.prompt:
+                from seacode.teams.mailbox import create_message
+                from seacode.teams.spawn_inprocess import LEAD_NAME
+
+                mailbox.write(
+                    teammate_name,
+                    create_message(
+                        from_agent=LEAD_NAME,
+                        to_agent=teammate_name,
+                        content=params.prompt,
+                        summary="initial task",
+                    ),
+                )
+            try:
+                if backend == BackendType.TMUX:
+                    tmux_pane = spawn_tmux_teammate(
+                        team_name, teammate_name, wt.path
+                    )
+                    self.team_manager.register_pane_id(
+                        team_name, teammate_name, tmux_pane.pane_id
+                    )
+                else:  # BackendType.ITERM2
+                    iterm_pane = spawn_iterm2_teammate(
+                        team_name, teammate_name, wt.path
+                    )
+                    self.team_manager.register_pane_id(
+                        team_name, teammate_name, iterm_pane.session_id
+                    )
+            except Exception as e:
+                log.warning("pane spawn 失败: %s", e)
+                return ToolResult(
+                    content=(
+                        f"pane spawn 失败 ({e})，teammate 未启动。"
+                        "可重试或将 teammate_mode 设为 in-process。"
+                    ),
+                    is_error=True,
+                )
 
         # 第 6 步：注册名字到 AgentNameRegistry 并持久化成员到团队 config。
         AgentNameRegistry.instance().register(
@@ -561,6 +611,13 @@ class AgentTool(Tool):
         )
         # 覆盖 work_dir 到 worktree 路径，让子 Agent 的所有工具调用都在隔离环境内。
         sub_agent.work_dir = wt.path
+        # 同步替换 permission_checker 的 sandbox 根到 worktree 路径，
+        # 避免 sandbox 仍指向父目录导致子 Agent 文件访问越界或被误拦。
+        sub_checker = getattr(sub_agent, "permission_checker", None)
+        if sub_checker is not None:
+            from seacode.permissions.sandbox import PathSandbox
+
+            sub_checker.sandbox = PathSandbox(wt.path)
 
         # 调用链追踪：trace_id 继承父 Agent；agent_id 由 TraceManager 生成。
         parent_trace_id: str = str(

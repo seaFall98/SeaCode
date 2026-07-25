@@ -41,6 +41,15 @@ class TeamCreateTool(Tool):
         tool_params: TeamCreateParams = params  # type: ignore[assignment]
         teammate_mode = getattr(self._config, "teammate_mode", "")
         is_interactive = True
+
+        # 先检测后端；fail-fast，避免团队已创建但 backend 信息缺失的中间态。
+        try:
+            backend = self._team_manager.detect_backend(teammate_mode, is_interactive)
+        except Exception as e:
+            return ToolResult(
+                content=f"后端检测失败: {e}", is_error=True
+            )
+
         try:
             team = await self._team_manager.create_team(
                 tool_params.team_name,
@@ -51,6 +60,9 @@ class TeamCreateTool(Tool):
             )
         except Exception as e:
             return ToolResult(content=f"创建团队失败: {e}", is_error=True)
+
+        # 把 team_manager 挂到 Lead agent 上，供后续 SendMessage 等工具按需取用。
+        self._parent_agent._team_manager = self._team_manager
 
         coordinator_note = ""
         if is_coordinator_mode(
@@ -64,7 +76,6 @@ class TeamCreateTool(Tool):
             self._parent_agent.coordinator_mode = True
             coordinator_note = "\n(coordinator mode 已激活，工具集收敛为调度-only)"
 
-        backend = self._team_manager.detect_backend(teammate_mode, is_interactive)
         return ToolResult(
             content=(
                 f"团队 {team.name} 已创建\n"

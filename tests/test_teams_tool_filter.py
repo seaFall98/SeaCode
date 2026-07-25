@@ -68,8 +68,9 @@ def test_apply_coordinator_filter_empty() -> None:
     assert list(filtered.list_tools()) == []
 
 
-# 验证 build_teammate_tools(IN_PROCESS) 用 IN_PROCESS_TEAMMATE_ALLOWED_TOOLS 过滤。
-# 含 TaskCreate / SendMessage，不含 TeamCreate / TeamDelete。
+# 验证 build_teammate_tools(IN_PROCESS) 用 IN_PROCESS_TEAMMATE_ALLOWED_TOOLS 过滤，
+# 并实例化 5 个绑定身份的协调工具（TaskCreate/Get/List/Update + SendMessage）。
+# 含 ReadFile / EditFile / TaskCreate / SendMessage，不含 TeamCreate / TeamDelete。
 def test_build_teammate_tools_in_process() -> None:
     registry = ToolRegistry()
     registry.register(_FakeTool("ReadFile"))
@@ -79,17 +80,29 @@ def test_build_teammate_tools_in_process() -> None:
     registry.register(_FakeTool("TeamCreate"))
     registry.register(_FakeTool("TeamDelete"))
 
-    filtered = build_teammate_tools(registry, BackendType.IN_PROCESS)
+    # team_manager 用 None；协调工具构造时不访问 team_manager，仅 execute 时才用。
+    filtered = build_teammate_tools(
+        registry,
+        team_manager=None,
+        team_name="t1",
+        agent_id="aid-1",
+        agent_name="alice",
+        backend_type=BackendType.IN_PROCESS,
+    )
     names = {t.name for t in filtered.list_tools()}
     assert "ReadFile" in names
     assert "EditFile" in names
+    # 协调工具由 build_teammate_tools 实例化注册，覆盖父注册表中的同名占位。
     assert "TaskCreate" in names
+    assert "TaskGet" in names
+    assert "TaskList" in names
+    assert "TaskUpdate" in names
     assert "SendMessage" in names
     assert "TeamCreate" not in names
     assert "TeamDelete" not in names
 
 
-# 验证 build_teammate_tools(TMUX) 去掉 TeamCreate/TeamDelete，保留其它。
+# 验证 build_teammate_tools(TMUX) 去掉 TeamCreate/TeamDelete，保留其它 + 协调工具。
 # 含 ReadFile / EditFile / TaskCreate，不含 TeamCreate / TeamDelete。
 def test_build_teammate_tools_tmux() -> None:
     registry = ToolRegistry()
@@ -99,11 +112,22 @@ def test_build_teammate_tools_tmux() -> None:
     registry.register(_FakeTool("TeamCreate"))
     registry.register(_FakeTool("TeamDelete"))
 
-    filtered = build_teammate_tools(registry, BackendType.TMUX)
+    filtered = build_teammate_tools(
+        registry,
+        team_manager=None,
+        team_name="t1",
+        agent_id="aid-1",
+        agent_name="alice",
+        backend_type=BackendType.TMUX,
+    )
     names = {t.name for t in filtered.list_tools()}
     assert "ReadFile" in names
     assert "EditFile" in names
     assert "TaskCreate" in names
+    assert "TaskGet" in names
+    assert "TaskList" in names
+    assert "TaskUpdate" in names
+    assert "SendMessage" in names
     assert "TeamCreate" not in names
     assert "TeamDelete" not in names
 

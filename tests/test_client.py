@@ -184,7 +184,7 @@ async def test_openai_compat_client_uses_chat_completions_protocol() -> None:
 
 
 # 验证 Anthropic 配置只调用 Messages，并在启用时传递 thinking 参数。
-# 最终消息的用量应被统一为 StreamComplete。
+# 最终消息的用量应被统一为 StreamComplete；prompt cache 启用时 user 消息尾部带 cache_control。
 @pytest.mark.asyncio
 async def test_anthropic_client_uses_messages_protocol() -> None:
     delta = SimpleNamespace(type="text_delta", text="Hello")
@@ -197,8 +197,21 @@ async def test_anthropic_client_uses_messages_protocol() -> None:
 
     assert events == [TextDelta("Hello"), StreamComplete(input_tokens=5, output_tokens=3)]
     assert fake.request is not None
-    assert fake.request["messages"] == [{"role": "user", "content": "Hello"}]
-    assert fake.request["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    # 启用 prompt cache 后，最后一条 user 消息的 content 会被改写为带 cache_control 的 list。
+    assert fake.request["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Hello", "cache_control": {"type": "ephemeral"}}
+            ],
+        }
+    ]
+    # test-model 不在 adaptive thinking 名单，budget_tokens = max_output_tokens - 1。
+    assert fake.request["thinking"] == {"type": "enabled", "budget_tokens": 8191}
+    # system prompt 也应该用 list 形式带 cache_control。
+    assert fake.request["system"] == [
+        {"type": "text", "text": "System prompt", "cache_control": {"type": "ephemeral"}}
+    ]
 
 
 # 验证客户端工厂只根据 protocol 创建对应适配器。

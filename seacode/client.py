@@ -157,6 +157,56 @@ def _api_key(config: ProviderConfig) -> str:
     return api_key
 
 
+# 识别支持 adaptive thinking 的 Anthropic 模型（claude-opus-4 / claude-sonnet-4 系列）。
+# adaptive thinking 模型允许 budget_tokens=0 表示"由模型自行决定思考预算"，
+# 旧模型必须显式给正数 budget_tokens（通常用 max_output_tokens - 1）。
+def _supports_adaptive_thinking(model: str) -> bool:
+    m = model.lower()
+    if "claude-opus-4" in m or "claude-sonnet-4" in m:
+        return True
+    if "claude-opus-5" in m or "claude-sonnet-5" in m:
+        return True
+    return False
+
+
+# 给 messages 列表中最后一条 user 消息尾部追加 cache_control 标记，
+# 启用 Anthropic prompt cache 的前缀缓存（多轮对话每轮命中前缀缓存，节省成本）。
+# 原地修改并返回 messages；content 既支持 str 也支持 list[dict]。
+def _mark_last_user_tail_for_cache(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+    # 从末尾向前找最后一条 user 消息。
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") != "user":
+            continue
+        msg = messages[idx]
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = [
+                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            ]
+        elif isinstance(content, list) and content:
+            # 仅给最后一个 block 加标记；已存在 cache_control 时跳过避免重复。
+            last_block = content[-1]
+            if isinstance(last_block, dict) and "cache_control" not in last_block:
+                last_block["cache_control"] = {"type": "ephemeral"}
+        break
+    return messages
+
+
+# 给 tools 列表中最后一个工具 schema 追加 cache_control 标记，
+# 让工具定义也命中前缀缓存（工具集稳定时收益显著）。
+def _mark_last_tool_for_cache(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not tools:
+        return tools
+    last = tools[-1]
+    if isinstance(last, dict) and "cache_control" not in last:
+        last["cache_control"] = {"type": "ephemeral"}
+    return tools
+
+
 # Anthropic /v1/models 拉取上下文窗口的超时秒数；超时不抛异常，降级到下一层。
 ANTHROPIC_MODEL_FETCH_TIMEOUT: float = 3.0
 
@@ -164,10 +214,10 @@ ANTHROPIC_MODEL_FETCH_TIMEOUT: float = 3.0
 class AnthropicClient(LLMClient):
     """通过 Anthropic Messages 协议流式传输文本、思考与工具调用。"""
 
-    # 保存配置并允许测试替换实际 SDK 客户端。
+    # 保存配置并允许测试替换实际 SDK 客户端；max_output_tokens 从配置读取。
     def __init__(self, config: ProviderConfig, client: Any | None = None) -> None:
         self._config = config
-        self._max_output_tokens = 8192
+        self._max_output_tokens = config.get_max_output_tokens()
         self._client = client or AsyncAnthropic(
             api_key=_api_key(config),
             base_url=config.base_url,
@@ -199,16 +249,30 @@ class AnthropicClient(LLMClient):
         system: str,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        # 构造请求：system / tools / messages 都启用 prompt cache，让多轮对话前缀命中缓存。
+        request_messages = build_anthropic_messages(list(messages))
+        _mark_last_user_tail_for_cache(request_messages)
         request: dict[str, Any] = {
             "model": self._config.model,
             "max_tokens": self._max_output_tokens,
-            "messages": build_anthropic_messages(list(messages)),
+            "messages": request_messages,
         }
         if system:
-            request["system"] = system
+            # system prompt 用 list 形式携带 cache_control，命中前缀缓存。
+            request["system"] = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
         if self._config.thinking:
-            request["thinking"] = {"type": "enabled", "budget_tokens": 4096}
+            # adaptive thinking 模型用 budget_tokens=0 表示由模型自决定思考预算；
+            # 旧模型用 max_output_tokens - 1 保证思考与正文有足够空间（至少 1024）。
+            if _supports_adaptive_thinking(self._config.model):
+                request["thinking"] = {"type": "enabled", "budget_tokens": 0}
+            else:
+                budget = max(self._max_output_tokens - 1, 1024)
+                request["thinking"] = {"type": "enabled", "budget_tokens": budget}
         if tools:
+            # tools 列表尾部加 cache_control，让工具定义也命中前缀缓存。
+            _mark_last_tool_for_cache(tools)
             request["tools"] = tools
 
         # 流式工具调用与思考块的累积状态。
@@ -434,10 +498,10 @@ class OpenAIClient(LLMClient):
 class OpenAICompatClient(LLMClient):
     """通过 OpenAI-compatible Chat Completions 协议流式传输文本、思考与工具调用。"""
 
-    # 保存配置并允许测试替换实际 SDK 客户端。
+    # 保存配置并允许测试替换实际 SDK 客户端；max_output_tokens 从配置读取。
     def __init__(self, config: ProviderConfig, client: Any | None = None) -> None:
         self._config = config
-        self._max_output_tokens = 8192
+        self._max_output_tokens = config.get_max_output_tokens()
         self._client = client or AsyncOpenAI(
             api_key=_api_key(config),
             base_url=config.base_url,
@@ -488,19 +552,23 @@ class OpenAICompatClient(LLMClient):
         active_calls: dict[int, dict[str, str]] = {}
         reasoning_accum = ""
         completed = False
+        # finish_reason="tool_calls" 标记：表示模型回合以工具调用结束，
+        # 后续 usage chunk 到达时发 StreamComplete；无 usage chunk 时在循环外兜底。
+        tool_calls_finished = False
 
         try:
             response_stream = await self._client.chat.completions.create(**request)
             async for chunk in response_stream:
                 if not chunk.choices:
                     # 最后一个 chunk 只包含 usage 数据。
-                    if chunk.usage:
+                    if chunk.usage and not completed:
                         details = getattr(chunk.usage, "prompt_tokens_details", None)
                         cache_read = getattr(details, "cached_tokens", 0) or 0 if details else 0
                         prompt_tokens = chunk.usage.prompt_tokens or 0
                         completed = True
+                        # stop_reason 取决于上一阶段是否以 tool_calls 结束。
                         yield StreamComplete(
-                            stop_reason="end_turn",
+                            stop_reason="tool_calls" if tool_calls_finished else "end_turn",
                             input_tokens=max(prompt_tokens - cache_read, 0),
                             output_tokens=chunk.usage.completion_tokens or 0,
                             cache_read=cache_read,
@@ -560,12 +628,36 @@ class OpenAICompatClient(LLMClient):
                                 arguments=args,
                             )
                         active_calls.clear()
+                        # 标记工具调用回合结束；StreamComplete 留给 usage chunk 或循环外兜底，
+                        # 这样能保留 usage chunk 中的 token 计数。
+                        tool_calls_finished = True
                     if choice.finish_reason == "stop" and not completed:
                         completed = True
                         # finish_reason=stop 但无 usage chunk 时，发一个空完成事件。
                         yield StreamComplete(stop_reason="end_turn")
+                    # 兼容 provider（如 DeepSeek）把 usage 与 finish_reason 放在同一 chunk：
+                    # 标准OpenAI 分两个 chunk 发，DeepSeek 合并发送。此处统一在 finish_reason
+                    # chunk 中提取 usage，避免 stream 结束后无 StreamComplete 事件。
+                    if not completed and getattr(chunk, "usage", None):
+                        usage = chunk.usage
+                        details = getattr(usage, "prompt_tokens_details", None)
+                        cache_read = getattr(details, "cached_tokens", 0) or 0 if details else 0
+                        prompt_tokens = usage.prompt_tokens or 0
+                        completed = True
+                        yield StreamComplete(
+                            stop_reason="tool_calls" if tool_calls_finished else "end_turn",
+                            input_tokens=max(prompt_tokens - cache_read, 0),
+                            output_tokens=usage.completion_tokens or 0,
+                            cache_read=cache_read,
+                            cache_creation=0,
+                        )
         except Exception as error:
             raise _normalize_error(error) from error
+
+        # 兜底：finish_reason="tool_calls" 后若无 usage chunk（部分兼容 provider 不发），
+        # 补发一个零 token 的 StreamComplete 让 Agent Loop 正常推进到工具执行阶段。
+        if not completed and tool_calls_finished:
+            yield StreamComplete(stop_reason="tool_calls")
 
         if not completed:
             raise ProtocolError("The compatible chat stream ended without a completion event.")

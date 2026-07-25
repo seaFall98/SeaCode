@@ -6,6 +6,9 @@ from typing import Any
 
 from seacode.skills.parser import SkillDef, substitute_arguments
 
+# fork 上下文 recent 模式保留的最近内容消息条数。
+FORK_RECENT_COUNT = 5
+
 
 class SkillExecutor:
     """执行 Skill：inline 激活后注入主对话；fork 创建独立子 Agent 隔离执行。
@@ -28,7 +31,7 @@ class SkillExecutor:
             recovery_state.record_skill_invocation(skill.name, prompt)
         return prompt
 
-    # fork 执行：替换参数 → 构建上下文 → 创建子 Agent → 收集流式文本。
+    # fork 执行：替换参数 → 记录恢复点 → 构建上下文 → 创建子 Agent → 收集流式文本。
     # 子 Agent 不持有主对话引用，结果作为系统消息返回主对话，不污染主对话历史。
     async def execute_fork(self, skill: SkillDef, args: str = "") -> str:
         # 延迟导入避免与 agent.py 形成循环依赖。
@@ -36,11 +39,20 @@ class SkillExecutor:
         from seacode.conversation import ConversationManager
 
         prompt = substitute_arguments(skill.prompt_body, args)
-        fork_messages = self._build_fork_context(skill.context)
+        # fork 也记录恢复点；按 skill 模板记录，便于压缩时还原 skill 调用链。
+        recovery_state = getattr(self._agent, "recovery_state", None)
+        if recovery_state is not None:
+            recovery_state.record_skill_invocation(skill.name, skill.prompt_body)
 
         fork_conv = ConversationManager()
-        for msg in fork_messages:
-            fork_conv._messages.append(msg)
+        # 按 role 分发到 add_user_message / add_assistant_message，
+        # 走 ConversationManager 封装而非直接操作 _messages，保持封装一致。
+        context_messages = self._build_fork_context(skill.context)
+        for msg in context_messages:
+            if msg.role == "user":
+                fork_conv.add_user_message(msg.content)
+            else:
+                fork_conv.add_assistant_message(msg.content)
         fork_conv.add_user_message(prompt)
 
         # 复用主 Agent 的运行时依赖；permission_checker=None 让子 Agent 工具调用不走 HITL。
@@ -63,7 +75,7 @@ class SkillExecutor:
         return "".join(result_parts)
 
     # 按 context 字段构建 fork 上下文消息列表。
-    # none 空；recent 最近 5 条内容消息（过滤空内容与工具结果）；full 200 字摘要单条 user 消息。
+    # none 空；recent 最近 N 条内容消息（过滤空内容与工具结果）；full 摘要单条 user 消息。
     def _build_fork_context(self, context: str) -> list[Any]:
         from seacode.conversation import Message
 
@@ -83,21 +95,22 @@ class SkillExecutor:
                 if getattr(m, "content", "")
                 and not getattr(m, "tool_results", None)
             ]
-            return filtered[-5:]
+            return filtered[-FORK_RECENT_COUNT:]
 
-        # full（默认与 fallback）：每条消息截断到 200 字符拼成摘要。
-        summaries: list[str] = []
-        for m in messages:
-            content = getattr(m, "content", "") or ""
-            if not content:
-                continue
-            summaries.append(f"- {content[:200]}")
-        if not summaries:
-            return []
-        summary = "\n".join(summaries)
-        return [
-            Message(
-                role="user",
-                content=f"## Previous conversation summary\n\n{summary}",
-            )
+        # full（默认与 fallback）：每条消息截断到 200 字符并带 role 前缀拼成摘要。
+        content_messages = [
+            m
+            for m in messages
+            if getattr(m, "content", "") and not getattr(m, "tool_results", None)
         ]
+        if not content_messages:
+            return []
+        summary_parts: list[str] = []
+        for m in content_messages:
+            prefix = "User" if m.role == "user" else "Assistant"
+            text = m.content[:200]
+            if len(m.content) > 200:
+                text += "..."
+            summary_parts.append(f"{prefix}: {text}")
+        summary = "## Previous conversation summary\n\n" + "\n\n".join(summary_parts)
+        return [Message(role="user", content=summary)]

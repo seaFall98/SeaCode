@@ -1,4 +1,8 @@
-"""模型相关常量与内置映射表，服务于上下文窗口的四层降级解析；并校验 hooks 段结构。"""
+"""模型相关常量与内置映射表，服务于上下文窗口的四层降级解析；并校验 hooks 段结构。
+
+补充运行时校验函数（validate_permission_mode / validate_teammate_mode 等），
+让命令处理器与配置加载层共用同一份校验逻辑，避免分散判断导致的边界漂移。
+"""
 
 from __future__ import annotations
 
@@ -23,6 +27,12 @@ MODEL_CONTEXT_WINDOWS: list[tuple[str, int]] = [
     ("gpt-3.5", 16_385),
     ("claude", 200_000),
 ]
+
+# 允许的 teammate_mode 值；空串表示不启用团队功能。
+# 命令处理器与配置层共用此集合做校验，避免散落字符串比较。
+VALID_TEAMMATE_MODES: frozenset[str] = frozenset(
+    {"", "tmux", "iterm2", "in-process"}
+)
 
 
 def lookup_model_context_window(model: str) -> int:
@@ -81,3 +91,82 @@ def validate_worktree(data: dict[str, Any]) -> Any:
         stale_cleanup_interval=raw_interval,
         stale_cutoff_hours=raw_cutoff,
     )
+
+
+# 校验权限模式字符串是否对应有效 PermissionMode 枚举值。
+# 命令处理器 /permission mode <模式> 与配置层共用此函数；
+# 无效字符串抛 ValueError 让调用方决定如何提示用户。
+def validate_permission_mode(mode: str) -> Any:
+    from seacode.permissions import PermissionMode
+
+    for m in PermissionMode:
+        if m.value == mode:
+            return m
+    valid = ", ".join(m.value for m in PermissionMode)
+    raise ValueError(f"unknown permission mode: {mode!r} (valid: {valid})")
+
+
+# 校验 teammate_mode 字符串是否在允许集合内。
+# 空串表示不启用团队功能；非空必须是 tmux / iterm2 / in-process 之一。
+def validate_teammate_mode(mode: str) -> str:
+    if mode not in VALID_TEAMMATE_MODES:
+        valid = ", ".join(sorted(VALID_TEAMMATE_MODES - {""}))
+        raise ValueError(
+            f"unknown teammate_mode: {mode!r} (valid: '' or {valid})"
+        )
+    return mode
+
+
+# 校验字段值是否为 bool；接受真正的 bool（拒绝 int 子类如 0/1 误传）。
+# name 参数用于错误消息定位字段，便于配置文件调试。
+def validate_bool_field(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean, got {type(value).__name__}")
+    return value
+
+
+# 校验 sandbox 配置段的三个布尔字段；返回归一化后的 dict 供调用方构造 SandboxAppConfig。
+# 缺字段用默认值（全部关闭）；类型非法抛 ValueError。
+def validate_sandbox(data: Any) -> dict[str, bool]:
+    if data is None or not isinstance(data, dict):
+        return {"enabled": False, "auto_allow": False, "network_enabled": False}
+    return {
+        "enabled": validate_bool_field(data.get("enabled", False), "sandbox.enabled"),
+        "auto_allow": validate_bool_field(data.get("auto_allow", False), "sandbox.auto_allow"),
+        "network_enabled": validate_bool_field(
+            data.get("network_enabled", False), "sandbox.network_enabled"
+        ),
+    }
+
+
+# 校验 providers 列表的非空与唯一性；字段级校验由 _parse_provider 完成。
+# 此函数作为 post-parse 校验，确认解析后的 provider 列表满足约束。
+def validate_providers(providers: Any) -> None:
+    if not isinstance(providers, (list, tuple)) or not providers:
+        raise ValueError("providers must be a non-empty list")
+    # name 取自 ProviderConfig.name；getattr 兜底 None 后过滤，避免 sorted 类型不匹配。
+    names: list[str] = [getattr(p, "name", "") or "" for p in providers]
+    if len(names) != len(set(names)):
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        raise ValueError(f"duplicate provider names: {duplicates}")
+
+
+# 校验 MCP 服务器列表的 name 唯一性；字段级校验由 _parse_mcp_server 完成。
+def validate_mcp_servers(servers: Any) -> None:
+    if not isinstance(servers, (list, tuple)):
+        return
+    names: list[str] = [getattr(s, "name", "") or "" for s in servers]
+    if len(names) != len(set(names)):
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        raise ValueError(f"duplicate MCP server names: {duplicates}")
+
+
+# 顶层配置结构校验：确认 raw 是 dict 且含 providers 键。
+# 在 _parse_config 解析前调用，fail-fast 给出清晰错误而不是让后续解析抛模糊异常。
+def validate_config_structure(data: Any) -> None:
+    if not isinstance(data, dict):
+        raise ValueError("configuration root must be a mapping")
+    if "providers" not in data:
+        raise ValueError("configuration requires a 'providers' key")
+    if not isinstance(data["providers"], list) or not data["providers"]:
+        raise ValueError("'providers' must be a non-empty list")

@@ -76,7 +76,7 @@ class TaskManager:
         return task_id
 
     # 后台执行体：fork 路径调用 run_to_completion("", fork_conversation)，
-    # 定义式路径调用 run_to_completion(task)；finally 入通知队列。
+    # 定义式路径调用 run_to_completion(task)；team 模式下进入长驻 follow-up 循环。
     async def _run_background(
         self,
         task_id: str,
@@ -92,6 +92,10 @@ class TaskManager:
                 await agent.run_to_completion(task)
             bg.status = "completed"
             bg.result = getattr(agent, "last_output", "") or ""
+            # team 模式下进入长驻 follow-up 循环：worker 完成初始任务后不立即退出，
+            # 而是发送 idle 通知给 lead，并轮询邮箱等待 lead 下发的后续任务。
+            # 这是 team 协调模式的核心运转机制——让长驻 teammate 可被反复调度。
+            await self._run_team_followup_loop(agent)
         except asyncio.CancelledError:
             bg.status = "cancelled"
             raise
@@ -105,6 +109,56 @@ class TaskManager:
             self._async_tasks.pop(task_id, None)
             # put_nowait 避免在 finally 中 await；队列无界不会阻塞。
             self._notify_queue.put_nowait(task_id)
+
+    # team 模式长驻 follow-up 循环：worker 完成初始任务后发送 idle 通知，
+    # 然后轮询邮箱最多 60 轮（每轮 1 秒）等待 lead 下发的后续任务。
+    # 收到消息时调用 run_to_completion 执行；无消息则继续等待。
+    # 非 team 模式（agent 无 team_name 或 _team_manager）直接返回不阻塞。
+    async def _run_team_followup_loop(self, agent: Any) -> None:
+        team_name = getattr(agent, "team_name", None)
+        team_manager = getattr(agent, "_team_manager", None)
+        if not team_name or not team_manager:
+            return
+        mailbox = team_manager.get_mailbox(team_name)
+        if mailbox is None:
+            return
+        agent_id = getattr(agent, "agent_id", "")
+        # 发送初始 idle 通知，告知 lead 当前 worker 已空闲可接新任务。
+        idle_msg = self._build_idle_notification(agent_id)
+        mailbox.write("lead", idle_msg)
+        # 长驻轮询：最多 60 轮，每轮等 1 秒；收到消息则执行并重新发 idle。
+        for _ in range(60):
+            await asyncio.sleep(1)
+            try:
+                msgs = mailbox.consume(agent_id)
+            except Exception:  # noqa: BLE001 — 邮箱读取失败不退出循环
+                continue
+            if not msgs:
+                continue
+            # 拼接所有消息内容作为新一轮 prompt；summary 优先用于上下文。
+            prompt_parts = [m.content for m in msgs if m.content]
+            if not prompt_parts:
+                continue
+            prompt = "\n\n".join(prompt_parts)
+            try:
+                await agent.run_to_completion(prompt)
+                # 任务完成后重新发 idle，让 lead 知道 worker 可接新任务。
+                mailbox.write("lead", idle_msg)
+            except Exception:  # noqa: BLE001 — follow-up 失败不退出循环
+                # 失败时也发 idle，让 lead 决定是否重试或下发新任务。
+                mailbox.write("lead", idle_msg)
+
+    # 构造 idle 通知消息；lead 收到后可将该 worker 纳入新一轮任务调度。
+    def _build_idle_notification(self, agent_id: str) -> Any:
+        from seacode.teams.mailbox import create_message
+
+        return create_message(
+            from_agent=agent_id,
+            to_agent="lead",
+            content="",
+            summary="idle: ready for next task",
+            message_type="text",
+        )
 
     # 把前台运行中的子 Agent 切换为后台任务；partial_result 是已积累的部分输出。
     async def adopt_running(

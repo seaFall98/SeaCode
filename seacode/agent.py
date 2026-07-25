@@ -464,6 +464,41 @@ class Agent:
     def plan_mode(self) -> bool:
         return self.permission_mode == PermissionMode.PLAN
 
+    # 手动触发 Layer 2 压缩：跳过阈值检查与熔断器直接走压缩流程。
+    # 成功返回 CompactNotification（携带结构化 boundary 供 /compact 持久化），
+    # 失败返回 ErrorEvent；auto_compact 内部已重写 conversation.history，
+    # 调用方下一次 _send_message 会重新捕获 history_cursor，无需手动重置。
+    async def manual_compact(
+        self, conversation: ConversationManager
+    ) -> CompactNotification | ErrorEvent:
+        result = await auto_compact(
+            conversation,
+            self.client,
+            self.context_window,
+            self.session_dir,
+            protocol=self.protocol,
+            manual=True,
+            breaker=self.compact_breaker,
+            recovery=self.recovery_state,
+            tool_schemas=self.registry.get_all_schemas(self.protocol),
+            transcript_path=self._transcript_path,
+        )
+        if isinstance(result, CompactEvent):
+            # 压缩成功后重新注入环境上下文与长期记忆（replace_history 已重置标记）。
+            env_context = build_environment_context(
+                self.work_dir, agent_catalog=self._agent_catalog
+            )
+            conversation.inject_environment(env_context)
+            mem = self.memory_manager.load() if self.memory_manager else ""
+            conversation.inject_long_term_memory(self.instructions_content, mem)
+            return CompactNotification(
+                before_tokens=result.before_tokens,
+                message=f"上下文已压缩（压缩前 {result.before_tokens:,} tokens）",
+                boundary=result.boundary,
+            )
+        # result 为 None（前缀太短）或 str（错误信息），统一转 ErrorEvent。
+        return ErrorEvent(message=result or "压缩失败：对话历史为空或未达到压缩条件")
+
     # batch10：激活 Skill，把 SOP 存入 active_skills 供压缩恢复与 /skill 查看。
     def activate_skill(self, name: str, prompt: str) -> None:
         self.active_skills[name] = prompt

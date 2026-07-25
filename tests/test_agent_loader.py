@@ -254,7 +254,7 @@ def test_loader_builtins_have_null_file_path_and_builtin_source(
     assert explore.source == "builtin"
 
 
-# 验证内置 .md 内容非空（仅做 SeaCode 品牌改名，保留行为约束）。
+# 验证内置 .md 内容非空（采用 SeaCode 品牌身份与 v1 行为约束）。
 # 取 Explore / Plan / general-purpose 三个内置的 system_prompt，断言非空。
 def test_loader_builtins_have_non_empty_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

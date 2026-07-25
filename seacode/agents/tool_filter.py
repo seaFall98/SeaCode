@@ -173,31 +173,67 @@ def apply_coordinator_filter(parent_registry: ToolRegistry) -> ToolRegistry:
     return new_registry
 
 
-# 按后端类型构造 teammate 工具注册表。
-# IN_PROCESS 后端用 IN_PROCESS_TEAMMATE_ALLOWED_TOOLS 白名单；
-# pane 后端（TMUX/ITERM2）保留全量工具但去掉 TeamCreate/TeamDelete，
-# 附加 TEAMMATE_COORDINATION_TOOLS。
+# 按后端类型构造 teammate 工具注册表，并实例化绑定到当前 teammate 的协调工具。
+# IN_PROCESS 后端用 IN_PROCESS_TEAMMATE_ALLOWED_TOOLS 白名单收拢；
+# pane 后端（TMUX/ITERM2）保留全量工具但去掉 TeamCreate/TeamDelete。
+# 随后应用 agent definition 的 tools/disallowed_tools 限制（白名单保留协调工具），
+# 最后实例化 5 个协调工具（TaskCreate/Get/List/Update + SendMessage）注册到注册表，
+# 每个 teammate 拿到的实例绑定自己的 agent_id/team_name/agent_name。
 def build_teammate_tools(
-    parent_registry: ToolRegistry, backend_type: Any
+    parent_registry: ToolRegistry,
+    team_manager: Any,
+    team_name: str,
+    agent_id: str,
+    agent_name: str,
+    backend_type: Any,
+    definition: Any = None,
 ) -> ToolRegistry:
     from seacode.teams.models import BackendType
+    from seacode.tools.send_message import SendMessageTool
+    from seacode.tools.task_create import TaskCreateTool
+    from seacode.tools.task_get import TaskGetTool
+    from seacode.tools.task_list import TaskListTool
+    from seacode.tools.task_update import TaskUpdateTool
 
-    new_registry = ToolRegistry()
+    # 第 1 步：按后端类型从父注册表过滤出基础工具集。
+    filtered: dict[str, Any] = {}
     if backend_type == BackendType.IN_PROCESS:
         for tool in parent_registry.list_tools():
-            if tool.name.startswith("mcp__"):
-                new_registry.register(tool)
-            elif tool.name in IN_PROCESS_TEAMMATE_ALLOWED_TOOLS:
-                new_registry.register(tool)
+            if tool.name.startswith("mcp__") or tool.name in IN_PROCESS_TEAMMATE_ALLOWED_TOOLS:
+                filtered[tool.name] = tool
     else:
-        # pane 后端：去掉 TeamCreate/TeamDelete，保留其它 + 协调工具。
+        # pane 后端：保留全量，仅剥离 TeamCreate/TeamDelete（teammate 不能再建/删团队）。
         for tool in parent_registry.list_tools():
             if tool.name in ("TeamCreate", "TeamDelete"):
                 continue
-            if tool.name.startswith("mcp__"):
-                new_registry.register(tool)
-            elif tool.name in TEAMMATE_COORDINATION_TOOLS:
-                new_registry.register(tool)
-            elif tool.name in ASYNC_AGENT_ALLOWED_TOOLS:
-                new_registry.register(tool)
+            filtered[tool.name] = tool
+
+    # 第 2 步：应用 agent definition 的工具限制。
+    # disallowed_tools 黑名单优先；tools 白名单后置，但协调工具始终保留。
+    if definition is not None:
+        if getattr(definition, "disallowed_tools", None):
+            for name in definition.disallowed_tools:
+                filtered.pop(name, None)
+        if getattr(definition, "tools", None):
+            allowed_set = set(definition.tools) | TEAMMATE_COORDINATION_TOOLS
+            filtered = {
+                name: tool for name, tool in filtered.items() if name in allowed_set
+            }
+
+    # 第 3 步：实例化 5 个协调工具，每个绑定当前 teammate 的身份。
+    # 直接把 team_name / agent_id / agent_name 传给工具构造函数，
+    # 这样 teammate 调用 SendMessage/TaskCreate 时身份正确，消息与任务归属本 teammate。
+    coordination_tools = [
+        TaskCreateTool(team_manager, team_name, agent_name),
+        TaskGetTool(team_manager, team_name),
+        TaskListTool(team_manager, team_name),
+        TaskUpdateTool(team_manager, team_name),
+        SendMessageTool(team_manager, team_name, agent_id, agent_name),
+    ]
+
+    new_registry = ToolRegistry()
+    for tool in filtered.values():
+        new_registry.register(tool)
+    for tool in coordination_tools:
+        new_registry.register(tool)
     return new_registry

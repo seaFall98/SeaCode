@@ -174,8 +174,9 @@ async def test_run_turn_injects_team_manager_and_notification_fn() -> None:
         assert isinstance(notes, list)
 
 
-# 验证 TeamCreate / TeamDelete / SendMessage 工具的 _parent_agent 在 _run_turn 中刷新。
-# 发送消息触发 _run_turn 后，三个工具的 _parent_agent 应为当前回合 Agent。
+# 验证 TeamCreate / TeamDelete 工具的 _parent_agent 在 _run_turn 中刷新；
+# SendMessageTool 改为构造时绑定 from_agent_id/from_agent_name，不再走 _parent_agent 模式。
+# 发送消息触发 _run_turn 后，TeamCreate/TeamDelete 的 _parent_agent 应为当前回合 Agent。
 @pytest.mark.asyncio
 async def test_run_turn_updates_team_tools_parent_agent() -> None:
     client = _FakeClient(
@@ -201,7 +202,8 @@ async def test_run_turn_updates_team_tools_parent_agent() -> None:
         assert send_message is not None
         assert team_create._parent_agent is agent
         assert team_delete._parent_agent is agent
-        assert send_message._parent_agent is agent
+        # SendMessageTool 不再有 _parent_agent；占位实例的 from_agent_id 为空字符串。
+        assert send_message._from_agent_id == ""
 
 
 # ---------------------------------------------------------------------------

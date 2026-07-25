@@ -67,6 +67,120 @@ def _parse_teammate_flags(argv: list[str]) -> tuple[bool, str, str]:
     return (is_teammate, team_name, agent_name)
 
 
+# 解析 -p / --prompt 与 --output-format 命令行标志。
+# 返回 (prompt, output_format)；prompt 为空表示未启用非交互模式。
+# output_format 仅支持 text / json / stream-json，默认 text。
+def _parse_prompt_flags(argv: list[str]) -> tuple[str, str]:
+    prompt = ""
+    output_format = "text"
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-p", "--prompt") and i + 1 < len(argv):
+            prompt = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--output-format" and i + 1 < len(argv):
+            fmt = argv[i + 1]
+            if fmt in ("text", "json", "stream-json"):
+                output_format = fmt
+            i += 2
+            continue
+        i += 1
+    return prompt, output_format
+
+
+# 非交互模式：直接执行 prompt 并把结果输出到 stdout，用于脚本化调用与 CI 集成。
+# 不启动 TUI、不连接 MCP、不加载 Hook；保留权限检查与默认工具集，
+# 让 LLM 仍可调用 ReadFile / Bash 等完成实际任务。
+async def _run_prompt(prompt: str, output_format: str) -> None:
+    from .agent import Agent
+    from .client import create_client
+    from .permissions import PermissionChecker, PermissionMode
+    from .permissions.dangerous import DangerousCommandDetector
+    from .permissions.rules import RuleEngine
+    from .permissions.sandbox import PathSandbox
+    from .tools import create_default_registry
+
+    try:
+        config = load_config()
+    except ConfigError as error:
+        print(f"SeaCode configuration error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+    if not config.providers:
+        print("SeaCode configuration error: no provider configured", file=sys.stderr)
+        raise SystemExit(1)
+
+    provider = config.providers[0]
+    try:
+        client = create_client(provider)
+    except Exception as error:
+        print(f"SeaCode client error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+    # 装配默认工具注册表与权限检查器；sandbox_enabled 关闭让 Bash 走常规确认。
+    # 非交互模式下无法弹 HITL 对话框，因此默认 BYPASS 避免阻塞；
+    # 用户若需严格权限，可在配置中切换 default 模式并配合 allow 规则。
+    registry = create_default_registry()
+    cwd = os.getcwd()
+    sandbox = PathSandbox(project_root=cwd)
+    detector = DangerousCommandDetector()
+    # 三层规则路径：用户级 ~/.seacode/permissions.yaml、项目级 .seacode/permissions.yaml、
+    # 本地级 .seacode/permissions.local.yaml；不存在时该层为空。
+    from pathlib import Path
+
+    home = str(Path.home())
+    rule_engine = RuleEngine(
+        user_rules_path=Path(home) / ".seacode" / "permissions.yaml",
+        project_rules_path=Path(cwd) / ".seacode" / "permissions.yaml",
+        local_rules_path=Path(cwd) / ".seacode" / "permissions.local.yaml",
+    )
+    checker = PermissionChecker(
+        detector=detector,
+        sandbox=sandbox,
+        rule_engine=rule_engine,
+        mode=PermissionMode.BYPASS,
+        sandbox_enabled=False,
+    )
+
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol=provider.protocol,
+        work_dir=os.getcwd(),
+        max_iterations=_read_max_steps(),
+        permission_checker=checker,
+        context_window=provider.get_context_window(),
+    )
+
+    try:
+        result = await agent.run_to_completion(prompt)
+    except Exception as error:
+        print(f"SeaCode run error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+    # text 模式直接打印最终输出；json/stream-json 模式当前仅输出 text 字段，
+    # 完整结构化事件流需后续接入流式回调，本版以满足脚本化调用为主。
+    # Windows 默认 GBK 无法编码 emoji 等 Unicode 字符，强制 stdout 用 UTF-8。
+    try:
+        # TextIO 在类型存根中没有 reconfigure，但 CPython 运行时存在该方法。
+        _reconfigure = getattr(sys.stdout, "reconfigure", None)
+        if _reconfigure is not None:
+            _reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+    if output_format == "json":
+        import json
+
+        print(json.dumps({"text": result}, ensure_ascii=False))
+    else:
+        # text 与 stream-json 当前都按纯文本输出最终结果。
+        sys.stdout.write(result)
+        if not result.endswith("\n"):
+            sys.stdout.write("\n")
+
+
 # batch14：teammate worker 入口；加载 config → 注册 self/lead 名字 → 构造 Agent → spawn。
 # 团队不存在时记 error 退出；任一步失败不抛异常到上层，避免 worker 进程崩溃。
 async def _run_teammate(team_name: str, agent_name: str) -> None:
@@ -108,8 +222,7 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
     registry_inst.register(agent_name, self_agent_id)
     registry_inst.register(LEAD_NAME, team.lead_agent_id)
 
-    # 构造 worker 工具注册表；SendMessageTool 需要 parent_agent 引用。
-    # parent_agent 用 worker agent 自己（执行时由 agent 传入覆盖）。
+    # 构造 worker 工具注册表；SendMessageTool 绑定 team_name / from_agent_id / from_agent_name。
     registry = create_default_registry()
     # 先创建 agent 占位，再注册 SendMessageTool 引用 agent。
     # permission_checker=None 等价于 BYPASS（跳过权限检查），worker 在隔离环境不阻塞。
@@ -135,8 +248,10 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
         permission_mode="bypassPermissions",
     )
     agent._current_definition = teammate_def
-    # 注册 SendMessageTool；parent_agent 为 worker 自己。
-    registry.register(SendMessageTool(agent, team_manager))
+    # 注册 SendMessageTool；team_name / from_agent_id / from_agent_name 直接传入。
+    registry.register(
+        SendMessageTool(team_manager, team_name, self_agent_id, agent_name)
+    )
 
     # spawn in-process teammate；task 为空，worker 启动后等待邮箱消息。
     task = ""
@@ -149,6 +264,12 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
 
 # 加载本地配置并启动交互式终端应用。
 def main() -> None:
+    # 非交互模式优先：-p / --prompt 触发 _run_prompt，直接执行并输出到 stdout。
+    prompt, output_format = _parse_prompt_flags(sys.argv)
+    if prompt:
+        asyncio.run(_run_prompt(prompt, output_format))
+        return
+
     # batch14：teammate worker 入口；--teammate 标志触发 _run_teammate。
     is_teammate, team_name, agent_name = _parse_teammate_flags(sys.argv)
     if is_teammate:
@@ -178,8 +299,9 @@ def main() -> None:
         pass
 
     from .app import SeaCodeApp
+    from .driver import NoAltScreenDriver
 
-    SeaCodeApp(
+    app = SeaCodeApp(
         providers=config.providers,
         max_steps=_read_max_steps(),
         hook_engine=hook_engine,
@@ -187,7 +309,10 @@ def main() -> None:
         # enable_coordinator_mode 开启 Lead 工具收敛与协调者提示词。
         teammate_mode=config.teammate_mode,
         enable_coordinator_mode=config.enable_coordinator_mode,
-    ).run()
+    )
+    # 使用自定义 driver 跳过 alternate screen，让 TUI 输出保留在主终端 scrollback。
+    app.driver_class = NoAltScreenDriver
+    app.run()
 
 
 if __name__ == "__main__":

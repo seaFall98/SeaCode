@@ -15,10 +15,8 @@ from seacode.tools.send_message import SendMessageParams, SendMessageTool
 # 验证 text 消息无 summary 返回 is_error=True。
 @pytest.mark.asyncio
 async def test_send_message_text_requires_summary() -> None:
-    fake_agent = MagicMock()
-    fake_agent.agent_id = "lead-1"
     fake_mgr = MagicMock()
-    tool = SendMessageTool(fake_agent, fake_mgr)
+    tool = SendMessageTool(fake_mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(to="alice", message="hello", summary="")
     result = await tool.execute(params)
     assert result.is_error
@@ -28,10 +26,8 @@ async def test_send_message_text_requires_summary() -> None:
 # 验证非法 message_type 返回 is_error=True。
 @pytest.mark.asyncio
 async def test_send_message_invalid_type() -> None:
-    fake_agent = MagicMock()
-    fake_agent.agent_id = "lead-1"
     fake_mgr = MagicMock()
-    tool = SendMessageTool(fake_agent, fake_mgr)
+    tool = SendMessageTool(fake_mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(
         to="alice", message="hello", summary="s",
         message_type="invalid",
@@ -64,11 +60,7 @@ async def test_send_message_broadcast(
     mgr._teams["demo"] = team
     mailbox = mgr.get_mailbox("demo")
 
-    fake_agent = MagicMock()
-    fake_agent.agent_id = "lead-1"
-    fake_agent.team_name = "demo"
-
-    tool = SendMessageTool(fake_agent, mgr)
+    tool = SendMessageTool(mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(
         to="*", message="hello team", summary="greeting",
     )
@@ -100,11 +92,7 @@ async def test_send_message_single_recipient(
     mgr._teams["demo"] = team
     mailbox = mgr.get_mailbox("demo")
 
-    fake_agent = MagicMock()
-    fake_agent.agent_id = "lead-1"
-    fake_agent.team_name = "demo"
-
-    tool = SendMessageTool(fake_agent, mgr)
+    tool = SendMessageTool(mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(
         to="alice", message="hello alice", summary="greeting",
     )
@@ -131,11 +119,7 @@ async def test_send_message_unknown_name(
     team = AgentTeam(name="demo", lead_agent_id="lead-1")
     mgr._teams["demo"] = team
 
-    fake_agent = MagicMock()
-    fake_agent.agent_id = "lead-1"
-    fake_agent.team_name = "demo"
-
-    tool = SendMessageTool(fake_agent, mgr)
+    tool = SendMessageTool(mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(
         to="nobody", message="hello", summary="s",
     )
@@ -160,11 +144,7 @@ async def test_send_message_no_pane_id_skips_wake(
     team = AgentTeam(name="demo", lead_agent_id="lead-1")
     mgr._teams["demo"] = team
 
-    fake_agent = MagicMock()
-    fake_agent.agent_id = "lead-1"
-    fake_agent.team_name = "demo"
-
-    tool = SendMessageTool(fake_agent, mgr)
+    tool = SendMessageTool(mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(
         to="alice", message="hello", summary="s",
     )
@@ -193,11 +173,7 @@ async def test_send_message_wakes_pane(
     mgr._teams["demo"] = team
     mgr.register_pane_id("demo", "alice", "%5")
 
-    fake_agent = MagicMock()
-    fake_agent.agent_id = "lead-1"
-    fake_agent.team_name = "demo"
-
-    tool = SendMessageTool(fake_agent, mgr)
+    tool = SendMessageTool(mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(
         to="alice", message="hello", summary="s",
     )

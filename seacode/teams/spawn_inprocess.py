@@ -94,8 +94,16 @@ class InProcessTeammateHandle:
         return self.task.done()
 
     @property
-    def result(self) -> str:
-        # 已完成时返回结果字符串；未完成返回空串。
+    def result(self) -> str | None:
+        # 已完成时返回结果字符串；任务异常时返回 None 区分"空完成"与"失败"；
+        # 未完成返回 None。通过 task.exception() 区分失败，不抛异常到调用方。
+        if not self.task.done():
+            return None
+        if self.task.cancelled():
+            return None
+        exc = self.task.exception()
+        if exc is not None:
+            return None
         return self._result
 
     def cancel(self) -> None:
@@ -129,15 +137,30 @@ def spawn_inprocess_teammate(
 
     def _on_event(event: dict[str, Any]) -> None:
         # run_to_completion 的 event_callback 以 dict 形式调用；
-        # 提取 text 更新 last_message，按 tool_calls 计数累加工具调用。
-        text = event.get("text", "")
-        if text:
-            with progress._lock:
-                progress.last_message = text
-        tool_calls = event.get("tool_calls", 0)
-        if tool_calls:
-            for _ in range(tool_calls):
-                progress.record_tool_use("tool", {})
+        # 按 event_type 分发：tool_use 记录真实工具名，usage 记录 token 用量，
+        # stream_text 更新 last_message。对齐主 Agent 的事件协议。
+        event_type = event.get("type")
+        if event_type == "tool_use":
+            tool_name = event.get("toolName", event.get("tool_name", "tool"))
+            args = event.get("args", {})
+            progress.record_tool_use(tool_name, args)
+        elif event_type == "usage":
+            usage = event.get("usage", {})
+            input_tokens = usage.get("inputTokens", usage.get("input_tokens", 0))
+            output_tokens = usage.get("outputTokens", usage.get("output_tokens", 0))
+            # TeammateProgress.token_count 是单一累加值；输入+输出合并计入。
+            progress.record_tokens(input_tokens + output_tokens)
+        elif event_type == "stream_text":
+            text = event.get("text", "")
+            if text:
+                with progress._lock:
+                    progress.last_message = text
+        # 兼容旧事件格式：无 type 字段时回退到 text / tool_calls 提取。
+        elif "text" in event:
+            text = event.get("text", "")
+            if text:
+                with progress._lock:
+                    progress.last_message = text
 
     async def _run() -> str:
         # teammate 主循环：有 mailbox 长驻（执行→idle 通知→等待新任务）；无 mailbox 单次返回。

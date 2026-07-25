@@ -5,13 +5,16 @@ from __future__ import annotations
 import secrets
 
 # 注入到子 Agent 任务文本前的 worktree 上下文通知模板。
+# 强调三点：继承父对话上下文、入向路径翻译、文件副本可能与父级分叉。
 WORKTREE_NOTICE_TEMPLATE = """[WORKTREE CONTEXT]
-You are currently operating in an isolated git worktree.
-- Parent agent working directory: {parent_cwd}
-- Current worktree path: {wt_path}
-- File paths in tool results may be relative to the worktree;
-  translate them when reporting to the parent.
-- Re-read files before editing to ensure you have the latest content.
+You have inherited the parent agent's conversation context.
+You are currently working in an isolated Git Worktree: {wt_path}
+The parent agent's working directory is: {parent_cwd}
+
+IMPORTANT:
+- File paths mentioned in the parent conversation refer to the PARENT directory.
+- You must translate them to your local worktree path before reading or editing.
+- Always re-read files before editing — your copy may differ from the parent's version.
 [/WORKTREE CONTEXT]"""
 
 

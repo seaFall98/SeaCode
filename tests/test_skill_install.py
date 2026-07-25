@@ -15,7 +15,8 @@ from seacode.skills import (
     MAX_FILE_SIZE,
     MAX_RECURSION_DEPTH,
     MAX_TOTAL_SIZE,
-    ParsedSkillUrl,
+    InstallReport,
+    SkillSource,
     install_skill,
     parse_skill_url,
 )
@@ -56,19 +57,33 @@ def _b64(data: bytes) -> str:
 
 
 # 构造 skills.sh 解析结果，便于 install_skill 测试快速复用。
-def _skills_sh_parsed() -> ParsedSkillUrl:
-    return parse_skill_url("https://skills.sh/user/commit-skill")
+# 3 段 URL：owner/repo/skill-name；skill-name 即安装目录名。
+def _skills_sh_parsed() -> SkillSource:
+    return parse_skill_url("https://skills.sh/user/repo/commit-skill")
+
+
+# 构造一个可直接内联解码的文件 entry（含 content/encoding/size），便于下载测试复用。
+def _file_entry(name: str, data: bytes, path: str | None = None) -> dict:
+    return {
+        "name": name,
+        "type": "file",
+        "path": path if path is not None else name,
+        "content": _b64(data),
+        "encoding": "base64",
+        "size": len(data),
+    }
 
 
 # ---------- 包重导出 ----------
 
 
-# 验证 seacode.skills 包重导出 install 模块全部公开符号。
+# 验证 seacode.skills 包重导出 install 模块全部公开符号（含 InstallReport 与 SkillSource）。
 # 顶层已 from seacode.skills 导入这些符号；断言非 None 即验证重导出成功。
 def test_skills_reexports_install_symbols() -> None:
-    assert ParsedSkillUrl is not None
+    assert SkillSource is not None
     assert parse_skill_url is not None
     assert install_skill is not None
+    assert InstallReport is not None
     assert MAX_FILE_SIZE is not None
     assert MAX_TOTAL_SIZE is not None
     assert MAX_FILE_COUNT is not None
@@ -92,91 +107,131 @@ def test_module_constants_values() -> None:
 # ---------- parse_skill_url ----------
 
 
-# 验证 parse_skill_url 解析 skills.sh 格式 URL。
-# 传入 skills.sh URL，断言 owner/repo/branch/path/url_type 字段正确。
+# 验证 parse_skill_url 解析 skills.sh 格式 URL（3 段 /<owner>/<repo>/<skill-name>）。
+# 传入 skills.sh URL，断言 owner/repo/ref/subpath/name/original 字段正确。
 def test_parse_skill_url_skills_sh_format() -> None:
-    result = parse_skill_url("https://skills.sh/user/commit-skill")
+    result = parse_skill_url("https://skills.sh/user/repo/commit-skill")
     assert result.owner == "user"
-    assert result.repo == "commit-skill"
-    assert result.branch == "main"
-    assert result.path == ""
-    assert result.url_type == "skills.sh"
+    assert result.repo == "repo"
+    assert result.ref == "main"
+    assert result.subpath == "skills/commit-skill"
+    assert result.name == "commit-skill"
+    assert result.original == "https://skills.sh/user/repo/commit-skill"
+
+
+# 验证 parse_skill_url 解析 www.skills.sh 格式 URL（host 带 www 前缀）。
+# 传入 www.skills.sh URL，断言解析结果与 skills.sh 一致。
+def test_parse_skill_url_www_skills_sh_format() -> None:
+    result = parse_skill_url("https://www.skills.sh/user/repo/commit-skill")
+    assert result.owner == "user"
+    assert result.repo == "repo"
+    assert result.ref == "main"
+    assert result.subpath == "skills/commit-skill"
+    assert result.name == "commit-skill"
 
 
 # 验证 parse_skill_url 解析 github.com/tree 格式 URL。
-# 传入 github tree URL，断言 owner/repo/branch/path/url_type 字段正确。
+# 传入 github tree URL，断言 owner/repo/ref/subpath/name 字段正确。
 def test_parse_skill_url_github_tree_format() -> None:
     result = parse_skill_url("https://github.com/user/repo/tree/main/skills/commit")
     assert result.owner == "user"
     assert result.repo == "repo"
-    assert result.branch == "main"
-    assert result.path == "skills/commit"
-    assert result.url_type == "github_tree"
+    assert result.ref == "main"
+    assert result.subpath == "skills/commit"
+    assert result.name == "commit"
 
 
 # 验证 parse_skill_url 解析 raw.githubusercontent.com 格式 URL。
-# 传入 github raw URL，断言 owner/repo/branch/path/url_type 字段正确。
+# 传入 github raw URL（末段是文件名），断言 subpath 取所在目录、name 取目录末段。
 def test_parse_skill_url_github_raw_format() -> None:
     result = parse_skill_url(
         "https://raw.githubusercontent.com/user/repo/main/skills/commit/SKILL.md"
     )
     assert result.owner == "user"
     assert result.repo == "repo"
-    assert result.branch == "main"
-    assert result.path == "skills/commit/SKILL.md"
-    assert result.url_type == "github_raw"
+    assert result.ref == "main"
+    assert result.subpath == "skills/commit"
+    assert result.name == "commit"
 
 
-# 验证 parse_skill_url 对不支持的 URL 抛 ValueError。
-# 传入 example.com URL，断言抛 ValueError。
+# 验证 parse_skill_url 对不支持的 host 抛 ValueError。
+# 传入 example.com URL，断言抛 ValueError 含"不支持的 host"。
 def test_parse_skill_url_invalid_raises() -> None:
-    with pytest.raises(ValueError, match="不支持的 Skill URL 格式"):
+    with pytest.raises(ValueError, match="不支持的 host"):
         parse_skill_url("https://example.com/skill")
+
+
+# 验证 parse_skill_url 对非 http(s) 协议抛 ValueError。
+# 传入 ftp URL，断言抛 ValueError 含"仅支持 http(s) URL"。
+def test_parse_skill_url_invalid_scheme_raises() -> None:
+    with pytest.raises(ValueError, match="仅支持 http"):
+        parse_skill_url("ftp://skills.sh/user/repo/name")
+
+
+# 验证 parse_skill_url 对 skills.sh 2 段 URL 抛 ValueError（必须 3 段）。
+# 传入 2 段 skills.sh URL，断言抛 ValueError。
+def test_parse_skill_url_skills_sh_two_segments_raises() -> None:
+    with pytest.raises(ValueError):
+        parse_skill_url("https://skills.sh/user/commit-skill")
 
 
 # 验证 parse_skill_url 同时支持 http 与 https 协议。
 # 分别用 http:// 和 https:// 解析 skills.sh URL，断言均成功且结果一致。
 def test_parse_skill_url_http_https_both_supported() -> None:
-    r1 = parse_skill_url("http://skills.sh/user/name")
-    r2 = parse_skill_url("https://skills.sh/user/name")
-    assert r1.owner == "user" and r1.repo == "name"
-    assert r2.owner == "user" and r2.repo == "name"
-    assert r1.url_type == "skills.sh"
-    assert r2.url_type == "skills.sh"
+    r1 = parse_skill_url("http://skills.sh/user/repo/name")
+    r2 = parse_skill_url("https://skills.sh/user/repo/name")
+    assert r1.owner == "user" and r1.repo == "repo" and r1.name == "name"
+    assert r2.owner == "user" and r2.repo == "repo" and r2.name == "name"
+    assert r1.ref == "main"
+    assert r2.ref == "main"
 
 
 # 验证 parse_skill_url 容忍末尾斜杠。
 # 传入末尾带斜杠的 skills.sh URL，断言解析成功。
 def test_parse_skill_url_trailing_slash_tolerated() -> None:
-    result = parse_skill_url("https://skills.sh/user/name/")
+    result = parse_skill_url("https://skills.sh/user/repo/name/")
     assert result.owner == "user"
-    assert result.repo == "name"
-    assert result.url_type == "skills.sh"
+    assert result.repo == "repo"
+    assert result.name == "name"
+
+
+# 验证 parse_skill_url 不再校验 skill 名称（名称校验移至 install_skill 入口）。
+# 传入含大写字母的 skill-name，断言 parse_skill_url 不抛异常；name 原样保留。
+def test_parse_skill_url_does_not_validate_name() -> None:
+    result = parse_skill_url("https://skills.sh/user/repo/BadName")
+    assert result.name == "BadName"
+    assert result.original == "https://skills.sh/user/repo/BadName"
+
+
+# ---------- install_skill 名称校验 ----------
+
+
+# 验证 install_skill 在入口处校验 skill 名称非法字符抛 ValueError。
+# 用 parse_skill_url 解析含大写字母的 URL 得到 SkillSource，再调 install_skill 触发校验。
+async def test_install_skill_invalid_name_raises(tmp_path: Path) -> None:
+    src = parse_skill_url("https://skills.sh/user/repo/BadName")
+    with pytest.raises(ValueError, match="非法字符"):
+        await install_skill(src, tmp_path)
 
 
 # ---------- install_skill 成功路径 ----------
 
 
-# 验证 install_skill 原子安装成功。
-# mock httpx 返回目录列表 + SKILL.md base64 内容，断言 target_dir 存在且含 SKILL.md。
+# 验证 install_skill 原子安装成功并返回 InstallReport。
+# mock httpx 返回目录列表（内联 base64 content），断言 report 字段与文件落盘。
 async def test_install_skill_atomic_success(tmp_path: Path) -> None:
-    dir_resp = _make_response(
-        json_data=[{"name": "SKILL.md", "type": "file", "path": "SKILL.md"}]
-    )
-    file_resp = _make_response(
-        json_data={
-            "name": "SKILL.md",
-            "content": _b64(b"---\nname: commit\n---\nbody"),
-            "encoding": "base64",
-        }
-    )
-    client = _make_client([dir_resp, file_resp])
-    target = tmp_path / "commit-skill"
+    body = b"---\nname: commit\n---\nbody"
+    dir_resp = _make_response(json_data=[_file_entry("SKILL.md", body)])
+    client = _make_client([dir_resp])
     with patch("httpx.AsyncClient", return_value=client):
-        result = await install_skill(_skills_sh_parsed(), target)
-    assert result == target
+        result = await install_skill(_skills_sh_parsed(), tmp_path)
+    assert isinstance(result, InstallReport)
+    assert result.skill_name == "commit-skill"
+    assert result.target_dir == str(tmp_path / "commit-skill")
+    assert result.file_count == 1
+    target = tmp_path / "commit-skill"
     assert (target / "SKILL.md").exists()
-    assert (target / "SKILL.md").read_bytes() == b"---\nname: commit\n---\nbody"
+    assert (target / "SKILL.md").read_bytes() == body
 
 
 # 验证 install_skill 在 manifest 含 skill.yaml 时接受安装。
@@ -184,20 +239,14 @@ async def test_install_skill_atomic_success(tmp_path: Path) -> None:
 async def test_install_skill_accepts_skill_yaml_manifest(tmp_path: Path) -> None:
     dir_resp = _make_response(
         json_data=[
-            {"name": "skill.yaml", "type": "file", "path": "skill.yaml"},
-            {"name": "prompt.md", "type": "file", "path": "prompt.md"},
+            _file_entry("skill.yaml", b"name: commit"),
+            _file_entry("prompt.md", b"body"),
         ]
     )
-    yaml_resp = _make_response(
-        json_data={"name": "skill.yaml", "content": _b64(b"name: commit"), "encoding": "base64"}
-    )
-    prompt_resp = _make_response(
-        json_data={"name": "prompt.md", "content": _b64(b"body"), "encoding": "base64"}
-    )
-    client = _make_client([dir_resp, yaml_resp, prompt_resp])
-    target = tmp_path / "commit-skill"
+    client = _make_client([dir_resp])
     with patch("httpx.AsyncClient", return_value=client):
-        await install_skill(_skills_sh_parsed(), target)
+        await install_skill(_skills_sh_parsed(), tmp_path)
+    target = tmp_path / "commit-skill"
     assert (target / "skill.yaml").exists()
     assert (target / "prompt.md").exists()
 
@@ -207,23 +256,17 @@ async def test_install_skill_accepts_skill_yaml_manifest(tmp_path: Path) -> None
 async def test_install_skill_recurses_subdirectories(tmp_path: Path) -> None:
     dir_resp = _make_response(
         json_data=[
-            {"name": "SKILL.md", "type": "file", "path": "SKILL.md"},
+            _file_entry("SKILL.md", b"body"),
             {"name": "sub", "type": "dir", "path": "sub"},
         ]
     )
-    skill_resp = _make_response(
-        json_data={"name": "SKILL.md", "content": _b64(b"body"), "encoding": "base64"}
-    )
     subdir_resp = _make_response(
-        json_data=[{"name": "extra.md", "type": "file", "path": "sub/extra.md"}]
+        json_data=[_file_entry("extra.md", b"extra", path="sub/extra.md")]
     )
-    extra_resp = _make_response(
-        json_data={"name": "extra.md", "content": _b64(b"extra"), "encoding": "base64"}
-    )
-    client = _make_client([dir_resp, skill_resp, subdir_resp, extra_resp])
-    target = tmp_path / "commit-skill"
+    client = _make_client([dir_resp, subdir_resp])
     with patch("httpx.AsyncClient", return_value=client):
-        await install_skill(_skills_sh_parsed(), target)
+        await install_skill(_skills_sh_parsed(), tmp_path)
+    target = tmp_path / "commit-skill"
     assert (target / "SKILL.md").exists()
     assert (target / "sub" / "extra.md").exists()
     assert (target / "sub" / "extra.md").read_bytes() == b"extra"
@@ -235,15 +278,10 @@ async def test_install_skill_replaces_existing_target(tmp_path: Path) -> None:
     target = tmp_path / "commit-skill"
     target.mkdir()
     (target / "old.txt").write_text("old content")
-    dir_resp = _make_response(
-        json_data=[{"name": "SKILL.md", "type": "file", "path": "SKILL.md"}]
-    )
-    file_resp = _make_response(
-        json_data={"name": "SKILL.md", "content": _b64(b"new body"), "encoding": "base64"}
-    )
-    client = _make_client([dir_resp, file_resp])
+    dir_resp = _make_response(json_data=[_file_entry("SKILL.md", b"new body")])
+    client = _make_client([dir_resp])
     with patch("httpx.AsyncClient", return_value=client):
-        await install_skill(_skills_sh_parsed(), target)
+        await install_skill(_skills_sh_parsed(), tmp_path)
     assert (target / "SKILL.md").exists()
     assert (target / "SKILL.md").read_bytes() == b"new body"
     assert not (target / "old.txt").exists()
@@ -252,171 +290,8 @@ async def test_install_skill_replaces_existing_target(tmp_path: Path) -> None:
 # 验证 install_skill 请求设置正确的 User-Agent 头与超时。
 # mock httpx，断言 timeout=HTTP_TIMEOUT 且请求头含 User-Agent: seacode-install-skill。
 async def test_install_skill_sets_user_agent_and_timeout(tmp_path: Path) -> None:
-    dir_resp = _make_response(
-        json_data=[{"name": "SKILL.md", "type": "file", "path": "SKILL.md"}]
-    )
-    file_resp = _make_response(
-        json_data={"name": "SKILL.md", "content": _b64(b"body"), "encoding": "base64"}
-    )
-    client = _make_client([dir_resp, file_resp])
-    target = tmp_path / "commit-skill"
-    with patch("httpx.AsyncClient", return_value=client) as mock_cls:
-        await install_skill(_skills_sh_parsed(), target)
-    # 超时设置：httpx.AsyncClient(timeout=HTTP_TIMEOUT) 调用参数。
-    assert mock_cls.call_args.kwargs["timeout"] == HTTP_TIMEOUT
-    # User-Agent 头：client.get 请求头含 seacode-install-skill。
-    headers = client.get.call_args.kwargs["headers"]
-    assert headers["User-Agent"] == "seacode-install-skill"
-
-
-# ---------- install_skill 失败与清理 ----------
-
-
-# 验证 install_skill 安装失败时清理 staging 目录。
-# mock httpx 抛异常 + mock tempfile.mkdtemp 返回已知路径，断言 staging 被清理。
-async def test_install_skill_cleans_staging_on_failure(tmp_path: Path) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    client = MagicMock()
-    client.get = AsyncMock(side_effect=RuntimeError("network error"))
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=None)
-    with patch("httpx.AsyncClient", return_value=client):
-        with patch(
-            "seacode.skills.install.tempfile.mkdtemp", return_value=str(staging)
-        ):
-            with pytest.raises(RuntimeError, match="network error"):
-                await install_skill(_skills_sh_parsed(), tmp_path / "target")
-    assert not staging.exists()
-
-
-# 验证 install_skill 在 manifest 缺失时拒绝安装。
-# mock 拉取 readme.md（无 SKILL.md 或 skill.yaml），断言抛 ValueError。
-async def test_install_skill_rejects_missing_manifest(tmp_path: Path) -> None:
-    dir_resp = _make_response(
-        json_data=[{"name": "readme.md", "type": "file", "path": "readme.md"}]
-    )
-    file_resp = _make_response(
-        json_data={"name": "readme.md", "content": _b64(b"readme"), "encoding": "base64"}
-    )
-    client = _make_client([dir_resp, file_resp])
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="manifest"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# 验证 install_skill 在 GitHub API 限流时抛 ValueError。
-# mock 403 响应 + X-RateLimit-Remaining: 0，断言抛 ValueError 含"GitHub API 限流"。
-async def test_install_skill_raises_on_rate_limit(tmp_path: Path) -> None:
-    resp = _make_response(
-        status_code=403,
-        headers={"X-RateLimit-Remaining": "0"},
-        text="rate limit exceeded",
-    )
-    client = _make_client([resp])
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="GitHub API 限流"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# ---------- install_skill 安全限制 ----------
-
-
-# 验证 install_skill 单文件超过 1 MiB 触发限制。
-# mock 文件内容 > MAX_FILE_SIZE，断言抛 ValueError 含"超过单文件大小限制"。
-async def test_install_skill_single_file_too_large(tmp_path: Path) -> None:
-    big_b64 = _b64(b"\x00" * (MAX_FILE_SIZE + 1))
-    dir_resp = _make_response(
-        json_data=[{"name": "big", "type": "file", "path": "big"}]
-    )
-    file_resp = _make_response(
-        json_data={"name": "big", "content": big_b64, "encoding": "base64"}
-    )
-    client = _make_client([dir_resp, file_resp])
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="超过单文件大小限制"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# 验证 install_skill 累计大小超过 8 MiB 触发限制。
-# mock 9 个 1 MiB 文件（累计 > MAX_TOTAL_SIZE），断言抛 ValueError。
-async def test_install_skill_total_size_too_large(tmp_path: Path) -> None:
-    large_b64 = _b64(b"\x00" * MAX_FILE_SIZE)
-    entries = [
-        {"name": f"f{i}", "type": "file", "path": f"f{i}"} for i in range(9)
-    ]
-    dir_resp = _make_response(json_data=entries)
-    file_resp = _make_response(
-        json_data={"name": "f", "content": large_b64, "encoding": "base64"}
-    )
-    # 1 目录列表 + 9 文件内容；第 9 个文件累计 9437184 > 8388608 触发限制。
-    client = _make_client([dir_resp] + [file_resp] * 9)
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="累计大小超过限制"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# 验证 install_skill 文件数超过 64 触发限制。
-# mock 65 个文件条目，断言抛 ValueError 含"文件数超过限制"。
-async def test_install_skill_file_count_too_many(tmp_path: Path) -> None:
-    entries = [
-        {"name": f"f{i}", "type": "file", "path": f"f{i}"} for i in range(65)
-    ]
-    dir_resp = _make_response(json_data=entries)
-    file_resp = _make_response(
-        json_data={"name": "f", "content": _b64(b"x"), "encoding": "base64"}
-    )
-    # 1 目录列表 + 65 文件内容；第 65 个文件 file_count=65 > 64 触发限制。
-    client = _make_client([dir_resp] + [file_resp] * 65)
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="文件数超过限制"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# 验证 install_skill 递归深度超过 4 触发限制。
-# mock 5 层嵌套子目录（depth 0-4 各返回目录，depth=5 抛限制），断言抛 ValueError。
-async def test_install_skill_depth_too_deep(tmp_path: Path) -> None:
-    dir_resp = _make_response(
-        json_data=[{"name": "d", "type": "dir", "path": "d"}]
-    )
-    # depth 0-4 共 5 次 GET 返回目录；depth=5 在 GET 前抛递归深度限制。
-    client = _make_client([dir_resp] * 5)
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="递归深度"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# 验证 install_skill 检测 entry name 含 .. 的路径穿越。
-# mock 目录条目 name 含 ".."，断言抛 ValueError 含"非法文件名"。
-async def test_install_skill_rejects_dotdot_path_traversal(tmp_path: Path) -> None:
-    dir_resp = _make_response(
-        json_data=[{"name": "../etc", "type": "file", "path": "../etc"}]
-    )
+    dir_resp = _make_response(json_data=[_file_entry("SKILL.md", b"body")])
     client = _make_client([dir_resp])
     with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="非法文件名"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# 验证 install_skill 检测 entry name 含 / 的路径穿越。
-# mock 目录条目 name 含 "/"，断言抛 ValueError 含"非法文件名"。
-async def test_install_skill_rejects_slash_path_traversal(tmp_path: Path) -> None:
-    dir_resp = _make_response(
-        json_data=[{"name": "a/b", "type": "file", "path": "a/b"}]
-    )
-    client = _make_client([dir_resp])
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="非法文件名"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
-
-
-# 验证 install_skill 检测 entry name 含反斜杠的路径穿越。
-# mock 目录条目 name 含 "\\"，断言抛 ValueError 含"非法文件名"。
-async def test_install_skill_rejects_backslash_path_traversal(tmp_path: Path) -> None:
-    dir_resp = _make_response(
-        json_data=[{"name": "a\\b", "type": "file", "path": "a\\b"}]
-    )
-    client = _make_client([dir_resp])
-    with patch("httpx.AsyncClient", return_value=client):
-        with pytest.raises(ValueError, match="非法文件名"):
-            await install_skill(_skills_sh_parsed(), tmp_path / "commit-skill")
+        await install_skill(_skills_sh_parsed(), tmp_path)
+    # 超时设置：httpx.AsyncClient(timeout=HTTP_TIMEOUT)

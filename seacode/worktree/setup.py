@@ -75,10 +75,17 @@ def _copy_ignored_files(repo_root: Path, wt_path: Path) -> None:
     include_file = repo_root / ".worktreeinclude"
     if not include_file.exists():
         return
+    # 读取异常时跳过本步，不中断 worktree 创建流程。
+    try:
+        raw_lines = include_file.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        log.warning("failed to read .worktreeinclude: %s", e)
+        return
+    # 先 strip 再判断注释头，识别带缩进的注释行；空行跳过。
     patterns = [
         line.strip()
-        for line in include_file.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
+        for line in raw_lines
+        if line.strip() and not line.strip().startswith("#")
     ]
     try:
         result = subprocess.run(

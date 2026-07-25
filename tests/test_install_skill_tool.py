@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from seacode.skills.install import InstallReport
 from seacode.tools.base import ToolCategory
 from seacode.tools.install_skill import InstallSkill, _InstallSkillParams
 
@@ -56,7 +56,8 @@ def test_install_skill_input_schema_contains_url() -> None:
 
 
 # 验证 InstallSkill 正常安装调 install_skill、reload、callback 并返回成功。
-# patch install_skill 为 AsyncMock，注入 loader 与 callback，断言全部副作用被触发。
+# patch install_skill 为 AsyncMock 返回 InstallReport，注入 loader 与 callback，
+# 断言全部副作用被触发。
 async def test_install_skill_success_invokes_install_reload_callback() -> None:
     loader = _FakeLoader(user_dir="/home/.seacode/skills")
     callback = _FakeCallback()
@@ -64,10 +65,17 @@ async def test_install_skill_success_invokes_install_reload_callback() -> None:
     tool.set_loader(loader)
     tool.set_on_installed(callback)
 
-    fake_install = AsyncMock(return_value=Path("/home/.seacode/skills/commit"))
+    fake_install = AsyncMock(
+        return_value=InstallReport(
+            skill_name="commit",
+            target_dir="/home/.seacode/skills/commit",
+            file_count=1,
+            total_bytes=10,
+        )
+    )
     with _patch_install_skill(fake_install):
         result = await tool.execute(
-            _InstallSkillParams(url="https://skills.sh/user/commit")
+            _InstallSkillParams(url="https://skills.sh/user/repo/commit")
         )
 
     assert result.is_error is False
@@ -86,9 +94,15 @@ async def test_install_skill_no_callback_does_not_raise() -> None:
     tool.set_loader(loader)
     tool._on_installed = None
 
-    fake_install = AsyncMock(return_value=Path("/home/.seacode/skills/x"))
+    fake_install = AsyncMock(
+        return_value=InstallReport(
+            skill_name="x", target_dir="/home/.seacode/skills/x"
+        )
+    )
     with _patch_install_skill(fake_install):
-        result = await tool.execute(_InstallSkillParams(url="https://skills.sh/user/x"))
+        result = await tool.execute(
+            _InstallSkillParams(url="https://skills.sh/user/repo/x")
+        )
 
     assert result.is_error is False
     assert "已安装" in result.content
@@ -128,7 +142,9 @@ async def test_install_skill_install_exception_returns_error() -> None:
 
     fake_install = AsyncMock(side_effect=ValueError("boom"))
     with _patch_install_skill(fake_install):
-        result = await tool.execute(_InstallSkillParams(url="https://skills.sh/user/x"))
+        result = await tool.execute(
+            _InstallSkillParams(url="https://skills.sh/user/repo/x")
+        )
 
     assert result.is_error is True
     assert "安装失败：boom" in result.content
@@ -142,7 +158,9 @@ async def test_install_skill_uninitialized_loader_returns_error() -> None:
     tool = InstallSkill()
     tool._loader = None
 
-    result = await tool.execute(_InstallSkillParams(url="https://skills.sh/user/x"))
+    result = await tool.execute(
+        _InstallSkillParams(url="https://skills.sh/user/repo/x")
+    )
 
     assert result.is_error is True
     assert "InstallSkill 未初始化" in result.content
@@ -163,7 +181,7 @@ async def test_install_skill_loader_missing_user_dir_returns_error() -> None:
     fake_install = AsyncMock()
     with _patch_install_skill(fake_install):
         result = await tool.execute(
-            _InstallSkillParams(url="https://skills.sh/user/x")
+            _InstallSkillParams(url="https://skills.sh/user/repo/x")
         )
 
     assert result.is_error is True
@@ -183,9 +201,15 @@ async def test_install_skill_callback_exception_does_not_block_success() -> None
     tool.set_loader(loader)
     tool.set_on_installed(raising_callback)
 
-    fake_install = AsyncMock(return_value=Path("/home/.seacode/skills/x"))
+    fake_install = AsyncMock(
+        return_value=InstallReport(
+            skill_name="x", target_dir="/home/.seacode/skills/x"
+        )
+    )
     with _patch_install_skill(fake_install):
-        result = await tool.execute(_InstallSkillParams(url="https://skills.sh/user/x"))
+        result = await tool.execute(
+            _InstallSkillParams(url="https://skills.sh/user/repo/x")
+        )
 
     assert result.is_error is False
     assert "已安装" in result.content

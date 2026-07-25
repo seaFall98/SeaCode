@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -45,6 +44,7 @@ class InstallSkill(Tool):
         self._on_installed = callback
 
     # 从 URL 安装 Skill；URL 解析失败或安装异常返回 is_error=True。
+    # 安装目录名取 parsed.name（skill-name），避免多 skill 仓库互相覆盖。
     async def execute(self, params: BaseModel) -> ToolResult:
         if self._loader is None:
             return ToolResult(
@@ -58,16 +58,15 @@ class InstallSkill(Tool):
                 content=f"URL 解析失败：{e}", is_error=True
             )
 
-        # 安装到用户级 ~/.seacode/skills/<repo> 目录。
+        # 安装到用户级 ~/.seacode/skills/ 目录；子目录名由 parsed.name 决定。
         user_dir = getattr(self._loader, "_user_dir", None)
         if user_dir is None:
             return ToolResult(
                 content="InstallSkill 未初始化：loader 缺少 _user_dir",
                 is_error=True,
             )
-        target_dir = Path(user_dir) / parsed.repo
         try:
-            await install_skill(parsed, target_dir)
+            report = await install_skill(parsed, install_root=user_dir)
         except Exception as e:
             return ToolResult(
                 content=f"安装失败：{e}", is_error=True
@@ -82,6 +81,6 @@ class InstallSkill(Tool):
                 # 回调失败不阻塞安装成功路径。
                 pass
         return ToolResult(
-            content=f"已安装 Skill：{parsed.repo} 到 {target_dir}",
+            content=f"已安装 Skill：{report.skill_name} 到 {report.target_dir}",
             is_error=False,
         )

@@ -244,11 +244,25 @@ class _AskUserApp(App[None]):
         self._future = future
 
     def compose(self) -> ComposeResult:
-        yield InlineAskUserWidget(self._questions, self._future)
+        yield InlineAskUserWidget(self._questions)
+
+    # 收到 Responded 事件时回填 future，模拟 app.py 的 future 回填契约。
+    def on_inline_ask_user_widget_responded(
+        self, event: InlineAskUserWidget.Responded
+    ) -> None:
+        if not self._future.done():
+            self._future.set_result(event.answers if event.answers else {})
 
 
-# 验证 InlineAskUserWidget 渲染 text 表单含 message 与输入框。
-# 挂载 text 问题，断言渲染含 message 文本。
+# 读取 InlineAskUserWidget 当前渲染内容（#askuser-content Static 的纯文本）。
+def _askuser_render(widget: InlineAskUserWidget) -> str:
+    from textual.widgets import Static
+
+    return str(widget.query_one("#askuser-content", Static).render())
+
+
+# 验证 InlineAskUserWidget 渲染 text 表单含 message 与 Other 输入提示。
+# 挂载 text 问题，断言渲染含 message 文本与 "Other" 占位（text 无 options，光标落到 Other）。
 async def test_inline_ask_user_renders_text_form() -> None:
     future: asyncio.Future[dict[str, str]] = asyncio.Future()
     questions = [{"type": "text", "name": "q1", "message": "你的名字", "options": []}]
@@ -256,14 +270,15 @@ async def test_inline_ask_user_renders_text_form() -> None:
     async with app.run_test() as pilot:
         await _settle(pilot)
         widget = app.query_one(InlineAskUserWidget)
-        # message 应出现在渲染中（可能在子组件 Static 里）。
-        # 检查 query 到的 Static label 含 message 文本。
-        labels = widget.query(".askuser-label")
-        assert labels is not None
+        rendered = _askuser_render(widget)
+        assert "你的名字" in rendered
+        # text 无 options，光标默认在 Other，应显示输入提示。
+        assert "Other" in rendered
+        assert "Type your answer here" in rendered
 
 
-# 验证 InlineAskUserWidget 渲染 radio 表单含选项。
-# 挂载 radio 问题带 2 选项，断言 OptionList 子组件存在。
+# 验证 InlineAskUserWidget 渲染 radio 表单含所有选项文本。
+# 挂载 radio 问题带 2 选项，断言渲染含两个选项文本与单选确认提示。
 async def test_inline_ask_user_renders_radio_form() -> None:
     future: asyncio.Future[dict[str, str]] = asyncio.Future()
     questions = [
@@ -277,14 +292,16 @@ async def test_inline_ask_user_renders_radio_form() -> None:
     app = _AskUserApp(questions, future)
     async with app.run_test() as pilot:
         await _settle(pilot)
-        from textual.widgets import OptionList
+        widget = app.query_one(InlineAskUserWidget)
+        rendered = _askuser_render(widget)
+        assert "选项A" in rendered
+        assert "选项B" in rendered
+        # 单选提示。
+        assert "enter to confirm" in rendered
 
-        option_lists = app.query(OptionList)
-        assert option_lists is not None
 
-
-# 验证 InlineAskUserWidget 渲染 select 表单含选项。
-# 挂载 select 问题带 3 选项，断言 OptionList 子组件存在。
+# 验证 InlineAskUserWidget 渲染 select 表单含所有选项文本。
+# 挂载 select 问题带 3 选项，断言渲染含全部选项文本。
 async def test_inline_ask_user_renders_select_form() -> None:
     future: asyncio.Future[dict[str, str]] = asyncio.Future()
     questions = [
@@ -298,14 +315,15 @@ async def test_inline_ask_user_renders_select_form() -> None:
     app = _AskUserApp(questions, future)
     async with app.run_test() as pilot:
         await _settle(pilot)
-        from textual.widgets import OptionList
+        widget = app.query_one(InlineAskUserWidget)
+        rendered = _askuser_render(widget)
+        assert "x" in rendered
+        assert "y" in rendered
+        assert "z" in rendered
 
-        option_lists = app.query(OptionList)
-        assert option_lists is not None
 
-
-# 验证 InlineAskUserWidget 渲染 checkbox 表单含选项。
-# 挂载 checkbox 问题带 2 选项，断言 OptionList 子组件存在。
+# 验证 InlineAskUserWidget 渲染 checkbox 表单含多选切换提示。
+# 挂载带 multiSelect=True 的 checkbox 问题，断言渲染含选项文本与 "space to toggle" 多选提示。
 async def test_inline_ask_user_renders_checkbox_form() -> None:
     future: asyncio.Future[dict[str, str]] = asyncio.Future()
     questions = [
@@ -313,30 +331,105 @@ async def test_inline_ask_user_renders_checkbox_form() -> None:
             "type": "checkbox",
             "name": "q1",
             "message": "多选",
+            "multiSelect": True,
             "options": ["m", "n"],
         }
     ]
     app = _AskUserApp(questions, future)
     async with app.run_test() as pilot:
         await _settle(pilot)
-        from textual.widgets import OptionList
+        widget = app.query_one(InlineAskUserWidget)
+        rendered = _askuser_render(widget)
+        assert "m" in rendered
+        assert "n" in rendered
+        # 多选提示。
+        assert "space to toggle" in rendered
 
-        option_lists = app.query(OptionList)
-        assert option_lists is not None
+
+# 验证 InlineAskUserWidget 多问题时渲染导航栏含 Submit 项。
+# 挂载 2 个问题，断言渲染含 "Submit" 导航项与两个问题的 name 标签。
+async def test_inline_ask_user_renders_nav_bar_with_submit() -> None:
+    future: asyncio.Future[dict[str, str]] = asyncio.Future()
+    questions = [
+        {"type": "text", "name": "q1", "message": "第一问", "options": []},
+        {"type": "text", "name": "q2", "message": "第二问", "options": []},
+    ]
+    app = _AskUserApp(questions, future)
+    async with app.run_test() as pilot:
+        await _settle(pilot)
+        widget = app.query_one(InlineAskUserWidget)
+        rendered = _askuser_render(widget)
+        # 多问题导航栏含 Submit 项与各问题 fallback 标签 Q1/Q2（无 header 时用 Q{i+1}）。
+        assert "Submit" in rendered
+        assert "Q1" in rendered
+        assert "Q2" in rendered
 
 
-# 验证 InlineAskUserWidget 含 Submit 按钮。
-# 挂载 widget，断言含 id="askuser-submit" 的 Button。
-async def test_inline_ask_user_has_submit_button() -> None:
+# 验证 InlineAskUserWidget 键盘导航：下移光标 → Enter 提交 → future 回填答案。
+# 挂载 radio 问题带 3 选项，action_cursor_down 后 action_select，断言 future 收到第 2 项。
+async def test_inline_ask_user_keyboard_navigation_submits_answer() -> None:
+    future: asyncio.Future[dict[str, str]] = asyncio.Future()
+    questions = [
+        {
+            "type": "radio",
+            "name": "q1",
+            "message": "选择",
+            "options": ["a", "b", "c"],
+        }
+    ]
+    app = _AskUserApp(questions, future)
+    async with app.run_test() as pilot:
+        await _settle(pilot)
+        widget = app.query_one(InlineAskUserWidget)
+        # 初始光标在 0（"a"），下移一次到 1（"b"），Enter 提交。
+        widget.action_cursor_down()
+        widget.action_select()
+        await _settle(pilot)
+        # 单问题 Enter 直接提交；key 取 question→message fallback，故 key 为 "选择"。
+        assert future.done()
+        assert future.result() == {"选择": "b"}
+
+
+# 验证 InlineAskUserWidget checkbox 多选切换：空格切换勾选 → Enter 提交多选答案。
+# 挂载带 multiSelect=True 的 checkbox 问题，action_toggle 切换两项后提交，断言答案含两项逗号拼接。
+async def test_inline_ask_user_checkbox_toggle_submits_multiple() -> None:
+    future: asyncio.Future[dict[str, str]] = asyncio.Future()
+    questions = [
+        {
+            "type": "checkbox",
+            "name": "q1",
+            "message": "多选",
+            "multiSelect": True,
+            "options": ["x", "y"],
+        }
+    ]
+    app = _AskUserApp(questions, future)
+    async with app.run_test() as pilot:
+        await _settle(pilot)
+        widget = app.query_one(InlineAskUserWidget)
+        # 光标在 0（"x"），空格勾选；下移到 1（"y"），空格勾选；Enter 提交。
+        widget.action_toggle_option()
+        widget.action_cursor_down()
+        widget.action_toggle_option()
+        widget.action_select()
+        await _settle(pilot)
+        assert future.done()
+        assert future.result() == {"多选": "x, y"}
+
+
+# 验证 InlineAskUserWidget ESC 取消回填空 dict。
+# 挂载 widget，触发 action_cancel，断言 future 回填空 dict。
+async def test_inline_ask_user_cancel_returns_empty_dict() -> None:
     future: asyncio.Future[dict[str, str]] = asyncio.Future()
     questions = [{"type": "text", "name": "q1", "message": "hi", "options": []}]
     app = _AskUserApp(questions, future)
     async with app.run_test() as pilot:
         await _settle(pilot)
-        from textual.widgets import Button
-
-        button = app.query_one("#askuser-submit", Button)
-        assert button is not None
+        widget = app.query_one(InlineAskUserWidget)
+        widget.action_cancel()
+        await _settle(pilot)
+        assert future.done()
+        assert future.result() == {}
 
 
 # 验证 InlineAskUserWidget.Responded 事件携带 answers。
@@ -346,6 +439,13 @@ def test_responded_event_carries_answers() -> None:
     event = InlineAskUserWidget.Responded(answers=answers)
     assert event.answers == answers
     assert len(event.answers) == 2
+
+
+# 验证 InlineAskUserWidget.Responded 事件支持 None（取消语义）。
+# 构造 Responded(None)，断言 answers 为 None。
+def test_responded_event_supports_none_answers() -> None:
+    event = InlineAskUserWidget.Responded(None)
+    assert event.answers is None
 
 
 # ---------------------------------------------------------------------------

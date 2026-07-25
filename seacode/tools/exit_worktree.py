@@ -70,3 +70,8 @@ class ExitWorktreeTool(Tool):
             )
         except WorktreeError as e:
             return ToolResult(content=str(e), is_error=True)
+        except Exception as e:
+            # 捕获 OSError / PermissionError 等非 WorktreeError，避免向 Agent 主循环冒泡。
+            return ToolResult(
+                content=f"退出 worktree 失败: {e}", is_error=True
+            )

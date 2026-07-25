@@ -1098,8 +1098,8 @@ class SeaCodeApp(App[None]):
             if self._agent_tool is not None:
                 self._agent_tool.set_team_manager(team_manager)
             # 注册 TeamCreate / TeamDelete / SendMessage 工具。
-            # parent_agent 在 _run_turn 中刷新为当前回合 Agent；此处传 None 仅作占位，
-            # TeamCreateTool.execute 通过 _parent_agent.agent_id 访问 Lead，由 _run_turn 注入。
+            # TeamCreate/TeamDelete 的 parent_agent 在 _run_turn 中刷新为当前回合 Agent；
+            # SendMessage 占位传空字符串，teammate 由 build_teammate_tools 重新实例化。
             self._tool_registry.register(
                 TeamCreateTool(None, team_manager, self._teams_config)
             )
@@ -1107,7 +1107,7 @@ class SeaCodeApp(App[None]):
                 TeamDeleteTool(None, team_manager)
             )
             self._tool_registry.register(
-                SendMessageTool(None, team_manager)
+                SendMessageTool(team_manager, "", "", "")
             )
         except Exception:
             # 工具注册失败不撤销 team_manager；Lead 仍可消费邮箱，只是无法新建团队。
@@ -1505,9 +1505,17 @@ class SeaCodeApp(App[None]):
     async def on_inline_ask_user_widget_responded(
         self, event: InlineAskUserWidget.Responded
     ) -> None:
-        # future 已在 widget 提交时回填；此处只负责清理 UI 与恢复焦点。
+        # 回填 future 让 AskUserTool.execute 继续；answers 为 None 时回填空 dict。
+        if (
+            self._ask_user_tool is not None
+            and self._ask_user_tool._pending_event is not None
+            and not self._ask_user_tool._pending_event.future.done()
+        ):
+            self._ask_user_tool._pending_event.future.set_result(
+                event.answers if event.answers else {}
+            )
         try:
-            widget = self.query_one("#askuser-form")
+            widget = self.query_one("#askuser-content")
             if widget is not None:
                 # 找到父 InlineAskUserWidget 并移除。
                 parent = widget.parent
@@ -1688,7 +1696,6 @@ class SeaCodeApp(App[None]):
                     ):
                         widget: InlineAskUserWidget | InlinePermissionWidget = InlineAskUserWidget(
                             self._ask_user_tool._pending_event.questions,
-                            self._ask_user_tool._pending_event.future,
                         )
                         await chat.mount(widget)
                         chat.scroll_end(animate=False)

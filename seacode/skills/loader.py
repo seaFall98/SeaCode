@@ -84,7 +84,8 @@ class SkillLoader:
     def _load_builtins(self) -> list[SkillDef]:
         return []
 
-    # 按 name 获取 Skill；source_path 不为 None 时重读磁盘，失败回退 _cache。
+    # 按 name 获取 Skill；source_path 不为 None 时重读磁盘，失败回退旧版本。
+    # 回退顺序：_cache 命中 → 旧 skill 对象；永不返回 None（除非 name 完全不存在）。
     def get(self, name: str) -> SkillDef | None:
         skill = self._skills.get(name)
         if skill is None:
@@ -97,7 +98,8 @@ class SkillLoader:
                 return refreshed
             except Exception as e:
                 logger.warning("重读 Skill %s 失败: %s，使用缓存版本", name, e)
-                return self._cache.get(name)
+                # _cache 命中用缓存；否则回退到旧 skill 对象，保证调用方不丢能力。
+                return self._cache.get(name, skill)
         return skill
 
     # 根据 source_path 重读磁盘：单文件走 parse_skill_file，目录型走 parse_skill_directory。
