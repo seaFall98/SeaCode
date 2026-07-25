@@ -110,6 +110,19 @@ class SandboxAppConfig:
     network_enabled: bool = False
 
 
+# batch13：Git Worktree 隔离工作区配置。
+# symlink_directories：创建 worktree 后符号链接到主仓库的目录列表（如 .venv、node_modules）；
+# stale_cleanup_interval：后台清理任务执行间隔（秒）；
+# stale_cutoff_hours：worktree 超过该小时数且无变更时被清理。
+@dataclass(frozen=True)
+class WorktreeConfig:
+    """Git Worktree 隔离工作区的运行配置。"""
+
+    symlink_directories: tuple[str, ...] = ()
+    stale_cleanup_interval: int = 3600
+    stale_cutoff_hours: int = 24
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """保存启动本批次对话应用所需的已校验配置。"""
@@ -122,6 +135,8 @@ class AppConfig:
     # Hook 原始配置列表；三层叠加合并（与 Provider 列表完整替换语义不同），
     # 字段级校验延迟到 hooks.loader.load_hooks 中做。
     raw_hooks: list[dict] = field(default_factory=list)
+    # batch13：Worktree 隔离工作区配置；三层合并按字段覆盖（与 sandbox 同语义）。
+    worktree: WorktreeConfig = WorktreeConfig()
 
 
 # 展开 ${VAR} 占位符；未定义变量保留原字面量，便于发现配置错误。
@@ -180,11 +195,13 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
     sandbox = _parse_sandbox(raw.get("sandbox"), path)
     mcp_servers = _parse_mcp_servers(raw.get("mcp_servers"), path)
     raw_hooks = validate_hooks(raw.get("hooks"))
+    worktree = _parse_worktree(raw.get("worktree"), path)
     return AppConfig(
         providers=providers,
         sandbox=sandbox,
         mcp_servers=mcp_servers,
         raw_hooks=raw_hooks,
+        worktree=worktree,
     )
 
 
@@ -268,6 +285,19 @@ def _parse_sandbox(raw: Any, path: Path) -> SandboxAppConfig:
     )
 
 
+# batch13：解析 worktree 段；非 dict 或字段缺失时返回默认值。
+# symlink_directories 接受 list[str]；非正整数的间隔与小时数抛 ConfigError。
+def _parse_worktree(raw: Any, path: Path) -> WorktreeConfig:
+    from seacode.validator import validate_worktree
+
+    if not isinstance(raw, dict):
+        return WorktreeConfig()
+    try:
+        return validate_worktree(raw)
+    except ConfigError as e:
+        raise ConfigError(f"{e}: {path}") from e
+
+
 # 校验单个 Provider 的公开字段与协议边界。
 def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
     if not isinstance(raw, dict):
@@ -315,6 +345,8 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
 
 # 按固定层级合并配置；后层完整替换 Provider 列表，sandbox 各字段任一层开启即开启，
 # mcp_servers 按 name 去重覆盖（同 name 替换、新 name 追加）。
+# batch13：worktree 字段三层合并，后层非默认值覆盖前层（与 sandbox 的 OR 语义不同，
+# 因为 symlink_directories 是列表、interval/hours 是覆盖）。
 def load_config(
     path: Path | None = None,
     *,
@@ -332,6 +364,10 @@ def load_config(
     sandbox_network = False
     merged_mcp: dict[str, MCPServerConfig] = {}
     merged_raw_hooks: list[dict] = []
+    # worktree 字段：后层非默认值覆盖前层；默认值表示"未配置"，允许前层值穿透。
+    merged_symlinks: list[str] = []
+    merged_interval: int = 3600
+    merged_cutoff: int = 24
     for candidate in config_candidates(cwd, home):
         if not candidate.is_file():
             continue
@@ -347,6 +383,14 @@ def load_config(
         # raw_hooks 叠加合并：用户级 + 项目级 + 本地级 Hook 全部累加，不互相覆盖。
         # 与 Provider 列表"后层完整替换"语义不同；dedup 由 once 标记或用户自行控制。
         merged_raw_hooks.extend(layer.raw_hooks)
+        # worktree 字段合并：后层非空 symlink_directories 覆盖前层；
+        # interval/cutoff 后层非默认值（!= 3600 / != 24）覆盖前层。
+        if layer.worktree.symlink_directories:
+            merged_symlinks = list(layer.worktree.symlink_directories)
+        if layer.worktree.stale_cleanup_interval != 3600:
+            merged_interval = layer.worktree.stale_cleanup_interval
+        if layer.worktree.stale_cutoff_hours != 24:
+            merged_cutoff = layer.worktree.stale_cutoff_hours
 
     if loaded is None:
         raise ConfigError(
@@ -362,4 +406,9 @@ def load_config(
         ),
         mcp_servers=tuple(merged_mcp.values()),
         raw_hooks=merged_raw_hooks,
+        worktree=WorktreeConfig(
+            symlink_directories=tuple(merged_symlinks),
+            stale_cleanup_interval=merged_interval,
+            stale_cutoff_hours=merged_cutoff,
+        ),
     )

@@ -444,6 +444,9 @@ class Agent:
         self._agent_catalog_list: list[tuple[str, str]] = []
         # last_output：run_to_completion 结束时保存最终文本，供 TaskManager 读取。
         self.last_output: str = ""
+        # batch13：文件历史快照；app.py 在装配阶段注入，None 时跳过 make_snapshot。
+        # 在每轮用户回合起点记录已跟踪文件的当前内容，供 /rewind 回滚。
+        self.file_history: Any = None
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -544,6 +547,23 @@ class Agent:
     async def run(
         self, conversation: ConversationManager
     ) -> AsyncIterator[AgentEvent]:
+        # batch13：用户回合起点留档；以最后一条 user 消息内容为快照文本，
+        # 消息数作为 message_index 供 /rewind 列表展示。file_history 为 None
+        # 时跳过（向后兼容 batch01-12 行为）。
+        if self.file_history is not None:
+            user_text = ""
+            for msg in reversed(conversation.history):
+                if msg.role == "user":
+                    user_text = msg.content
+                    break
+            try:
+                self.file_history.make_snapshot(
+                    len(conversation.history), user_text
+                )
+            except Exception:
+                # 快照失败不阻塞主循环；/rewind 仍可访问之前的快照。
+                pass
+
         # 会话启动时注入会话级环境上下文（position 0，env_injected 标记只注入一次）。
         # batch12：附加子 Agent 目录摘要（## Available Sub-Agent Types 段落）。
         env_context = build_environment_context(
