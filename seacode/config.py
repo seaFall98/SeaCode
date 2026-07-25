@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-from .validator import DEFAULT_CONTEXT_WINDOW, lookup_model_context_window
+from .validator import DEFAULT_CONTEXT_WINDOW, lookup_model_context_window, validate_hooks
 
 SUPPORTED_PROTOCOLS: Final = frozenset({"anthropic", "openai", "openai-compat"})
 _ENV_KEY_NAMES: Final = {
@@ -119,6 +119,9 @@ class AppConfig:
     sandbox: SandboxAppConfig = SandboxAppConfig()
     # MCP 服务器配置列表；三层合并按 name 去重覆盖（同 name 替换、新 name 追加）。
     mcp_servers: tuple[MCPServerConfig, ...] = ()
+    # Hook 原始配置列表；三层叠加合并（与 Provider 列表完整替换语义不同），
+    # 字段级校验延迟到 hooks.loader.load_hooks 中做。
+    raw_hooks: list[dict] = field(default_factory=list)
 
 
 # 展开 ${VAR} 占位符；未定义变量保留原字面量，便于发现配置错误。
@@ -176,7 +179,13 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
         raise ConfigError(f"Provider names must be unique: {path}")
     sandbox = _parse_sandbox(raw.get("sandbox"), path)
     mcp_servers = _parse_mcp_servers(raw.get("mcp_servers"), path)
-    return AppConfig(providers=providers, sandbox=sandbox, mcp_servers=mcp_servers)
+    raw_hooks = validate_hooks(raw.get("hooks"))
+    return AppConfig(
+        providers=providers,
+        sandbox=sandbox,
+        mcp_servers=mcp_servers,
+        raw_hooks=raw_hooks,
+    )
 
 
 # 解析 mcp_servers 段；缺失或非 list 时返回空元组，逐条校验字段。
@@ -322,6 +331,7 @@ def load_config(
     sandbox_auto_allow = False
     sandbox_network = False
     merged_mcp: dict[str, MCPServerConfig] = {}
+    merged_raw_hooks: list[dict] = []
     for candidate in config_candidates(cwd, home):
         if not candidate.is_file():
             continue
@@ -334,6 +344,9 @@ def load_config(
         # mcp_servers 按 name 去重覆盖：后层同名替换前层，新名追加。
         for server in layer.mcp_servers:
             merged_mcp[server.name] = server
+        # raw_hooks 叠加合并：用户级 + 项目级 + 本地级 Hook 全部累加，不互相覆盖。
+        # 与 Provider 列表"后层完整替换"语义不同；dedup 由 once 标记或用户自行控制。
+        merged_raw_hooks.extend(layer.raw_hooks)
 
     if loaded is None:
         raise ConfigError(
@@ -348,4 +361,5 @@ def load_config(
             network_enabled=sandbox_network,
         ),
         mcp_servers=tuple(merged_mcp.values()),
+        raw_hooks=merged_raw_hooks,
     )
