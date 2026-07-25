@@ -42,6 +42,13 @@ from .conversation import (
     ToolUseBlock,
 )
 from .mcp import ConnectResult, MCPManager
+from .memory.auto_memory import MemoryManager
+from .memory.consolidation import MemoryConsolidator
+from .memory.recall import (
+    SelectorFn,
+    find_relevant_memories,
+    render_reminder,
+)
 from .permissions import PermissionChecker, PermissionMode
 from .permissions.rules import Rule, extract_content
 from .prompts import build_environment_context, build_system_prompt
@@ -329,6 +336,8 @@ class Agent:
         permission_checker: PermissionChecker | None = None,
         mcp_manager: MCPManager | None = None,
         context_window: int = 200_000,
+        instructions_content: str = "",
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -363,6 +372,22 @@ class Agent:
         self.recovery_state: RecoveryState = RecoveryState()
         # 会话记录路径只作为字符串拼进压缩后摘要提示，本步不读写会话 JSONL（第 08 步交付）。
         self._transcript_path: str = ""
+        # 跨会话记忆：instructions_content 是 load_instructions 的拼接结果，
+        # memory_manager 提供 MEMORY.md 索引加载与裸 LLM 提取能力。
+        # 为 None 时跳过长期记忆注入与提取（向后兼容 batch01-07 行为）。
+        self.instructions_content = instructions_content
+        self.memory_manager = memory_manager
+        # 记忆提取合并策略（对齐 v1 既定 inProgress + pendingContext）：
+        # _extracting: 标记是否有提取正在进行
+        # _pending_extraction: 提取期间又触发了新请求，标记需要尾随提取
+        self._extracting = False
+        self._pending_extraction = False
+        # 记忆整理器：仅在 memory_manager 装配时启用；门控由 consolidator 自管。
+        self._consolidator: MemoryConsolidator | None = None
+        if memory_manager is not None:
+            self._consolidator = MemoryConsolidator(work_dir)
+        # 当前会话 ID；由 app.py 在创建/恢复会话时设置，仅用于 transcript_path 提示。
+        self.session_id: str = ""
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -394,13 +419,20 @@ class Agent:
 
         return result
 
-    # 执行 Agent 主循环：注入环境 → MCP 连接 → 每轮 build_system_prompt → 模型流 → 工具执行 → 回灌。
+    # 执行 Agent 主循环：注入环境 → 长期记忆注入 → MCP 连接
+    # → 每轮 prompt → 模型流 → 工具执行 → 回灌。
     async def run(
         self, conversation: ConversationManager
     ) -> AsyncIterator[AgentEvent]:
         # 会话启动时注入会话级环境上下文（position 0，env_injected 标记只注入一次）。
         env_context = build_environment_context(self.work_dir)
         conversation.inject_environment(env_context)
+
+        # 长期记忆注入：load_instructions 拼接的指令 + MEMORY.md 索引内容 + 当前日期，
+        # 整体 <system-reminder> 包裹后插在 env 之后。ltm_injected 标记只注入一次。
+        # memory_manager 为 None 时跳过（向后兼容 batch01-07 行为）。
+        memory_content = self.memory_manager.load() if self.memory_manager else ""
+        conversation.inject_long_term_memory(self.instructions_content, memory_content)
 
         # MCP 连接：首轮启动时一次性连接所有 Server，注册工具并注入 instructions。
         # 单 Server 失败不阻断其它；连接结果通过 MCPConnectEvent 通知 TUI 展示摘要。
@@ -480,6 +512,10 @@ class Agent:
                 )
                 # 压缩后重新注入环境上下文（replace_history 已重置 env_injected）。
                 conversation.inject_environment(env_context)
+                # 压缩后重新注入长期记忆（replace_history 已重置 ltm_injected）。
+                # 重新加载 MEMORY.md 以反映整理或新增记忆后的最新索引。
+                mem = self.memory_manager.load() if self.memory_manager else ""
+                conversation.inject_long_term_memory(self.instructions_content, mem)
                 # 压缩后重新应用 budget，保证尾部保留的 tool_result 也走预算替换。
                 apply_tool_result_budget(
                     conversation, self.session_dir, self.replacement_state
@@ -563,6 +599,18 @@ class Agent:
                 conversation.add_assistant_message(
                     response.text, thinking_blocks=conv_thinking
                 )
+                # Loop 结束时异步触发记忆提取与整理门控检查。
+                # 提取用裸 LLM 调用不带工具，合并策略见 _extract_memories。
+                # 整理门控由 consolidator 自管，5 级门控全通过才 fork 子 Agent。
+                # 两者都不阻塞主循环，失败静默不影响用户回复。
+                if self.memory_manager is not None:
+                    asyncio.ensure_future(self._extract_memories(conversation))
+                if self._consolidator is not None:
+                    asyncio.ensure_future(
+                        self._consolidator.maybe_run(
+                            self.client, conversation, self.protocol
+                        )
+                    )
                 yield LoopComplete(total_turns=iteration)
                 break
 
@@ -816,3 +864,81 @@ class Agent:
             fp = persist_tool_result(tool_use_id, text, self.session_dir)
             return make_persisted_preview(text, fp)
         return text
+
+    # -----------------------------------------------------------------
+    # 跨会话记忆：提取合并策略 + 召回选择器注入点
+    # -----------------------------------------------------------------
+
+    # 触发记忆提取，使用 _extracting + _pending_extraction 双标志合并。
+    # 正在提取时新触发只标记 pending，当前提取完成后检查 pending 并尾随执行一次，
+    # 防止多个触发器同时执行导致重复提取污染索引。
+    async def _extract_memories(self, conversation: ConversationManager) -> None:
+        if not self.memory_manager:
+            return
+
+        # 合并策略：正在提取时暂存新请求，等当前提取完成后尾随执行。
+        if self._extracting:
+            self._pending_extraction = True
+            return
+
+        self._extracting = True
+        try:
+            await self.memory_manager.extract(
+                self.client, conversation, self.protocol
+            )
+        except Exception:
+            # 提取失败不阻塞主循环，下次 LoopComplete 会再次触发。
+            pass
+        finally:
+            self._extracting = False
+            # 检查是否有尾随提取请求；若有则递归处理。
+            if self._pending_extraction:
+                self._pending_extraction = False
+                await self._extract_memories(conversation)
+
+    # 把 LLM 客户端封装为 recall 模块使用的异步 SelectorFn。
+    # SelectorFn 接收 (system_prompt, user_message) 返回 LLM 原始输出文本；
+    # 这里调用 client.stream 裸流式调用并累积 TextDelta。
+    def _make_memory_selector(self) -> SelectorFn:
+        from seacode.client import StreamComplete, TextDelta
+
+        async def selector(system_prompt: str, user_message: str) -> str:
+            from seacode.conversation import Message
+
+            messages = [Message(role="user", content=user_message)]
+            collected = ""
+            async for event in self.client.stream(messages, system=system_prompt):
+                if isinstance(event, TextDelta):
+                    collected += event.text
+                elif isinstance(event, StreamComplete):
+                    pass
+            return collected
+
+        return selector
+
+    # 召回入口：扫描双目录、调用选择器挑选相关记忆、渲染 reminder。
+    # 失败静默返回空串；调用方（app.py）按需注入 system-reminder。
+    async def recall_memories(
+        self,
+        query: str,
+        recent_tools: list[str] | None,
+        already_surfaced: set[str] | None,
+    ) -> str:
+        if not self.memory_manager:
+            return ""
+        user_dir = self.memory_manager.user_mem_dir
+        proj_dir = self.memory_manager.project_mem_dir
+        memories = await find_relevant_memories(
+            query=query,
+            user_mem_dir=user_dir if user_dir else None,
+            project_mem_dir=proj_dir if proj_dir else None,
+            recent_tools=recent_tools,
+            already_surfaced=already_surfaced,
+            selector=self._make_memory_selector(),
+        )
+        if not memories:
+            return ""
+        try:
+            return render_reminder(memories)
+        except Exception:
+            return ""
