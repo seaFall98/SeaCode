@@ -43,7 +43,8 @@ class TeamCreateTool(Tool):
         '  "prompt": "...",\n'
         '  "description": "..."\n'
         "})\n```\n"
-        "不传 team_name 时 Agent 走一次性子 Agent 路径，会阻塞当前回合并直接返回 —— 它不会成为团队成员。\n\n"
+        "不传 team_name 时 Agent 走一次性子 Agent 路径，"
+        "会阻塞当前回合并直接返回 —— 它不会成为团队成员。\n\n"
         "## 队友 idle 状态\n\n"
         "队友每完成一轮就进入 idle，这是正常行为；向 idle 队友发消息会唤醒他们继续工作。\n\n"
         "## 通信\n\n"

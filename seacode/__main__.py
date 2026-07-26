@@ -67,35 +67,35 @@ def _parse_teammate_flags(argv: list[str]) -> tuple[bool, str, str]:
     return (is_teammate, team_name, agent_name)
 
 
-# 解析 -p / --prompt 与 --output-format 命令行标志。
-# 返回 (prompt, output_format)；prompt 为空表示未启用非交互模式。
-# output_format 仅支持 text / json / stream-json，默认 text。
-def _parse_prompt_flags(argv: list[str]) -> tuple[str, str]:
-    prompt = ""
-    output_format = "text"
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg in ("-p", "--prompt") and i + 1 < len(argv):
-            prompt = argv[i + 1]
-            i += 2
-            continue
-        if arg == "--output-format" and i + 1 < len(argv):
-            fmt = argv[i + 1]
-            if fmt in ("text", "json", "stream-json"):
-                output_format = fmt
-            i += 2
-            continue
-        i += 1
-    return prompt, output_format
-
-
 # 非交互模式：直接执行 prompt 并把结果输出到 stdout，用于脚本化调用与 CI 集成。
 # 不启动 TUI、不连接 MCP、不加载 Hook；保留权限检查与默认工具集，
 # 让 LLM 仍可调用 ReadFile / Bash 等完成实际任务。
-async def _run_prompt(prompt: str, output_format: str) -> None:
-    from .agent import Agent
+# -p 模式默认 DEFAULT 权限模式，PermissionRequest 事件自动批准避免阻塞；
+# 用户可通过 --mode bypassPermissions 完全跳过权限确认，或 --mode acceptEdits 放行写操作。
+# output_format 支持 text（默认，仅打印最终文本）与 stream-json（NDJSON 事件流）。
+async def _run_prompt(
+    prompt: str, output_format: str, mode_str: str | None
+) -> None:
+    import json
+    import time
+
+    from .agent import (
+        Agent,
+        CompactNotification,
+        ErrorEvent,
+        LoopComplete,
+        PermissionRequest,
+        PermissionResponse,
+        RetryEvent,
+        StreamText,
+        ThinkingText,
+        ToolResultEvent,
+        ToolUseEvent,
+        TurnComplete,
+        UsageEvent,
+    )
     from .client import create_client
+    from .conversation import ConversationManager
     from .permissions import PermissionChecker, PermissionMode
     from .permissions.dangerous import DangerousCommandDetector
     from .permissions.rules import RuleEngine
@@ -119,9 +119,11 @@ async def _run_prompt(prompt: str, output_format: str) -> None:
         print(f"SeaCode client error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
 
+    # 解析权限模式：--mode 优先，否则默认 DEFAULT（与 TUI 模式一致）。
+    permission_mode = PermissionMode(mode_str) if mode_str else PermissionMode.DEFAULT
+
     # 装配默认工具注册表与权限检查器；sandbox_enabled 关闭让 Bash 走常规确认。
-    # 非交互模式下无法弹 HITL 对话框，因此默认 BYPASS 避免阻塞；
-    # 用户若需严格权限，可在配置中切换 default 模式并配合 allow 规则。
+    # -p 模式下无法弹 HITL 对话框，PermissionRequest 事件在事件循环中自动批准。
     registry = create_default_registry()
     cwd = os.getcwd()
     sandbox = PathSandbox(project_root=cwd)
@@ -140,7 +142,7 @@ async def _run_prompt(prompt: str, output_format: str) -> None:
         detector=detector,
         sandbox=sandbox,
         rule_engine=rule_engine,
-        mode=PermissionMode.BYPASS,
+        mode=permission_mode,
         sandbox_enabled=False,
     )
 
@@ -154,14 +156,6 @@ async def _run_prompt(prompt: str, output_format: str) -> None:
         context_window=provider.get_context_window(),
     )
 
-    try:
-        result = await agent.run_to_completion(prompt)
-    except Exception as error:
-        print(f"SeaCode run error: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
-
-    # text 模式直接打印最终输出；json/stream-json 模式当前仅输出 text 字段，
-    # 完整结构化事件流需后续接入流式回调，本版以满足脚本化调用为主。
     # Windows 默认 GBK 无法编码 emoji 等 Unicode 字符，强制 stdout 用 UTF-8。
     try:
         # TextIO 在类型存根中没有 reconfigure，但 CPython 运行时存在该方法。
@@ -170,15 +164,107 @@ async def _run_prompt(prompt: str, output_format: str) -> None:
             _reconfigure(encoding="utf-8")
     except (AttributeError, OSError):
         pass
-    if output_format == "json":
-        import json
 
-        print(json.dumps({"text": result}, ensure_ascii=False))
-    else:
-        # text 与 stream-json 当前都按纯文本输出最终结果。
-        sys.stdout.write(result)
-        if not result.endswith("\n"):
-            sys.stdout.write("\n")
+    is_json = output_format == "stream-json"
+
+    def emit_json(obj: dict) -> None:
+        """输出一行 NDJSON 到 stdout。"""
+        print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+    conv = ConversationManager()
+    conv.add_user_message(prompt)
+
+    start = time.monotonic()
+    text_buf = ""
+    total_input = 0
+    total_output = 0
+    tool_calls: list[dict] = []
+
+    try:
+        # 消费 agent.run() 事件流；text 模式累积最终文本，stream-json 模式逐事件 emit。
+        async for event in agent.run(conv):
+            if isinstance(event, StreamText):
+                text_buf += event.text
+                if is_json:
+                    emit_json({"type": "assistant", "text": event.text})
+            elif isinstance(event, ThinkingText):
+                if is_json:
+                    emit_json({"type": "thinking", "text": event.text})
+            elif isinstance(event, ToolUseEvent):
+                tool_calls.append({"name": event.tool_name, "is_error": False})
+                if is_json:
+                    emit_json({
+                        "type": "tool_use",
+                        "tool_name": event.tool_name,
+                        "tool_id": event.tool_id,
+                        "args": event.arguments,
+                    })
+            elif isinstance(event, ToolResultEvent):
+                # 回填最后一个同名 tool_call 的 is_error 状态。
+                if tool_calls:
+                    tool_calls[-1]["is_error"] = event.is_error
+                if is_json:
+                    emit_json({
+                        "type": "tool_result",
+                        "tool_name": event.tool_name,
+                        "tool_id": event.tool_id,
+                        "output": event.output,
+                        "is_error": event.is_error,
+                        "elapsed": round(event.elapsed, 3),
+                    })
+            elif isinstance(event, UsageEvent):
+                total_input = event.input_tokens
+                total_output = event.output_tokens
+                if is_json:
+                    emit_json({
+                        "type": "usage",
+                        "input_tokens": event.input_tokens,
+                        "output_tokens": event.output_tokens,
+                    })
+            elif isinstance(event, TurnComplete):
+                if is_json:
+                    emit_json({"type": "turn_complete", "turn": event.turn})
+            elif isinstance(event, LoopComplete):
+                # 最终结果：stream-json 输出 result 行，text 模式直接打印文本。
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                if is_json:
+                    emit_json({
+                        "type": "result",
+                        "result": text_buf,
+                        "duration_ms": elapsed_ms,
+                        "num_turns": event.total_turns,
+                        "tool_calls": tool_calls,
+                        "usage": {
+                            "input_tokens": total_input,
+                            "output_tokens": total_output,
+                        },
+                        "stop_reason": "end_turn",
+                    })
+                else:
+                    sys.stdout.write(text_buf)
+                    if not text_buf.endswith("\n"):
+                        sys.stdout.write("\n")
+                break
+            elif isinstance(event, ErrorEvent):
+                if is_json:
+                    emit_json({"type": "error", "message": event.message})
+                else:
+                    print(f"Error: {event.message}", file=sys.stderr, flush=True)
+            elif isinstance(event, CompactNotification):
+                if is_json:
+                    emit_json({"type": "compact", "message": event.message})
+            elif isinstance(event, RetryEvent):
+                if is_json:
+                    emit_json({"type": "retry", "reason": event.reason})
+            elif isinstance(event, PermissionRequest):
+                # -p 非交互模式：自动批准所有权限请求，避免事件循环阻塞。
+                event.future.set_result(PermissionResponse.ALLOW)
+    except Exception as error:
+        if is_json:
+            emit_json({"type": "error", "message": str(error)})
+        else:
+            print(f"SeaCode run error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
 
 
 # batch14：teammate worker 入口；加载 config → 注册 self/lead 名字 → 构造 Agent → spawn。
@@ -269,16 +355,44 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
 
 # 加载本地配置并启动交互式终端应用。
 def main() -> None:
-    # 非交互模式优先：-p / --prompt 触发 _run_prompt，直接执行并输出到 stdout。
-    prompt, output_format = _parse_prompt_flags(sys.argv)
-    if prompt:
-        asyncio.run(_run_prompt(prompt, output_format))
-        return
+    import argparse
 
     # batch14：teammate worker 入口；--teammate 标志触发 _run_teammate。
+    # 必须在 argparse 之前拦截，走独立的 worker 分支而不是正常 TUI。
     is_teammate, team_name, agent_name = _parse_teammate_flags(sys.argv)
     if is_teammate:
         asyncio.run(_run_teammate(team_name, agent_name))
+        return
+
+    from .permissions import PermissionMode
+
+    parser = argparse.ArgumentParser(
+        prog="sea", description="SeaCode AI coding assistant"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=[m.value for m in PermissionMode],
+        default=None,
+        help="Permission mode (overrides config.yaml)",
+    )
+    parser.add_argument(
+        "-p",
+        metavar="PROMPT",
+        default=None,
+        help="Run non-interactively: execute the prompt and print the result to stdout",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["text", "stream-json"],
+        default="text",
+        help="Output format for -p mode: 'text' (default) prints final text, "
+        "'stream-json' emits NDJSON events",
+    )
+    args = parser.parse_args()
+
+    # 非交互模式优先：-p 触发 _run_prompt，直接执行并输出到 stdout。
+    if args.p is not None:
+        asyncio.run(_run_prompt(args.p, args.output_format, args.mode))
         return
 
     try:
