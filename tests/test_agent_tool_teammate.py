@@ -71,8 +71,10 @@ class _FakeTeamManager:
         self._team = team
         self.detect_calls: list[tuple[str, bool]] = []
         self.mailbox = MagicMock()
-        self.register_inprocess_calls: list[tuple[str, str, Any]] = []
-        self.register_pane_calls: list[tuple[str, str, str]] = []
+        # register_inprocess_handle / register_pane_id 改为按 agent_id 索引；
+        # 测试断言用 (agent_id, handle) / (agent_id, pane_id) 元组。
+        self.register_inprocess_calls: list[tuple[str, Any]] = []
+        self.register_pane_calls: list[tuple[str, str]] = []
         self.register_member_calls: list[tuple[str, TeammateInfo]] = []
 
     def detect_backend(self, teammate_mode: str, is_interactive: bool) -> BackendType:
@@ -85,15 +87,11 @@ class _FakeTeamManager:
     def get_mailbox(self, name: str) -> Any:
         return self.mailbox
 
-    def register_inprocess_handle(
-        self, team_name: str, member_name: str, handle: Any
-    ) -> None:
-        self.register_inprocess_calls.append((team_name, member_name, handle))
+    def register_inprocess_handle(self, agent_id: str, handle: Any) -> None:
+        self.register_inprocess_calls.append((agent_id, handle))
 
-    def register_pane_id(
-        self, team_name: str, member_name: str, pane_id: str
-    ) -> None:
-        self.register_pane_calls.append((team_name, member_name, pane_id))
+    def register_pane_id(self, agent_id: str, pane_id: str) -> None:
+        self.register_pane_calls.append((agent_id, pane_id))
 
     def register_member(
         self, team_name: str, member: TeammateInfo
@@ -304,10 +302,10 @@ async def test_execute_as_teammate_in_process_full_flow(
     assert spawn_calls[0]["name"] == "alice"
     assert spawn_calls[0]["task"] == "read README.md"
     assert spawn_calls[0]["lead_agent_id"] == "lead-id"
-    # 确认 register_inprocess_handle 调用。
+    # 确认 register_inprocess_handle 按 agent_id 调用。
     assert len(team_manager.register_inprocess_calls) == 1
-    assert team_manager.register_inprocess_calls[0][0] == "demo"
-    assert team_manager.register_inprocess_calls[0][1] == "alice"
+    # agent_id 形如 "alice-<8hex>"，仅校验前缀而非完整值。
+    assert team_manager.register_inprocess_calls[0][0].startswith("alice-")
     # 确认 register_member 调用。
     assert len(team_manager.register_member_calls) == 1
     member = team_manager.register_member_calls[0][1]
@@ -366,7 +364,8 @@ async def test_execute_as_teammate_tmux_backend(
     assert tmux_calls[0][0] == "demo"
     assert tmux_calls[0][1] == "alice"
     assert len(team_manager.register_pane_calls) == 1
-    assert team_manager.register_pane_calls[0][2] == "%5"
+    # register_pane_calls 现为 (agent_id, pane_id) 元组；pane_id 仍是第二个元素。
+    assert team_manager.register_pane_calls[0][1] == "%5"
     # tmux 后端不调用 register_inprocess_handle。
     assert len(team_manager.register_inprocess_calls) == 0
 

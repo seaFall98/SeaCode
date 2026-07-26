@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class SendMessageParams(BaseModel):
-    # to 支持具体名称或 "*"（广播）；message 必填；summary 仅 text 类型必填。
+    # to 支持具体名称、agent_id 或 "*"（广播）；message 必填；summary 仅 text 类型必填。
     to: str
     message: str
     summary: str = ""
@@ -79,7 +79,7 @@ class SendMessageTool(Tool):
         from_agent = self._from_agent_id
 
         if tool_params.to == "*":
-            # 广播：排除发送者；非 lead 发送时带 lead。
+            # 广播：排除发送者；非 lead 发送时带 lead，并按 agent_id 唤醒各收件人 pane。
             recipients = [
                 m.agent_id for m in team.members if m.agent_id != from_agent
             ]
@@ -94,6 +94,10 @@ class SendMessageTool(Tool):
                 metadata=tool_params.metadata,
             )
             mailbox.broadcast(msg, recipients, exclude=from_agent)
+            # 广播路径同样需要唤醒所有收件人 pane；Lead 主进程无 pane_id 时跳过。
+            for recipient_id in recipients:
+                if recipient_id != from_agent:
+                    self._wake_pane(recipient_id)
         else:
             # Lead 是团队角色名，始终解析为当前团队保存的稳定标识。
             agent_id: str | None
@@ -119,16 +123,16 @@ class SendMessageTool(Tool):
                 return ToolResult(
                     content=f"写入邮箱失败: {e}", is_error=True
                 )
-            # pane 后端唤醒：in-process 无需唤醒。
-            self._wake_pane(tool_params.to)
+            # 按 agent_id 唤醒目标 pane；in-process / Lead 主进程无 pane_id 时跳过。
+            self._wake_pane(agent_id)
 
         return ToolResult(
             content=f"消息已发送给 {tool_params.to}", is_error=False
         )
 
-    # 唤醒 pane 后端的 teammate；in-process 后端无 pane_id 时跳过。
-    def _wake_pane(self, member_name: str) -> None:
-        pane_id = self._team_manager.get_pane_id(self._team_name, member_name)
+    # 唤醒 pane 后端的 teammate；in-process 后端或 Lead 主进程无 pane_id 时跳过。
+    def _wake_pane(self, agent_id: str) -> None:
+        pane_id = self._team_manager.get_pane_id(agent_id)
         if pane_id:
             try:
                 from seacode.teams.spawn_tmux import send_keys_to_pane

@@ -505,7 +505,7 @@ class AgentTool(Tool):
                 lead_agent_id=team.lead_agent_id,
             )
             self.team_manager.register_inprocess_handle(
-                team_name, teammate_name, handle
+                teammate_agent_id, handle
             )
         elif backend in (BackendType.TMUX, BackendType.ITERM2):
             # pane 后端：spawn 前先把初始任务投进队友邮箱，
@@ -529,14 +529,14 @@ class AgentTool(Tool):
                         team_name, teammate_name, wt.path
                     )
                     self.team_manager.register_pane_id(
-                        team_name, teammate_name, tmux_pane.pane_id
+                        teammate_agent_id, tmux_pane.pane_id
                     )
                 else:  # BackendType.ITERM2
                     iterm_pane = spawn_iterm2_teammate(
                         team_name, teammate_name, wt.path
                     )
                     self.team_manager.register_pane_id(
-                        team_name, teammate_name, iterm_pane.session_id
+                        teammate_agent_id, iterm_pane.session_id
                     )
             except Exception as e:
                 log.warning("pane spawn 失败: %s", e)

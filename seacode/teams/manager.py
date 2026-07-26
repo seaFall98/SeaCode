@@ -37,8 +37,10 @@ class TeamManager:
         self._teams: dict[str, AgentTeam] = {}
         self._task_stores: dict[str, SharedTaskStore] = {}
         self._mailboxes: dict[str, Mailbox] = {}
-        self._inprocess_handles: dict[tuple[str, str], InProcessTeammateHandle] = {}
-        self._pane_ids: dict[tuple[str, str], str] = {}
+        # 三张运行时索引统一以 agent_id 为键，让 SendMessage / pane 唤醒 /
+        # idle 收敛等跨模块查找都能用同一身份定位，不必再 (team_name, member_name) 反查。
+        self._inprocess_handles: dict[str, InProcessTeammateHandle] = {}
+        self._pane_ids: dict[str, str] = {}
         self._teammate_team_map: dict[str, str] = {}
         self._detected_backend: BackendType | None = None
 
@@ -105,18 +107,18 @@ class TeamManager:
         self._mailboxes[name] = mailbox
         return mailbox
 
-    # 注册成员到团队并持久化；同时记录 teammate→team 映射，附加已有 handle 的 progress。
+    # 注册成员到团队并持久化；同时记录 agent_id→team 映射，附加已有 handle 的 progress。
     def register_member(self, team_name: str, member: TeammateInfo) -> None:
         team = self.get_team(team_name)
         if team is None:
             raise TeamError(f"team {team_name} not found")
         team.add_member(member)
         # 若已有 in-process handle，附加其 progress 供 get_all_teammate_progress 收集。
-        handle = self._inprocess_handles.get((team_name, member.name))
+        handle = self._inprocess_handles.get(member.agent_id)
         if handle is not None and handle.progress is not None:
             member.progress = handle.progress
         team.save()
-        self._teammate_team_map[member.name] = team_name
+        self._teammate_team_map[member.agent_id] = team_name
 
     # 标记成员 idle 并向该团队保存的 Lead 邮箱写 idle 通知。
     def set_member_idle(self, team_name: str, member_name: str, reason: str) -> None:
@@ -137,24 +139,28 @@ class TeamManager:
             ),
         )
 
-    # 注册 in-process handle；若成员已注册，附加 progress。
+    # 注册 in-process handle；按 agent_id 索引，便于跨模块按身份唤醒或附加 progress。
     def register_inprocess_handle(
-        self, team_name: str, member_name: str, handle: InProcessTeammateHandle
+        self, agent_id: str, handle: InProcessTeammateHandle
     ) -> None:
-        self._inprocess_handles[(team_name, member_name)] = handle
-        team = self.get_team(team_name)
-        if team is not None:
-            member = team.get_member(member_name)
-            if member is not None and handle.progress is not None:
-                member.progress = handle.progress
+        self._inprocess_handles[agent_id] = handle
+        team_name = self._teammate_team_map.get(agent_id)
+        if team_name is not None:
+            team = self.get_team(team_name)
+            if team is not None:
+                member = next(
+                    (m for m in team.members if m.agent_id == agent_id), None
+                )
+                if member is not None and handle.progress is not None:
+                    member.progress = handle.progress
 
-    # 注册 pane 后端的 pane_id（tmux pane_id 或 iTerm2 session_id）。
-    def register_pane_id(self, team_name: str, member_name: str, pane_id: str) -> None:
-        self._pane_ids[(team_name, member_name)] = pane_id
+    # 注册 pane 后端的 pane_id（tmux pane_id 或 iTerm2 session_id）；按 agent_id 索引。
+    def register_pane_id(self, agent_id: str, pane_id: str) -> None:
+        self._pane_ids[agent_id] = pane_id
 
-    # 获取成员的 pane_id；in-process 后端返回 None。
-    def get_pane_id(self, team_name: str, member_name: str) -> str | None:
-        return self._pane_ids.get((team_name, member_name))
+    # 获取成员的 pane_id；in-process 后端或 Lead 主进程返回 None。
+    def get_pane_id(self, agent_id: str) -> str | None:
+        return self._pane_ids.get(agent_id)
 
     # 6 步全链路删除团队：活跃检查 → 注销名字 → cancel/kill → 清理 worktree → 清理邮箱 → 删目录。
     async def delete_team(self, name: str) -> None:
@@ -175,13 +181,13 @@ class TeamManager:
 
         # 第 3 步：cancel in-process handle 与 kill pane。
         for member in team.members:
-            handle = self._inprocess_handles.pop((name, member.name), None)
+            handle = self._inprocess_handles.pop(member.agent_id, None)
             if handle is not None:
                 try:
                     handle.cancel()
                 except Exception as e:
                     log.warning("cancel handle %s failed: %s", member.name, e)
-            pane_id = self._pane_ids.pop((name, member.name), None)
+            pane_id = self._pane_ids.pop(member.agent_id, None)
             if pane_id:
                 self._kill_pane(pane_id)
 
@@ -208,15 +214,15 @@ class TeamManager:
         self._task_stores.pop(name, None)
         self._mailboxes.pop(name, None)
         for m in team.members:
-            self._teammate_team_map.pop(m.name, None)
+            self._teammate_team_map.pop(m.agent_id, None)
 
     # 返回当前内存中所有团队名。
     def list_teams(self) -> list[str]:
         return list(self._teams.keys())
 
-    # 按 teammate 名字反查所属团队名。
-    def get_team_for_teammate(self, member_name: str) -> str | None:
-        return self._teammate_team_map.get(member_name)
+    # 按 agent_id 反查所属团队名；用于跨模块按身份定位 team。
+    def get_team_for_teammate(self, agent_id: str) -> str | None:
+        return self._teammate_team_map.get(agent_id)
 
     # 消费每个团队保存的 Lead 邮箱，拼成 <team-notification> XML 列表。
     def drain_lead_mailbox(self) -> list[str]:

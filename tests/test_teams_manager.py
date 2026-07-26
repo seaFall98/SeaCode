@@ -126,7 +126,7 @@ async def test_get_task_store_and_mailbox(
     assert mgr.get_mailbox("demo") is not None
 
 
-# 验证 register_member 持久化到 config.json 且记录 teammate→team 映射。
+# 验证 register_member 持久化到 config.json 且记录 agent_id→team 映射。
 @pytest.mark.asyncio
 async def test_register_member_persists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -146,8 +146,8 @@ async def test_register_member_persists(
     cfg = json.loads((tmp_path / ".seacode" / "teams" / "demo" / "config.json").read_text("utf-8"))
     assert len(cfg["members"]) == 1
     assert cfg["members"][0]["name"] == "alice"
-    # teammate→team 映射。
-    assert mgr.get_team_for_teammate("alice") == "demo"
+    # agent_id→team 映射。
+    assert mgr.get_team_for_teammate("a1") == "demo"
 
 
 # 验证 register_member 团队不存在时抛 TeamError。
@@ -198,12 +198,12 @@ async def test_register_handles_and_pane_ids(
 
     fake_handle = MagicMock()
     fake_handle.progress = TeammateProgress(name="alice", team_name="demo")
-    mgr.register_inprocess_handle("demo", "alice", fake_handle)
-    assert mgr._inprocess_handles[("demo", "alice")] is fake_handle
+    mgr.register_inprocess_handle("a1", fake_handle)
+    assert mgr._inprocess_handles["a1"] is fake_handle
 
-    mgr.register_pane_id("demo", "bob", "%5")
-    assert mgr.get_pane_id("demo", "bob") == "%5"
-    assert mgr.get_pane_id("demo", "alice") is None
+    mgr.register_pane_id("b1", "%5")
+    assert mgr.get_pane_id("b1") == "%5"
+    assert mgr.get_pane_id("a1") is None
 
 
 # 验证 register_inprocess_handle 在成员已注册时附加 progress。
@@ -223,7 +223,7 @@ async def test_register_inprocess_handle_attaches_progress(
     fake_handle = MagicMock()
     fake_progress = TeammateProgress(name="alice", team_name="demo")
     fake_handle.progress = fake_progress
-    mgr.register_inprocess_handle("demo", "alice", fake_handle)
+    mgr.register_inprocess_handle("a1", fake_handle)
 
     team = mgr.get_team("demo")
     assert team is not None
@@ -267,8 +267,8 @@ async def test_delete_team_full_cleanup(
 
     # 注册 handle 与 pane_id。
     fake_handle = MagicMock()
-    mgr.register_inprocess_handle("demo", "alice", fake_handle)
-    mgr.register_pane_id("demo", "alice", "%5")
+    mgr.register_inprocess_handle("a1", fake_handle)
+    mgr.register_pane_id("a1", "%5")
 
     # mock _kill_pane / _cleanup_worktree 避免真实调用。
     with patch.object(mgr, "_kill_pane") as mock_kill, \
@@ -287,7 +287,7 @@ async def test_delete_team_full_cleanup(
     # 内存缓存被清理。
     assert "demo" not in mgr._teams
     assert "demo" not in mgr._mailboxes
-    assert mgr.get_team_for_teammate("alice") is None
+    assert mgr.get_team_for_teammate("a1") is None
 
 
 # 验证 delete_team 团队不存在时抛 TeamError。
@@ -315,8 +315,8 @@ async def test_list_teams_and_get_team_for_teammate(
         worktree_path="/wt", backend_type=BackendType.IN_PROCESS,
     )
     mgr.register_member("demo", member)
-    assert mgr.get_team_for_teammate("alice") == "demo"
-    assert mgr.get_team_for_teammate("bob") is None
+    assert mgr.get_team_for_teammate("a1") == "demo"
+    assert mgr.get_team_for_teammate("b1") is None
 
 
 # 验证 drain_lead_mailbox 拼成 <team-notification> XML。

@@ -123,10 +123,10 @@ def spawn_inprocess_teammate(
     mailbox: Mailbox | None = None,
     lead_agent_id: str = LEAD_NAME,
 ) -> InProcessTeammateHandle:
-    # team_name 优先从 team_manager 反查；查不到时 progress.team_name 暂为空。
+    # team_name 优先从 team_manager 按 agent_id 反查；查不到时 progress.team_name 暂为空。
     team_name = ""
     if team_manager is not None:
-        team_name = team_manager.get_team_for_teammate(name) or ""
+        team_name = team_manager.get_team_for_teammate(agent.agent_id) or ""
     progress = TeammateProgress(
         name=name, team_name=team_name, spinner_verb=random_verb()
     )
@@ -134,7 +134,9 @@ def spawn_inprocess_teammate(
     if team_name and team_manager is not None:
         team = team_manager.get_team(team_name)
         if team is not None:
-            member = team.get_member(name)
+            member = next(
+                (m for m in team.members if m.agent_id == agent.agent_id), None
+            )
             if member is not None:
                 member.progress = progress
 

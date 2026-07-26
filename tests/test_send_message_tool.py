@@ -171,7 +171,8 @@ async def test_send_message_wakes_pane(
     mgr = TeamManager()
     team = AgentTeam(name="demo", lead_agent_id="lead-1")
     mgr._teams["demo"] = team
-    mgr.register_pane_id("demo", "alice", "%5")
+    # pane_id 按 agent_id 索引；send_message 通过 AgentNameRegistry 解析得到 a1 后唤醒。
+    mgr.register_pane_id("a1", "%5")
 
     tool = SendMessageTool(mgr, "demo", "lead-1", "lead")
     params = SendMessageParams(
@@ -182,4 +183,49 @@ async def test_send_message_wakes_pane(
     ) as mock_send:
         await tool.execute(params)
     mock_send.assert_called_once_with("%5", "")
+    AgentNameRegistry.instance().reset()
+
+
+# 验证广播路径会唤醒每个有 pane_id 的收件人，包括 lead。
+# 构造 alice + bob + lead-1 三个 agent_id，仅 alice 与 bob 有 pane_id；
+# 断言 send_keys_to_pane 被调用两次（lead 主进程无 pane_id 时跳过）。
+@pytest.mark.asyncio
+async def test_send_message_broadcast_wakes_all_recipients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    AgentNameRegistry.instance().reset()
+
+    from seacode.teams.manager import TeamManager
+
+    mgr = TeamManager()
+    # bob 作为团队成员发送广播；recipients 应为 alice + lead-1（排除 bob 自己）。
+    team = AgentTeam(name="demo", lead_agent_id="lead-1")
+    team.add_member(TeammateInfo(
+        name="alice", agent_id="a1", agent_type="t", model="m",
+        worktree_path="/wt", backend_type=BackendType.TMUX,
+    ))
+    team.add_member(TeammateInfo(
+        name="bob", agent_id="b1", agent_type="t", model="m",
+        worktree_path="/wt", backend_type=BackendType.TMUX,
+    ))
+    mgr._teams["demo"] = team
+    # alice 与 lead 都有 pane_id（lead 在跨进程 pane 后端时也会被注册）。
+    mgr.register_pane_id("a1", "%5")
+    mgr.register_pane_id("lead-1", "%9")
+
+    tool = SendMessageTool(mgr, "demo", "b1", "bob")
+    params = SendMessageParams(
+        to="*", message="standup", summary="daily",
+    )
+    with patch(
+        "seacode.teams.spawn_tmux.send_keys_to_pane"
+    ) as mock_send:
+        result = await tool.execute(params)
+
+    assert not result.is_error
+    # alice 与 lead 各被唤醒一次；bob 自己被排除。
+    assert mock_send.call_count == 2
+    called_panes = {call.args[0] for call in mock_send.call_args_list}
+    assert called_panes == {"%5", "%9"}
     AgentNameRegistry.instance().reset()

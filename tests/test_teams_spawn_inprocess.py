@@ -119,6 +119,7 @@ async def test_spawn_inprocess_no_mailbox_single_run(monkeypatch: pytest.MonkeyP
     fake_agent.agent_id = "agent-1"
     fake_agent.run_to_completion = AsyncMock(return_value="done")
     fake_team_manager = MagicMock()
+    # spawn_inprocess 按 agent.agent_id 反查 team_name；查不到时 progress.team_name 为空。
     fake_team_manager.get_team_for_teammate.return_value = ""
 
     handle = spawn_inprocess_teammate(
