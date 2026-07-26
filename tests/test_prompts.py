@@ -274,6 +274,17 @@ def test_environment_section_defaults_to_detect_environment(
     assert "Working directory: /custom" in section.content
 
 
+# 验证 USING_TOOLS_SECTION 含 Agent/Team/ToolSearch 三条工具使用指引。
+# 缺少这些指引会让模型不知道可委派子 Agent 或组建团队，影响正常使用。
+def test_using_tools_section_contains_agent_team_toolsearch_guidance() -> None:
+    content = USING_TOOLS_SECTION.content
+    assert "Use the Agent tool to delegate" in content
+    assert "TeamCreate" in content
+    assert "team_name parameter" in content
+    assert "SendMessage" in content
+    assert "ToolSearch to find and load" in content
+
+
 # ---------------------------------------------------------------------------
 # build_system_prompt
 # ---------------------------------------------------------------------------

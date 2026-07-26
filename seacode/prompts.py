@@ -113,7 +113,7 @@ Examples of risky actions that warrant user confirmation:
 When you encounter an obstacle, do not use destructive actions as a shortcut. Try to identify root causes rather than bypassing safety checks. If you discover unexpected state like unfamiliar files or branches, investigate before deleting — it may be the user's in-progress work.""",
 )
 
-# 工具使用指南段，保留 batch02 删减版仅含六个核心工具相关句子。
+# 工具使用指南段，覆盖核心工具优先级、并行调用、子 Agent 委派与团队协作。
 USING_TOOLS_SECTION = PromptSection(
     name="UsingTools",
     priority=40,
@@ -127,7 +127,10 @@ USING_TOOLS_SECTION = PromptSection(
    - Use Grep instead of grep or rg for searching file contents
    - Reserve Bash exclusively for system commands and operations that require shell execution
  - You can call multiple tools in a single response. If tools are independent of each other, call them all in parallel for maximum efficiency. Only call tools sequentially when one depends on the result of another.
- - When running multiple independent Bash commands, make separate parallel tool calls rather than chaining with &&.""",
+ - When running multiple independent Bash commands, make separate parallel tool calls rather than chaining with &&.
+ - Use the Agent tool to delegate complex, multi-step tasks to specialized sub-agents.
+ - When the user asks multiple agents to collaborate, form a team, or needs agents to communicate with each other, use TeamCreate to create a team, then spawn teammates with the Agent tool's team_name parameter. Teammates are long-running and communicate via SendMessage, unlike regular sub-agents which block and return inline.
+ - Some specialized tools are deferred and not listed in your initial tool set. If you need a tool that isn't available, use ToolSearch to find and load it.""",
 )
 
 # 延迟工具搜索段，引导模型在 MCP 工具未加载 Schema 时先用 ToolSearch 发现。
