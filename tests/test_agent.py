@@ -46,6 +46,7 @@ from seacode.permissions import (
 from seacode.tools import ToolRegistry, partition_tool_calls
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 from seacode.tools.exit_plan_mode import ExitPlanModeTool
+from seacode.tools.read_file import ReadFile
 
 
 # 可控返回结果或抛出异常的测试工具，支持自定义名称以区分多工具场景。
@@ -288,6 +289,108 @@ async def test_single_tool_call_round_trip() -> None:
     assert conversation.messages[2].tool_uses[0].tool_name == "MockTool"
     assert conversation.messages[3].tool_results[0].content == "file body"
     assert conversation.messages[4].content == "Done"
+
+
+# 验证直接执行成功的 ReadFile 会保存文件原始内容，供后续恢复使用。
+# 写入临时文件后直接调用执行入口，断言快照内容来自本地文件而不是工具输出。
+@pytest.mark.asyncio
+async def test_direct_read_file_execution_records_recovery_snapshot(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "settings.py"
+    file_path.write_text("PORT = 8080\n", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register(ReadFile())
+    agent = Agent(
+        client=_FakeClient([]), registry=registry, protocol="anthropic"
+    )
+
+    execution = await agent._execute_single_tool_direct(
+        ToolCallComplete(
+            tool_id="read-direct",
+            tool_name="ReadFile",
+            arguments={"file_path": str(file_path)},
+        )
+    )
+
+    assert execution.result.is_error is False
+    snapshots = agent.recovery_state.snapshot_files(1)
+    assert len(snapshots) == 1
+    assert snapshots[0].path == str(file_path)
+    assert snapshots[0].content == "PORT = 8080\n"
+
+
+# 验证流式工具执行完成后同样会保存 ReadFile 的恢复快照。
+# 模型流中发出文件读取并继续到最终文本，断言快照保留原始文件内容。
+@pytest.mark.asyncio
+async def test_streamed_read_file_execution_records_recovery_snapshot(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "config.toml"
+    file_path.write_text("[server]\nport = 9000\n", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register(ReadFile())
+    client = _FakeClient(
+        [
+            _tool_call_stream(
+                "read-stream",
+                "ReadFile",
+                {"file_path": str(file_path)},
+            ),
+            _text_stream("Read complete"),
+        ]
+    )
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("Read config")
+
+    await _collect(agent.run(conversation))
+
+    snapshots = agent.recovery_state.snapshot_files(1)
+    assert len(snapshots) == 1
+    assert snapshots[0].path == str(file_path)
+    assert snapshots[0].content == "[server]\nport = 9000\n"
+
+
+# 验证人工确认后延迟执行成功的 ReadFile 也会保存恢复快照。
+# 强制 ReadFile 走 ask 决策并回复允许，断言延迟路径记录实际文件内容。
+@pytest.mark.asyncio
+async def test_approved_read_file_execution_records_recovery_snapshot(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "approved.txt"
+    file_path.write_text("approved content\n", encoding="utf-8")
+    checker = _make_test_checker(project_root=str(tmp_path))
+    read_tool = ReadFile()
+    read_tool.category = ToolCategory.WRITE
+    registry = ToolRegistry()
+    registry.register(read_tool)
+    client = _FakeClient(
+        [
+            _tool_call_stream(
+                "read-approved",
+                "ReadFile",
+                {"file_path": str(file_path)},
+            ),
+            _text_stream("Approved read complete"),
+        ]
+    )
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol="anthropic",
+        permission_checker=checker,
+    )
+    conversation = ConversationManager()
+    conversation.add_user_message("Read approved file")
+
+    events = await _collect_with_permissions(agent.run(conversation))
+
+    assert any(isinstance(event, PermissionRequest) for event in events)
+    snapshots = agent.recovery_state.snapshot_files(1)
+    assert len(snapshots) == 1
+    assert snapshots[0].path == str(file_path)
+    assert snapshots[0].content == "approved content\n"
 
 
 # ---------------------------------------------------------------------------

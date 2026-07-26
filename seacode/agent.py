@@ -1179,6 +1179,7 @@ class Agent:
         except Exception as e:
             result = ToolResult(content=f"Tool execution error: {e}", is_error=True)
 
+        self._snapshot_file_read_for_recovery(tc, result)
         return _ToolExecResult(
             tool_id=tc.tool_id,
             tool_name=tc.tool_name,
@@ -1265,7 +1266,23 @@ class Agent:
         except Exception as e:
             result = ToolResult(content=f"Tool execution error: {e}", is_error=True)
 
+        self._snapshot_file_read_for_recovery(tc, result)
         yield result, time.monotonic() - start, False
+
+    # 成功读取文件后保存原始内容，供上下文压缩恢复时重新附加。
+    def _snapshot_file_read_for_recovery(
+        self, tc: ToolCallComplete, result: ToolResult
+    ) -> None:
+        if tc.tool_name != "ReadFile" or result.is_error:
+            return
+        file_path = tc.arguments.get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            return
+        try:
+            content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        self.recovery_state.record_file_read(file_path, content)
 
     # 并发执行一批工具调用；第 06 步 MCP 延迟工具的并发路径会消费。
     async def _execute_batch_parallel(
