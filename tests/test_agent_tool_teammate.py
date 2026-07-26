@@ -432,6 +432,17 @@ def test_teammate_addendum_contains_context_marker() -> None:
     assert "SendMessage" in TEAMMATE_ADDENDUM
 
 
+# 验证 AgentTool.description 含 team_name 引导，让模型知道可 spawn 长驻 teammate。
+# 直接断言 description 包含 team_name / teammate / SendMessage 关键字。
+def test_agent_tool_description_covers_team_path() -> None:
+    from seacode.tools.agent_tool import AgentTool
+
+    desc = AgentTool.description
+    assert "team_name" in desc
+    assert "teammate" in desc.lower()
+    assert "SendMessage" in desc
+
+
 # 验证 teammate Agent 的 _current_definition.system_prompt 含 TEAMMATE_ADDENDUM。
 # 执行 in-process 路径，捕获 spawn 的 agent 参数，检查其 _current_definition。
 @pytest.mark.asyncio

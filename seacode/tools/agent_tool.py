@@ -75,8 +75,13 @@ class AgentTool(Tool):
 
     name = "Agent"
     description = (
-        "Launch a sub-agent to handle a bounded task. Pass subagent_type for "
-        "defined agents; leave empty to fork the current conversation."
+        "Launch a sub-agent to handle a task in an isolated context. "
+        "Use subagent_type to select a predefined agent type (e.g. Explore, "
+        "Plan, general-purpose), or leave it empty to fork the current "
+        "conversation. Use team_name (together with name) to spawn a "
+        "long-running teammate in an existing team — teammates persist after "
+        "the lead returns and communicate via SendMessage, unlike regular "
+        "sub-agents which block and return inline."
     )
     category = ToolCategory.COMMAND
     is_system_tool = False

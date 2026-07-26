@@ -130,3 +130,15 @@ async def test_team_create_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result.is_error
     assert "创建团队失败" in result.content
+
+
+# 验证 TeamCreateTool.description 含团队工作流关键提示，让模型能正确使用。
+# 直接断言 description 包含 team_name / name / SendMessage / idle 等关键字。
+def test_team_create_description_covers_workflow() -> None:
+    desc = TeamCreateTool.description
+    assert "team_name" in desc
+    assert "name" in desc
+    assert "SendMessage" in desc
+    assert "idle" in desc
+    # 必须明确告知不传 team_name 走一次性子 Agent 路径。
+    assert "不会成为团队成员" in desc

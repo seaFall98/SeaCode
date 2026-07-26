@@ -22,7 +22,35 @@ class TeamCreateParams(BaseModel):
 class TeamCreateTool(Tool):
     # 创建团队工具；enable_coordinator_mode=True 时同步收敛 Lead 工具集。
     name = "TeamCreate"
-    description = "建立长期团队，Lead 可在团队中 spawn 长驻 teammate"
+    description = (
+        "创建一个长期团队用于协调多个 Agent 协作。\n\n"
+        "## 何时使用\n\n"
+        "在以下情况主动使用此工具：\n"
+        "- 用户明确要求使用团队、集群或多 Agent 协作\n"
+        "- 用户希望多个 Agent 一起工作、协调或合作\n"
+        "- 任务需要多个 Agent 之间的顺序或并行协作\n\n"
+        "## 团队工作流\n\n"
+        "1. 用 TeamCreate **创建团队**\n"
+        "2. 用 Agent 工具传入 team_name 与 name **spawn 镟友** —— 这是创建长驻团队成员的必经路径\n"
+        "3. 队友独立工作，通过 **SendMessage** 互相通信\n"
+        "4. 队友完成一轮后会向 \"lead\" 发送结果，然后进入 idle 状态\n"
+        "5. Lead 收集并整合所有队友的结果\n\n"
+        "## 关键：spawn 队友\n\n"
+        "要向团队添加成员，必须同时传入 team_name 与 name：\n"
+        "```\nAgent({\n"
+        '  "team_name": "<步骤 1 的团队名>",\n'
+        '  "name": "<成员名，例如 reviewer>",\n'
+        '  "prompt": "...",\n'
+        '  "description": "..."\n'
+        "})\n```\n"
+        "不传 team_name 时 Agent 走一次性子 Agent 路径，会阻塞当前回合并直接返回 —— 它不会成为团队成员。\n\n"
+        "## 队友 idle 状态\n\n"
+        "队友每完成一轮就进入 idle，这是正常行为；向 idle 队友发消息会唤醒他们继续工作。\n\n"
+        "## 通信\n\n"
+        "- 用 SendMessage 按名字或 agent_id 与队友通信\n"
+        "- 队友发来的消息会在每轮开始时作为 system-reminder 自动注入\n"
+        "- 消息自动送达，不需要手动检查收件箱"
+    )
     params_model = TeamCreateParams
     category = ToolCategory.COMMAND
     is_concurrency_safe = False
