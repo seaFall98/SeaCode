@@ -966,6 +966,7 @@ class Agent:
 
             # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）。
             tool_results: list[ToolResultBlock] = []
+            exit_plan_succeeded = False
             # batch11: 并入 pre_tool_use 拒绝的工具结果，让模型看到拒绝原因并调整策略。
             tool_results.extend(rejected_results)
             streaming_results = await executor.collect_results()
@@ -993,6 +994,8 @@ class Agent:
                     is_error=br.result.is_error,
                     elapsed=br.elapsed,
                 )
+                if br.tool_name == "ExitPlanMode" and not br.result.is_error:
+                    exit_plan_succeeded = True
                 # batch11: post_tool_use hook — 工具执行后触发，携带工具名与参数。
                 if self.hook_engine and br.tool_id in tool_call_by_id:
                     orig_tc = tool_call_by_id[br.tool_id]
@@ -1047,6 +1050,8 @@ class Agent:
                     is_error=result.is_error,
                     elapsed=elapsed,
                 )
+                if tc.tool_name == "ExitPlanMode" and not result.is_error:
+                    exit_plan_succeeded = True
                 # batch11: post_tool_use hook — 延迟工具执行后同样触发。
                 if self.hook_engine:
                     await self.hook_engine.run_hooks(
@@ -1070,6 +1075,10 @@ class Agent:
 
             conversation.add_tool_results_message(tool_results)
             yield TurnComplete(turn=iteration)
+
+            if exit_plan_succeeded:
+                yield LoopComplete(total_turns=iteration)
+                break
 
             # batch11: turn_end hook — 每轮迭代结束触发（仅未命中停止条件的轮次）。
             if self.hook_engine:

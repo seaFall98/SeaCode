@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from seacode.config import ProviderConfig
 from seacode.conversation import Message
 from seacode.permission_dialog import InlinePermissionWidget
 from seacode.permissions import PermissionMode, RuleEngine
+from seacode.plan_dialog import InlinePlanWidget, PlanChoice
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 
@@ -90,6 +92,48 @@ class _PlanModeCaptureClient(LLMClient):
         del system, tools
         self.requests.append(tuple(messages))
         yield TextDelta("Plan context received")
+        yield StreamComplete(input_tokens=1, output_tokens=1)
+
+
+# 模拟完成计划、请求审批与后续执行的两段模型响应。
+class _PlanApprovalClient(LLMClient):
+    def __init__(self) -> None:
+        self.requests: list[tuple[Message, ...]] = []
+        self.plan_path: Path | None = None
+        self._requested_approval = False
+
+    # 首次 Plan 回合写入提示中的计划文件并请求审批，后续回合返回完成文本。
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        system: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        del system
+        if tools is None:
+            return
+        self.requests.append(tuple(messages))
+        reminders = [
+            message.content
+            for message in messages
+            if "Plan mode is active" in message.content
+        ]
+        if reminders and not self._requested_approval:
+            match = re.search(r"Plan file: ([^\n]+)", reminders[-1])
+            assert match is not None
+            self.plan_path = Path(match.group(1))
+            self.plan_path.write_text(
+                "# Delivery plan\\n\\nImplement the requested change.",
+                encoding="utf-8",
+            )
+            self._requested_approval = True
+            yield ToolCallStart(tool_name="ExitPlanMode", tool_id="plan-exit")
+            yield ToolCallComplete(
+                tool_id="plan-exit", tool_name="ExitPlanMode", arguments={}
+            )
+            yield StreamComplete(input_tokens=1, output_tokens=1)
+            return
+        yield TextDelta("Execution complete")
         yield StreamComplete(input_tokens=1, output_tokens=1)
 
 
@@ -396,6 +440,28 @@ async def _wait_done(app: SeaCodeApp, pilot: Any, max_pauses: int = 40) -> None:
         if not app._streaming:
             break
         await pilot.pause(0.05)
+
+
+# 等待 Plan 审批组件挂载，避免依赖固定延迟。
+async def _wait_for_plan_approval(app: SeaCodeApp, pilot: Any) -> InlinePlanWidget:
+    for _ in range(40):
+        await pilot.pause(0.05)
+        try:
+            return app.query_one("#plan-inline", InlinePlanWidget)
+        except Exception:
+            pass
+    raise AssertionError("Plan 审批组件未出现")
+
+
+# 等待审批选择触发的下一次模型请求完成。
+async def _wait_for_request_count(
+    app: SeaCodeApp, client: _PlanApprovalClient, pilot: Any, count: int
+) -> None:
+    for _ in range(40):
+        await pilot.pause(0.05)
+        if len(client.requests) >= count and not app._streaming:
+            return
+    raise AssertionError(f"模型请求数量未达到 {count}")
 
 
 # 验证单轮内 >=2 个可折叠工具时 mount ToolGroupSummary 并隐藏工具块。
@@ -710,6 +776,102 @@ async def test_plan_mode_is_injected_into_next_model_request(
     assert app._permission_checker is not None
     plan_path = Path(app._permission_checker.plan_file_path)
     assert plan_path.parent == tmp_path / ".seacode" / "plans"
+
+
+# 验证完成计划后显示审批组件，YOLO 选择会切换权限并带计划内容进入执行回合。
+# 模拟模型写入计划并调用 ExitPlanMode，断言 TUI 审批和下一轮上下文形成完整闭环。
+@pytest.mark.asyncio
+async def test_plan_approval_yolo_starts_execution_with_plan_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _PlanApprovalClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        app.set_plan_mode(True)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Prepare a delivery plan")
+        await pilot.press("enter")
+
+        await _wait_for_plan_approval(app, pilot)
+        assert input_widget.disabled is True
+        await pilot.press("enter")
+        await _wait_for_request_count(app, client, pilot, 2)
+
+        assert app._permission_mode == PermissionMode.BYPASS
+        assert app._permission_checker is not None
+        assert app._permission_checker.mode == PermissionMode.BYPASS
+
+    assert client.plan_path is not None
+    execution_request = client.requests[1]
+    assert any("Exited Plan Mode" in message.content for message in execution_request)
+    assert any("Approved Plan:" in message.content for message in execution_request)
+    assert any(
+        "Implement the requested change." in message.content
+        for message in execution_request
+    )
+
+
+# 验证手动确认恢复进入 Plan 前的权限模式，而不会错误进入自动确认模式。
+# 先设为 accept-edits 再完成计划并选中第二项，断言应用与检查器同步恢复。
+@pytest.mark.asyncio
+async def test_plan_approval_manual_restores_previous_permission_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _PlanApprovalClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        app.set_permission_mode(PermissionMode.ACCEPT_EDITS)
+        app.set_plan_mode(True)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Prepare a delivery plan")
+        await pilot.press("enter")
+
+        await _wait_for_plan_approval(app, pilot)
+        await pilot.press("down", "enter")
+        await _wait_for_request_count(app, client, pilot, 2)
+
+        assert app._permission_mode == PermissionMode.ACCEPT_EDITS
+        assert app._permission_checker is not None
+        assert app._permission_checker.mode == PermissionMode.ACCEPT_EDITS
+
+
+# 验证反馈后保留 Plan 模式并把同一计划文件交给下一回合继续修订。
+# 在审批组件发送反馈，断言下一次请求含反馈、仍是 Plan 提醒且路径没有变化。
+@pytest.mark.asyncio
+async def test_plan_approval_feedback_keeps_plan_mode_and_plan_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _PlanApprovalClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        app.set_plan_mode(True)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Prepare a delivery plan")
+        await pilot.press("enter")
+
+        widget = await _wait_for_plan_approval(app, pilot)
+        widget.post_message(
+            InlinePlanWidget.Responded(PlanChoice.FEEDBACK, "Please simplify the plan.")
+        )
+        await _wait_for_request_count(app, client, pilot, 2)
+
+        assert app._permission_mode == PermissionMode.PLAN
+        assert app._permission_checker is not None
+        assert app._permission_checker.mode == PermissionMode.PLAN
+
+    assert client.plan_path is not None
+    feedback_request = client.requests[1]
+    assert any("Please simplify the plan." in message.content for message in feedback_request)
+    assert any(
+        "Plan mode is active" in message.content and str(client.plan_path) in message.content
+        for message in feedback_request
+    )
 
 
 # 验证权限对话框 Enter 确认（默认光标在 Yes）放行工具执行。

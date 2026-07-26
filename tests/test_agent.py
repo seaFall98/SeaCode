@@ -45,6 +45,7 @@ from seacode.permissions import (
 )
 from seacode.tools import ToolRegistry, partition_tool_calls
 from seacode.tools.base import Tool, ToolCategory, ToolResult
+from seacode.tools.exit_plan_mode import ExitPlanModeTool
 
 
 # 可控返回结果或抛出异常的测试工具，支持自定义名称以区分多工具场景。
@@ -186,6 +187,38 @@ async def test_plain_conversation_completes_without_tools() -> None:
     assert "Current working directory" in conversation.messages[0].content
     assert conversation.messages[1].content == "Hi"
     assert conversation.messages[-1].content == "Hello there"
+
+
+# 验证失败的 ExitPlanMode 调用会作为工具错误回灌，而不是提前终止当前循环。
+# 让退出工具因缺少计划文件失败，再提供一轮文本回复，断言两次请求都被消费。
+@pytest.mark.asyncio
+async def test_failed_plan_exit_keeps_agent_loop_running() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ExitPlanModeTool(is_plan_mode=lambda: True, plan_exists=lambda: False)
+    )
+    client = _FakeClient(
+        [
+            _tool_call_stream("exit-1", "ExitPlanMode"),
+            _text_stream("Please create the plan first."),
+        ]
+    )
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("Create a plan")
+
+    events = await _collect(agent.run(conversation))
+
+    exit_results = [
+        event
+        for event in events
+        if isinstance(event, ToolResultEvent) and event.tool_name == "ExitPlanMode"
+    ]
+    assert len(exit_results) == 1
+    assert exit_results[0].is_error is True
+    assert len(client.requests) == 2
+    assert isinstance(events[-1], LoopComplete)
+    assert conversation.messages[-1].content == "Please create the plan first."
 
 
 # ---------------------------------------------------------------------------

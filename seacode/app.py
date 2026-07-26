@@ -94,6 +94,8 @@ from .permissions import (
     PermissionMode,
     RuleEngine,
 )
+from .plan_dialog import InlinePlanWidget, PlanChoice
+from .prompts import build_plan_mode_exit_reminder
 from .sandbox import SandboxConfig, create_sandbox
 from .session_dialog import InlineResumeWidget
 from .skills import SkillExecutor, SkillLoader
@@ -105,6 +107,7 @@ from .tools.ask_user import AskUserTool
 from .tools.base import ToolResult
 from .tools.bash import Bash
 from .tools.enter_worktree import EnterWorktreeTool
+from .tools.exit_plan_mode import ExitPlanModeTool
 from .tools.exit_worktree import ExitWorktreeTool
 from .tools.install_skill import InstallSkill
 from .tools.load_skill import LoadSkill
@@ -732,6 +735,9 @@ class SeaCodeApp(App[None]):
         self._conversation = ConversationManager()
         self._selected_provider: ProviderConfig | None = None
         self._tool_registry = create_default_registry()
+        self._plan_exit_requested = False
+        self._plan_approval_active = False
+        self._pre_plan_mode = PermissionMode.DEFAULT
         self._streaming = False
         # spinner 动画状态：thinking 期间持续旋转，显示 ⠋ verb… (Ns)。
         self._thinking_start: float = 0.0
@@ -933,6 +939,16 @@ class SeaCodeApp(App[None]):
 
         self._selected_provider = provider
         self._assemble_permission_system()
+        self._tool_registry.register(
+            ExitPlanModeTool(
+                is_plan_mode=lambda: self._permission_mode == PermissionMode.PLAN,
+                plan_exists=lambda: bool(
+                    self._permission_checker
+                    and self._permission_checker.plan_file_path
+                    and Path(self._permission_checker.plan_file_path).exists()
+                ),
+            )
+        )
         # 装配跨会话能力：load_instructions 拼接项目/用户级 SEACODE.md 与 AGENTS.md；
         # MemoryManager 提供双目录记忆索引；SessionManager 创建新 JSONL 并清理过期会话。
         # 失败均不阻断启动——记忆/会话功能降级为不可用，但 Provider 仍可正常对话。
@@ -1343,11 +1359,13 @@ class SeaCodeApp(App[None]):
 
     # UIController: 切换 Plan 模式；同步权限状态保持一致。
     def set_plan_mode(self, enabled: bool) -> None:
-        new_mode = PermissionMode.PLAN if enabled else PermissionMode.DEFAULT
+        new_mode = PermissionMode.PLAN if enabled else self._pre_plan_mode
         self.set_permission_mode(new_mode)
 
     # UIController: 统一切换权限模式，保持状态栏、检查器与当前 Agent 一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
+        if mode == PermissionMode.PLAN and self._permission_mode != PermissionMode.PLAN:
+            self._pre_plan_mode = self._permission_mode or PermissionMode.DEFAULT
         self._permission_mode = mode
         if self._permission_checker is not None:
             self._permission_checker.mode = mode
@@ -1544,6 +1562,68 @@ class SeaCodeApp(App[None]):
         except Exception:
             pass
 
+    # 在计划完成后挂载审批组件，并阻止输入与审批选择竞争焦点。
+    async def _show_plan_approval(self) -> None:
+        self._plan_approval_active = True
+        chat = self.query_one("#chat-area", VerticalScroll)
+        await chat.mount(InlinePlanWidget())
+        self.call_after_refresh(chat.scroll_end, animate=False)
+        try:
+            self.query_one(ChatInput).disabled = True
+        except Exception:
+            pass
+
+    # 处理计划审批选择：恢复权限、保留反馈上下文或进入自动确认执行。
+    async def on_inline_plan_widget_responded(
+        self, event: InlinePlanWidget.Responded
+    ) -> None:
+        self._plan_approval_active = False
+        try:
+            widget = self.query_one("#plan-inline", InlinePlanWidget)
+            await widget.remove()
+        except Exception:
+            pass
+        try:
+            input_widget = self.query_one(ChatInput)
+            input_widget.disabled = self._client is None
+            if not input_widget.disabled:
+                input_widget.focus()
+        except Exception:
+            pass
+
+        agent = self._agent
+        if agent is None:
+            return
+
+        plan_path = agent._get_plan_path()
+        plan_exists = plan_path.exists()
+        plan_content = ""
+        if plan_exists:
+            try:
+                plan_content = plan_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        if event.choice == PlanChoice.FEEDBACK:
+            if event.feedback:
+                self.send_user_message(event.feedback)
+            else:
+                await self._show_system_message("Type your feedback and send.")
+            return
+
+        if event.choice == PlanChoice.YOLO:
+            self.set_permission_mode(PermissionMode.BYPASS)
+        else:
+            self.set_permission_mode(self._pre_plan_mode)
+
+        execute_text = (
+            build_plan_mode_exit_reminder(str(plan_path), plan_exists)
+            + "\n\nUser has approved your plan. You can now start coding."
+        )
+        if plan_content:
+            execute_text += "\n\nApproved Plan:\n" + plan_content
+        self.send_user_message(execute_text)
+
     # 执行一条完整 Agent Loop 回合，消费 AgentEvent 流并管理 TUI 展示与取消。
     async def _run_turn(self, text: str) -> None:
         client = self._client
@@ -1551,6 +1631,7 @@ class SeaCodeApp(App[None]):
         if client is None or provider is None:
             return
 
+        self._plan_exit_requested = False
         input_widget = self.query_one(ChatInput)
         input_widget.disabled = True
 
@@ -1608,6 +1689,11 @@ class SeaCodeApp(App[None]):
                 # batch11：注入 HookEngine；Agent.run 在 8 个注入点触发对应生命周期事件。
                 hook_engine=self._hook_engine,
             )
+            if (
+                self._permission_checker is not None
+                and self._permission_checker.plan_file_path
+            ):
+                agent._plan_path_cache = Path(self._permission_checker.plan_file_path)
             # 保存当前回合 Agent 引用，供命令路径（/status /compact /plan 等）访问。
             self._agent = agent
             # batch13：注入 FileHistory 与恢复的 worktree work_dir。
@@ -1713,6 +1799,8 @@ class SeaCodeApp(App[None]):
                     await ai_row.mount(block)
                     chat.scroll_end(animate=False)
                 elif isinstance(event, ToolResultEvent):
+                    if event.tool_name == "ExitPlanMode" and not event.is_error:
+                        self._plan_exit_requested = True
                     result_block = tool_blocks.get(event.tool_id)
                     if result_block is not None:
                         # batch12：SubAgentBlock 与 ToolCallBlock 接口不同，按类型分发。
@@ -1829,6 +1917,9 @@ class SeaCodeApp(App[None]):
                             agent.total_input_tokens + agent.total_output_tokens
                         )
                         asyncio.ensure_future(self._update_session_summary())
+                    if self._plan_exit_requested:
+                        self._plan_exit_requested = False
+                        await self._show_plan_approval()
 
             # 收尾：把剩余的累积文本转为 Markdown 持久化到当前 ai_row。
             # live_answer 为 None 时（工具调用后已转 Markdown）不再处理。
@@ -1878,7 +1969,7 @@ class SeaCodeApp(App[None]):
                 self._spinner_label = None
             self._streaming = False
             self._agent_task = None
-            input_widget.disabled = self._client is None
+            input_widget.disabled = self._client is None or self._plan_approval_active
             if not input_widget.disabled:
                 input_widget.focus()
 
