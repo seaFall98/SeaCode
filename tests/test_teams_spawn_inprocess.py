@@ -10,7 +10,6 @@ import pytest
 
 from seacode.teams.mailbox import Mailbox, create_message
 from seacode.teams.spawn_inprocess import (
-    LEAD_NAME,
     SHUTDOWN_PREFIX,
     _create_idle_notification,
     _inject_pending_messages,
@@ -43,11 +42,11 @@ def test_is_shutdown_request_branches() -> None:
 
 
 # 验证 _create_idle_notification 构造正确的 idle 消息。
-# 断言 from_agent=name、to_agent=LEAD_NAME、content 含 [idle] 与 reason。
+# 断言 from_agent=name、to_agent=传入的 Lead 标识、content 含 [idle] 与 reason。
 def test_create_idle_notification() -> None:
-    msg = _create_idle_notification("alice", "task completed")
+    msg = _create_idle_notification("alice", "lead-123", "task completed")
     assert msg.from_agent == "alice"
-    assert msg.to_agent == LEAD_NAME
+    assert msg.to_agent == "lead-123"
     assert "[idle]" in msg.content
     assert "alice" in msg.content
     assert "task completed" in msg.content
@@ -166,7 +165,12 @@ async def test_spawn_inprocess_with_mailbox_long_running(monkeypatch: pytest.Mon
         )
 
         handle = spawn_inprocess_teammate(
-            fake_agent, "first task", "alice", fake_team_manager, mailbox=mailbox
+            fake_agent,
+            "first task",
+            "alice",
+            fake_team_manager,
+            mailbox=mailbox,
+            lead_agent_id="lead-123",
         )
         await handle.task
 
@@ -174,7 +178,7 @@ async def test_spawn_inprocess_with_mailbox_long_running(monkeypatch: pytest.Mon
         assert fake_agent.run_to_completion.call_count == 2
         assert handle.progress.status == "completed"
         # lead 邮箱应收到至少一条 idle 通知。
-        lead_msgs = mailbox.read(LEAD_NAME)
+        lead_msgs = mailbox.read("lead-123")
         assert len(lead_msgs) >= 1
         assert any("[idle]" in m.content for m in lead_msgs)
     finally:
@@ -217,12 +221,17 @@ async def test_spawn_inprocess_exception_marks_failed(monkeypatch: pytest.Monkey
         fake_team_manager.get_team_for_teammate.return_value = "demo"
 
         handle = spawn_inprocess_teammate(
-            fake_agent, "task", "alice", fake_team_manager, mailbox=mailbox
+            fake_agent,
+            "task",
+            "alice",
+            fake_team_manager,
+            mailbox=mailbox,
+            lead_agent_id="lead-123",
         )
         with pytest.raises(RuntimeError):
             await handle.task
         assert handle.progress.status == "failed"
-        lead_msgs = mailbox.read(LEAD_NAME)
+        lead_msgs = mailbox.read("lead-123")
         assert any("[idle]" in m.content and "failed" in m.content for m in lead_msgs)
     finally:
         import shutil

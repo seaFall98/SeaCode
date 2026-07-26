@@ -489,6 +489,11 @@ class AgentTool(Tool):
         teammate_agent._current_definition = teammate_def
 
         mailbox = self.team_manager.get_mailbox(team_name)
+        team = self.team_manager.get_team(team_name)
+        if team is None:
+            return ToolResult(
+                content=f"团队不存在: {team_name}", is_error=True
+            )
 
         if backend == BackendType.IN_PROCESS:
             handle = spawn_inprocess_teammate(
@@ -497,6 +502,7 @@ class AgentTool(Tool):
                 teammate_name,
                 self.team_manager,
                 mailbox=mailbox,
+                lead_agent_id=team.lead_agent_id,
             )
             self.team_manager.register_inprocess_handle(
                 team_name, teammate_name, handle

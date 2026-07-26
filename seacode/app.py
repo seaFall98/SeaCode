@@ -1632,14 +1632,13 @@ class SeaCodeApp(App[None]):
             if self._agent_tool is not None:
                 self._agent_tool.parent_agent = agent
             # batch14：注入 TeamManager 与 notification_fn 到当前回合 Lead Agent。
-            # notification_fn 绑定 lead_agent_id（即当回合 agent_id），
-            # 每轮消费 lead 邮箱中的未读消息并拼成 <team-notification> XML 注入对话历史。
+            # notification_fn 按团队保存的 Lead 标识消费未读消息，
+            # 每轮拼成 <team-notification> XML 注入对话历史。
             # team_manager 为 None 时（装配失败或未启用）静默跳过，向后兼容 batch01-13。
             if self.team_manager is not None:
                 agent._team_manager = self.team_manager
-                lead_agent_id = agent.agent_id
                 agent.notification_fn = (
-                    lambda: self.team_manager.drain_lead_mailbox(lead_agent_id)
+                    lambda: self.team_manager.drain_lead_mailbox()
                     if self.team_manager is not None
                     else []
                 )

@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -112,12 +113,45 @@ async def test_send_message_and_drain_lead_mailbox(
     assert not result.is_error
 
     # lead drain_lead_mailbox 应返回含 alice 消息的 <team-notification> XML。
-    notes = mgr.drain_lead_mailbox("lead-agent-id")
+    notes = mgr.drain_lead_mailbox()
     assert len(notes) >= 1
     xml = notes[0]
     assert '<team-notification team="demo">' in xml
     assert "I read README.md" in xml
     assert "alice" in xml
+
+
+# 验证队友发给 Lead 的消息始终写入当前团队保存的稳定收件人。
+# 即使进程级名称表没有 Lead 条目，主 Agent 仍能在后续回合读取通知。
+@pytest.mark.asyncio
+async def test_send_message_to_lead_uses_team_lead_identifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manager = TeamManager()
+    lead = _FakeLeadAgent()
+    create_tool = TeamCreateTool(lead, manager, _make_config())
+    await create_tool.execute(TeamCreateParams(team_name="demo"))
+
+    registry = MagicMock()
+    monkeypatch.setattr(
+        "seacode.tools.send_message.AgentNameRegistry.instance",
+        lambda: registry,
+    )
+    tool = SendMessageTool(manager, "demo", "alice-id", "alice")
+    result = await tool.execute(
+        SendMessageParams(
+            to=LEAD_NAME,
+            message="work complete",
+            summary="completion",
+        )
+    )
+
+    assert not result.is_error
+    registry.resolve.assert_not_called()
+    notes = manager.drain_lead_mailbox()
+    assert len(notes) == 1
+    assert "work complete" in notes[0]
 
 
 # 验证 TeamDelete 清理团队目录与内存缓存。

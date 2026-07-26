@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from seacode.teams.mailbox import create_message
 from seacode.teams.registry import AgentNameRegistry
+from seacode.teams.spawn_inprocess import LEAD_NAME
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 if TYPE_CHECKING:
@@ -94,8 +95,12 @@ class SendMessageTool(Tool):
             )
             mailbox.broadcast(msg, recipients, exclude=from_agent)
         else:
-            # 单发：通过 AgentNameRegistry 解析名称到 agent_id。
-            agent_id = AgentNameRegistry.instance().resolve(tool_params.to)
+            # Lead 是团队角色名，始终解析为当前团队保存的稳定标识。
+            agent_id: str | None
+            if tool_params.to == LEAD_NAME:
+                agent_id = team.lead_agent_id
+            else:
+                agent_id = AgentNameRegistry.instance().resolve(tool_params.to)
             if agent_id is None:
                 return ToolResult(
                     content=f"未知名称: {tool_params.to}", is_error=True

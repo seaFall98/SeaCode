@@ -256,7 +256,12 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
     # spawn in-process teammate；task 为空，worker 启动后等待邮箱消息。
     task = ""
     handle = spawn_inprocess_teammate(
-        agent, task, agent_name, team_manager, mailbox=mailbox
+        agent,
+        task,
+        agent_name,
+        team_manager,
+        mailbox=mailbox,
+        lead_agent_id=team.lead_agent_id,
     )
     # 等待主循环结束（shutdown 或异常）。
     await handle.task

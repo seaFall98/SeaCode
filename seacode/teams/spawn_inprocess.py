@@ -32,11 +32,13 @@ def _is_shutdown_request(msg: MailboxMessage) -> bool:
     return msg.content.strip().startswith(SHUTDOWN_PREFIX)
 
 
-# 构造 idle 通知消息，发给 lead 表明 teammate 当前轮次已完成。
-def _create_idle_notification(member_name: str, reason: str) -> MailboxMessage:
+# 构造 idle 通知消息，发给团队保存的 Lead 表明 teammate 当前轮次已完成。
+def _create_idle_notification(
+    member_name: str, lead_agent_id: str, reason: str
+) -> MailboxMessage:
     return create_message(
         from_agent=member_name,
-        to_agent=LEAD_NAME,
+        to_agent=lead_agent_id,
         content=f"[idle] {member_name} (reason: {reason})",
         summary="idle",
     )
@@ -119,6 +121,7 @@ def spawn_inprocess_teammate(
     name: str,
     team_manager: Any,
     mailbox: Mailbox | None = None,
+    lead_agent_id: str = LEAD_NAME,
 ) -> InProcessTeammateHandle:
     # team_name 优先从 team_manager 反查；查不到时 progress.team_name 暂为空。
     team_name = ""
@@ -195,7 +198,10 @@ def spawn_inprocess_teammate(
                     progress.status = "idle"
 
                 # 第 5 步：通知 lead 本轮已完成。
-                mailbox.write(LEAD_NAME, _create_idle_notification(name, idle_reason))
+                mailbox.write(
+                    lead_agent_id,
+                    _create_idle_notification(name, lead_agent_id, idle_reason),
+                )
                 idle_reason = "available"
 
                 # 第 6 步：轮询等待 lead 下发新任务或 shutdown。
@@ -216,7 +222,10 @@ def spawn_inprocess_teammate(
             if mailbox is not None:
                 try:
                     mailbox.write(
-                        LEAD_NAME, _create_idle_notification(name, f"failed: {e}")
+                        lead_agent_id,
+                        _create_idle_notification(
+                            name, lead_agent_id, f"failed: {e}"
+                        )
                     )
                 except Exception:
                     pass

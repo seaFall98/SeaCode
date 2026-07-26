@@ -10,7 +10,6 @@ import pytest
 from seacode.teams.manager import TeamError, TeamManager
 from seacode.teams.models import BackendType, TeammateInfo
 from seacode.teams.progress import TeammateProgress
-from seacode.teams.spawn_inprocess import LEAD_NAME
 
 
 # 验证 detect_backend 首次调用后缓存；第二次不调用底层 detect_backend 函数。
@@ -162,7 +161,7 @@ def test_register_member_team_not_found() -> None:
         mgr.register_member("nope", member)
 
 
-# 验证 set_member_idle 标记 idle 并写 idle 通知到 lead 邮箱。
+# 验证 set_member_idle 标记 idle 并写 idle 通知到团队保存的 Lead 邮箱。
 @pytest.mark.asyncio
 async def test_set_member_idle_writes_notification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -179,7 +178,7 @@ async def test_set_member_idle_writes_notification(
     mgr.set_member_idle("demo", "alice", "completed")
     # lead 邮箱应收到 idle 通知。
     mailbox = mgr.get_mailbox("demo")
-    msgs = mailbox.read(LEAD_NAME)
+    msgs = mailbox.read("lead-1")
     assert len(msgs) >= 1
     assert any("[idle]" in m.content and "alice" in m.content for m in msgs)
     # 成员 is_active 应为 False。
@@ -334,13 +333,13 @@ async def test_drain_lead_mailbox_xml_format(
 
     mailbox.write("lead-1", create_message("alice", "lead-1", "task done", "done"))
 
-    notes = mgr.drain_lead_mailbox("lead-1")
+    notes = mgr.drain_lead_mailbox()
     assert len(notes) == 1
     assert '<team-notification team="demo">' in notes[0]
     assert "task done" in notes[0]
     assert "From alice:" in notes[0]
     # 二次 drain 应为空（已 consume）。
-    assert mgr.drain_lead_mailbox("lead-1") == []
+    assert mgr.drain_lead_mailbox() == []
 
 
 # 验证 get_all_teammate_progress 收集所有团队所有成员的 progress。

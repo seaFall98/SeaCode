@@ -20,7 +20,7 @@ from seacode.teams.models import (
 from seacode.teams.progress import TeammateProgress
 from seacode.teams.registry import AgentNameRegistry
 from seacode.teams.shared_task import SharedTaskStore
-from seacode.teams.spawn_inprocess import LEAD_NAME, InProcessTeammateHandle
+from seacode.teams.spawn_inprocess import InProcessTeammateHandle
 
 log = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class TeamManager:
         team.save()
         self._teammate_team_map[member.name] = team_name
 
-    # 标记成员 idle 并向 lead 邮箱写 idle 通知。
+    # 标记成员 idle 并向该团队保存的 Lead 邮箱写 idle 通知。
     def set_member_idle(self, team_name: str, member_name: str, reason: str) -> None:
         team = self.get_team(team_name)
         if team is None:
@@ -126,11 +126,12 @@ class TeamManager:
         team.set_member_active(member_name, False)
         team.save()
         mailbox = self.get_mailbox(team_name)
+        lead_agent_id = team.lead_agent_id
         mailbox.write(
-            LEAD_NAME,
+            lead_agent_id,
             create_message(
                 from_agent=member_name,
-                to_agent=LEAD_NAME,
+                to_agent=lead_agent_id,
                 content=f"[idle] {member_name} (reason: {reason})",
                 summary="idle",
             ),
@@ -217,12 +218,15 @@ class TeamManager:
     def get_team_for_teammate(self, member_name: str) -> str | None:
         return self._teammate_team_map.get(member_name)
 
-    # 消费 lead 在所有团队邮箱中的未读消息，拼成 <team-notification> XML 列表。
-    def drain_lead_mailbox(self, lead_agent_id: str) -> list[str]:
+    # 消费每个团队保存的 Lead 邮箱，拼成 <team-notification> XML 列表。
+    def drain_lead_mailbox(self) -> list[str]:
         notes: list[str] = []
         for team_name in self.list_teams():
+            team = self.get_team(team_name)
+            if team is None:
+                continue
             mailbox = self.get_mailbox(team_name)
-            msgs = mailbox.consume(lead_agent_id)
+            msgs = mailbox.consume(team.lead_agent_id)
             if msgs:
                 content = "\n".join(
                     f"From {m.from_agent}: {m.content}" for m in msgs

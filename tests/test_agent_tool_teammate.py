@@ -256,9 +256,16 @@ async def test_execute_as_teammate_in_process_full_flow(
     fake_handle = _FakeHandle()
     spawn_calls: list[dict[str, Any]] = []
 
-    def fake_spawn(agent, task, name, tm, mailbox=None):
+    def fake_spawn(agent, task, name, tm, mailbox=None, lead_agent_id=""):
         spawn_calls.append(
-            {"agent": agent, "task": task, "name": name, "tm": tm, "mailbox": mailbox}
+            {
+                "agent": agent,
+                "task": task,
+                "name": name,
+                "tm": tm,
+                "mailbox": mailbox,
+                "lead_agent_id": lead_agent_id,
+            }
         )
         return fake_handle
 
@@ -296,6 +303,7 @@ async def test_execute_as_teammate_in_process_full_flow(
     assert len(spawn_calls) == 1
     assert spawn_calls[0]["name"] == "alice"
     assert spawn_calls[0]["task"] == "read README.md"
+    assert spawn_calls[0]["lead_agent_id"] == "lead-id"
     # 确认 register_inprocess_handle 调用。
     assert len(team_manager.register_inprocess_calls) == 1
     assert team_manager.register_inprocess_calls[0][0] == "demo"
@@ -441,7 +449,8 @@ async def test_teammate_addendum_injected_into_system_prompt(
 
     captured_agent: list[Any] = []
 
-    def fake_spawn(agent, task, name, tm, mailbox=None):
+    def fake_spawn(agent, task, name, tm, mailbox=None, lead_agent_id=""):
+        del lead_agent_id
         captured_agent.append(agent)
         return _FakeHandle()
 
