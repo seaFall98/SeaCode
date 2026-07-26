@@ -63,6 +63,16 @@ def test_load_skill_class_attributes() -> None:
     assert LoadSkill.is_system_tool is True
 
 
+# 验证 LoadSkill 描述说明激活后的完整 SOP 返回语义。
+# 直接检查工具描述，防止调用时机或后续执行指引被压缩丢失。
+def test_load_skill_description_includes_sop_execution_guidance() -> None:
+    description = LoadSkill.description
+
+    assert "按名称加载并激活" in description
+    assert "返回完整 SOP" in description
+    assert "后续执行" in description
+
+
 # 验证 LoadSkill input_schema 含 name 必填字段。
 # 调 get_schema() 取 input_schema 断言含 name 字段且 required 包含 name。
 def test_load_skill_input_schema_contains_name() -> None:

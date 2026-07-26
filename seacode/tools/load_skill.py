@@ -24,7 +24,11 @@ class LoadSkill(Tool):
     """
 
     name: str = "LoadSkill"
-    description: str = "按需加载并激活 Skill 完整 SOP"
+    description: str = (
+        "按名称加载并激活与当前任务匹配的 Skill。"
+        "当用户请求与可用 Skill 相符时调用此工具。"
+        "工具会返回完整 SOP 正文，必须在后续执行中遵循其中的指令。"
+    )
     params_model: type[BaseModel] = _LoadSkillParams
     category: ToolCategory = ToolCategory.READ
     is_system_tool: bool = True

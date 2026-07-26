@@ -140,5 +140,7 @@ def test_team_create_description_covers_workflow() -> None:
     assert "name" in desc
     assert "SendMessage" in desc
     assert "idle" in desc
+    assert "如果不能确定" in desc
+    assert "镟友" not in desc
     # 必须明确告知不传 team_name 走一次性子 Agent 路径。
     assert "不会成为团队成员" in desc
