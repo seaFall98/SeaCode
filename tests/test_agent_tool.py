@@ -574,6 +574,18 @@ async def test_isolation_worktree_branch_returns_error() -> None:
     assert "未初始化" in result.content
 
 
+# 验证调用参数指定 worktree 隔离时进入既定隔离路径。
+# 不提供 WorktreeManager，调用公开 execute 并断言返回隔离路径的初始化错误。
+async def test_params_isolation_worktree_branch_returns_error() -> None:
+    tool, _ = _make_tool()
+    params = AgentToolParams(prompt="task", isolation="worktree")
+
+    result = await tool.execute(params, conversation=None, parent_agent=tool.parent_agent)
+
+    assert result.is_error is True
+    assert "Worktree manager" in result.content
+
+
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------

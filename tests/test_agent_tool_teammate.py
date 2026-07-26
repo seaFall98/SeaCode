@@ -311,9 +311,49 @@ async def test_execute_as_teammate_in_process_full_flow(
     member = team_manager.register_member_calls[0][1]
     assert member.name == "alice"
     assert member.backend_type == BackendType.IN_PROCESS
+    assert member.model == "inherit"
     # 确认 AgentNameRegistry.register 调用。
     assert len(registry_calls) == 1
     assert registry_calls[0][0] == "alice"
+
+
+# 验证队友显式模型覆盖会写入持久化成员信息。
+# 通过公开 execute 创建队友，断言 TeamManager 收到的成员模型与调用参数一致。
+@pytest.mark.asyncio
+async def test_execute_as_teammate_records_explicit_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_manager = _FakeTeamManager(
+        backend=BackendType.IN_PROCESS, team=_FakeTeam()
+    )
+    tool = _make_tool(
+        team_manager=team_manager,
+        worktree_manager=_FakeWorktreeManager(),
+    )
+
+    import seacode.teams.spawn_inprocess as spawn_mod
+
+    monkeypatch.setattr(
+        spawn_mod, "spawn_inprocess_teammate", lambda *args, **kwargs: _FakeHandle()
+    )
+    monkeypatch.setattr(
+        "seacode.teams.registry.AgentNameRegistry.instance", lambda: MagicMock()
+    )
+
+    result = await tool.execute(
+        AgentToolParams(
+            team_name="demo",
+            name="alice",
+            prompt="read README.md",
+            model="sonnet",
+        ),
+        conversation=None,
+        parent_agent=_FakeParent(),
+    )
+
+    assert result.is_error is False
+    member = team_manager.register_member_calls[0][1]
+    assert member.model == "sonnet"
 
 
 # ---------------------------------------------------------------------------

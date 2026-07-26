@@ -65,6 +65,7 @@ class AgentToolParams(BaseModel):
     prompt: str = ""
     run_in_background: bool = False
     model: str | None = None
+    isolation: str | None = None
     # batch14：team_name 非空走 Teammate 路径；name 指定 teammate 显示名（缺省用 agent_type）。
     team_name: str | None = None
     name: str | None = None
@@ -132,6 +133,37 @@ class AgentTool(Tool):
         if getattr(tool_params, "team_name", None):
             return await self._execute_as_teammate(
                 tool_params, conversation, parent
+            )
+
+        if tool_params.isolation == "worktree":
+            definition = (
+                self.agent_loader.get(tool_params.subagent_type)
+                if tool_params.subagent_type
+                else AgentDef(
+                    agent_type="worktree-agent",
+                    when_to_use="isolated worktree agent",
+                    system_prompt="",
+                    model="inherit",
+                    max_turns=getattr(parent, "max_iterations", 100),
+                    permission_mode="bypassPermissions",
+                    isolation="worktree",
+                    source="builtin",
+                )
+            )
+            if definition is None:
+                available = self.agent_loader.list_agents()
+                available_str = ", ".join(
+                    f"{name} ({description})" for name, description in available
+                )
+                return ToolResult(
+                    content=(
+                        f"未知子 Agent 类型: {tool_params.subagent_type}，"
+                        f"可用: {available_str}"
+                    ),
+                    is_error=True,
+                )
+            return await self._execute_with_worktree(
+                tool_params, conversation, parent, definition
             )
 
         if tool_params.subagent_type:
@@ -561,7 +593,7 @@ class AgentTool(Tool):
             name=teammate_name,
             agent_id=teammate_agent.agent_id,
             agent_type=agent_def.agent_type,
-            model=agent_def.model,
+            model=params.model or agent_def.model,
             worktree_path=wt.path,
             backend_type=backend,
             is_active=None,
