@@ -88,6 +88,16 @@ Screen {
     padding: 0 0;
 }
 
+#plan-inline {
+    height: auto;
+    padding: 0 0;
+    margin: 0 0;
+}
+
+#plan-content {
+    padding: 0 0;
+}
+
 .tool-block-loading {
     color: #d9a441;
 }

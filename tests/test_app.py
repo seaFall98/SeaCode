@@ -951,6 +951,40 @@ async def test_plan_approval_yolo_starts_execution_with_plan_context(
     )
 
 
+# 验证长聊天历史和受限窗口中，Plan 审批组件仍完整可见并接收键盘焦点。
+# 构造成功退出 Plan 的真实 TUI 路径，断言组件尺寸、滚动位置和焦点均可交互。
+@pytest.mark.asyncio
+async def test_plan_approval_is_visible_and_focused_in_short_viewport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _PlanApprovalClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        for index in range(8):
+            content = "\n".join(f"history {index}-{line}" for line in range(4))
+            await app._append_static(Text(content), "message system-message")
+
+        app.set_plan_mode(True)
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Prepare a delivery plan")
+        await pilot.press("enter")
+
+        dialog = await _wait_for_plan_approval(app, pilot)
+        await pilot.pause()
+
+        chat = app.query_one("#chat-area", VerticalScroll)
+        assert dialog.region.height > 1
+        assert chat.scroll_y == chat.max_scroll_y
+        assert dialog.region.y >= chat.region.y
+        assert dialog.region.bottom <= chat.region.bottom
+        assert app.focused is dialog
+
+        await pilot.press("escape")
+        await _wait_done(app, pilot)
+
+
 # 验证手动确认恢复进入 Plan 前的权限模式，而不会错误进入自动确认模式。
 # 先设为 accept-edits 再完成计划并选中第二项，断言应用与检查器同步恢复。
 @pytest.mark.asyncio
