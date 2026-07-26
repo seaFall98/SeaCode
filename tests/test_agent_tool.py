@@ -596,7 +596,7 @@ def _make_provider_config() -> Any:
 # 直接断言 name / category / is_system_tool / should_defer 字段值。
 def test_agent_tool_class_attributes() -> None:
     assert AgentTool.name == "Agent"
-    assert AgentTool.category == ToolCategory.READ
+    assert AgentTool.category == ToolCategory.COMMAND
     assert AgentTool.is_system_tool is False
     assert AgentTool.should_defer is False
 

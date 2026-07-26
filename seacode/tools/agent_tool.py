@@ -78,7 +78,7 @@ class AgentTool(Tool):
         "Launch a sub-agent to handle a bounded task. Pass subagent_type for "
         "defined agents; leave empty to fork the current conversation."
     )
-    category = ToolCategory.READ  # 用 read 避免子 Agent 调度被误判为高风险写操作
+    category = ToolCategory.COMMAND
     is_system_tool = False
     should_defer = False  # Agent 工具不延迟；需立即执行子 Agent 并阻塞当前回合
     # Agent 工具需要 Agent.execute(params, conversation, parent_agent) 三参签名。
