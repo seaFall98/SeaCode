@@ -193,8 +193,8 @@ async def test_tasks_info_shows_details() -> None:
     assert "task completed successfully" in output
 
 
-# 验证 /tasks info <id> 结果截断 2000 字符。
-# 构造 task result 长 3000 字符，断言输出结果部分不超过 2000。
+# 验证 /tasks info <id> 结果截断 2000 字符并附加截断提示。
+# 构造 task result 长 3000 字符，断言输出结果部分不超过 2000+截断提示长度且含 "truncated"。
 async def test_tasks_info_truncates_long_result() -> None:
     tm = TaskManager()
     long_result = "x" * 3000
@@ -212,9 +212,11 @@ async def test_tasks_info_truncates_long_result() -> None:
     await handler(ctx)
 
     output = ui.system_messages[0]
-    # 结果预览部分应不超过 2000 字符；截取 "结果:\n" 之后的内容判断。
+    # 截断后必须有提示标记，让用户知道输出被裁剪。
+    assert "truncated" in output
+    # 结果预览部分应不超过 2000 字符 + 截断提示长度。
     result_part = output.split("结果:\n", 1)[1] if "结果:\n" in output else output
-    assert len(result_part) <= 2000
+    assert len(result_part) <= 2000 + len("\n... (truncated)")
 
 
 # 验证 /tasks info <id> 任务不存在返回 "未找到任务"。

@@ -59,7 +59,7 @@ def create_tasks_handler(task_manager: TaskManager) -> Any:
         sub = args[0]
 
         if sub == "info":
-            # /tasks info <id>：显示详情与结果预览（截断 2000 字符）。
+            # /tasks info <id>：显示详情、token 用量与结果预览（截断 2000 字符）。
             if len(args) < 2:
                 ctx.ui.add_system_message("用法: /tasks info <id>")
                 return
@@ -71,11 +71,15 @@ def create_tasks_handler(task_manager: TaskManager) -> Any:
             now = time.time()
             elapsed = (task.end_time or now) - task.start_time
             result_preview = task.result[:_TASK_RESULT_PREVIEW_LIMIT]
+            # 结果超长时附加截断提示，让用户知道输出被裁剪。
+            if len(task.result) > _TASK_RESULT_PREVIEW_LIMIT:
+                result_preview += "\n... (truncated)"
             ctx.ui.add_system_message(
                 f"任务 {task.id}\n"
                 f"名称: {task.name}\n"
                 f"状态: {task.status}\n"
                 f"耗时: {_format_elapsed(elapsed)}\n"
+                f"Tokens: ↑{task.progress.input_tokens} ↓{task.progress.output_tokens}\n"
                 f"结果:\n{result_preview}"
             )
             return
