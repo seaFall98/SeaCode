@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from seacode.teams.mailbox import Mailbox, create_message
+from seacode.teams.manager import TeamManager
+from seacode.teams.models import BackendType, TeammateInfo
 from seacode.teams.spawn_inprocess import (
     SHUTDOWN_PREFIX,
     _create_idle_notification,
@@ -129,10 +131,47 @@ async def test_spawn_inprocess_no_mailbox_single_run(monkeypatch: pytest.MonkeyP
     assert handle.done is True
 
 
+# 验证 teammate 单次完成会收敛持久成员状态并通知团队 Lead。
+# 使用真实 TeamManager 注册成员，断言完成后 is_active 为 False 且邮箱有 idle 消息。
+@pytest.mark.asyncio
+async def test_spawn_inprocess_completion_marks_registered_member_idle(
+    tmp_path, monkeypatch: pytest.MonkeyPatch  # type: ignore[no-untyped-def]
+) -> None:
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    manager = TeamManager()
+    await manager.create_team("demo", "lead-1")
+    manager.register_member(
+        "demo",
+        TeammateInfo(
+            name="alice",
+            agent_id="alice-id",
+            agent_type="teammate",
+            model="test-model",
+            worktree_path="/tmp/alice",
+            backend_type=BackendType.IN_PROCESS,
+            is_active=None,
+        ),
+    )
+    fake_agent = MagicMock()
+    fake_agent.agent_id = "alice-id"
+    fake_agent.run_to_completion = AsyncMock(return_value="done")
+
+    handle = spawn_inprocess_teammate(
+        fake_agent, "task", "alice", manager, mailbox=None
+    )
+    await handle.task
+
+    team = manager.get_team("demo")
+    assert team is not None
+    assert team.get_member("alice").is_active is False
+    messages = manager.get_mailbox("demo").read("lead-1")
+    assert any("[idle]" in message.content for message in messages)
+
+
 # 验证 spawn_inprocess_teammate 有 mailbox 时长驻循环：执行→idle 通知→等待→shutdown。
 # mock run_to_completion 返回 "done"，_wait_for_next_prompt_or_shutdown
 # 第一次返回普通消息、第二次 shutdown。
-# 断言 run_to_completion 调用 2 次、lead 邮箱收到 idle 通知、最终 status="completed"。
+# 断言 run_to_completion 调用 2 次、manager 收到 idle 收敛请求、最终 status="completed"。
 @pytest.mark.asyncio
 async def test_spawn_inprocess_with_mailbox_long_running(monkeypatch: pytest.MonkeyPatch) -> None:
     from pathlib import Path
@@ -177,10 +216,7 @@ async def test_spawn_inprocess_with_mailbox_long_running(monkeypatch: pytest.Mon
         # run_to_completion 应被调用 2 次（首轮 + 续派）。
         assert fake_agent.run_to_completion.call_count == 2
         assert handle.progress.status == "completed"
-        # lead 邮箱应收到至少一条 idle 通知。
-        lead_msgs = mailbox.read("lead-123")
-        assert len(lead_msgs) >= 1
-        assert any("[idle]" in m.content for m in lead_msgs)
+        fake_team_manager.set_member_idle.assert_called()
     finally:
         # 清理测试邮箱目录。
         import shutil
@@ -207,7 +243,7 @@ async def test_spawn_inprocess_cancelled_marks_stopped(monkeypatch: pytest.Monke
 
 
 # 验证 _run 主循环在普通异常时标记 status="failed" 并写 idle 通知到 lead 邮箱。
-# mock agent.run_to_completion 抛 RuntimeError，断言 status="failed" 且 lead 邮箱有 idle 通知。
+# mock agent.run_to_completion 抛 RuntimeError，断言 status="failed" 且 manager 收到 idle 通知。
 @pytest.mark.asyncio
 async def test_spawn_inprocess_exception_marks_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     from pathlib import Path
@@ -231,8 +267,9 @@ async def test_spawn_inprocess_exception_marks_failed(monkeypatch: pytest.Monkey
         with pytest.raises(RuntimeError):
             await handle.task
         assert handle.progress.status == "failed"
-        lead_msgs = mailbox.read("lead-123")
-        assert any("[idle]" in m.content and "failed" in m.content for m in lead_msgs)
+        fake_team_manager.set_member_idle.assert_called_once_with(
+            "demo", "alice", "failed: boom"
+        )
     finally:
         import shutil
 

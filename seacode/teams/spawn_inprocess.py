@@ -138,6 +138,20 @@ def spawn_inprocess_teammate(
             if member is not None:
                 member.progress = progress
 
+    # 完成当前轮次时优先经 manager 收敛成员状态；无 manager 时保留邮箱通知退化路径。
+    def _mark_member_idle(reason: str) -> None:
+        if team_manager is not None and team_name:
+            try:
+                team_manager.set_member_idle(team_name, name, reason)
+                return
+            except Exception as e:
+                log.warning("failed to mark teammate %s idle: %s", name, e)
+        if mailbox is not None:
+            mailbox.write(
+                lead_agent_id,
+                _create_idle_notification(name, lead_agent_id, reason),
+            )
+
     def _on_event(event: dict[str, Any]) -> None:
         # run_to_completion 的 event_callback 以 dict 形式调用；
         # 按 event_type 分发：tool_use 记录真实工具名，usage 记录 token 用量，
@@ -189,6 +203,7 @@ def spawn_inprocess_teammate(
                 # 第 3 步：无 mailbox 时退化为单次返回。
                 if mailbox is None:
                     progress.status = "completed"
+                    _mark_member_idle("completed")
                     return result
 
                 # 第 4 步：更新进度状态。
@@ -198,10 +213,7 @@ def spawn_inprocess_teammate(
                     progress.status = "idle"
 
                 # 第 5 步：通知 lead 本轮已完成。
-                mailbox.write(
-                    lead_agent_id,
-                    _create_idle_notification(name, lead_agent_id, idle_reason),
-                )
+                _mark_member_idle(idle_reason)
                 idle_reason = "available"
 
                 # 第 6 步：轮询等待 lead 下发新任务或 shutdown。
@@ -219,16 +231,7 @@ def spawn_inprocess_teammate(
         except Exception as e:
             log.error("teammate %s failed: %s", name, e)
             progress.status = "failed"
-            if mailbox is not None:
-                try:
-                    mailbox.write(
-                        lead_agent_id,
-                        _create_idle_notification(
-                            name, lead_agent_id, f"failed: {e}"
-                        )
-                    )
-                except Exception:
-                    pass
+            _mark_member_idle(f"failed: {e}")
             raise
 
     task_handle = asyncio.create_task(_run(), name=f"teammate-{name}")
