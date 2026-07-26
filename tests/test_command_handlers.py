@@ -112,16 +112,29 @@ class _FakeBashTool:
         self.sandbox_config = sandbox_config
 
 
-# 假工具注册中心：get 返回指定工具，list_tools 返回预设列表。
+# 假工具条目：仅保留注册中心和状态处理器需要的名称。
+class _FakeListedTool:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+# 假工具注册中心：get 返回指定工具，list_tools 返回预设工具，is_enabled 记录启用状态。
 class _FakeToolRegistry:
     def __init__(
-        self, tools: list[str] | None = None, bash_tool: _FakeBashTool | None = None
+        self,
+        tools: list[str] | None = None,
+        bash_tool: _FakeBashTool | None = None,
+        disabled: set[str] | None = None,
     ) -> None:
-        self._tools = tools or []
+        self._tools = [_FakeListedTool(name) for name in tools or []]
         self._bash_tool = bash_tool
+        self._disabled = disabled or set()
 
-    def list_tools(self) -> list[str]:
+    def list_tools(self) -> list[_FakeListedTool]:
         return self._tools
+
+    def is_enabled(self, name: str) -> bool:
+        return name not in self._disabled
 
     def get(self, name: str) -> _FakeBashTool | None:
         if name == "Bash":
@@ -143,7 +156,6 @@ class _FakeAgent:
     def __init__(self, **kwargs: Any) -> None:
         self.model = kwargs.get("model", "test-model")
         self.plan_mode = kwargs.get("plan_mode", False)
-        self.tool_registry = kwargs.get("tool_registry")
         self.permission_checker = kwargs.get("permission_checker")
         # 权限模式与 checker.mode 保持同步；handler 通过 set_permission_mode 切换。
         self.permission_mode: PermissionMode = (
@@ -154,6 +166,7 @@ class _FakeAgent:
         self.mcp_manager = kwargs.get("mcp_manager")
         # sandbox 命令通过 registry.get("Bash") 与 work_dir 操作沙箱。
         self.registry = kwargs.get("registry")
+        self.context_window = kwargs.get("context_window", 200_000)
         self.work_dir = kwargs.get("work_dir", "/tmp/fake-work")
         self.history_cursor = kwargs.get("history_cursor", 0)
         # /clear 需要重置的运行时状态。
@@ -427,8 +440,13 @@ async def test_help_unknown_command() -> None:
 # 验证 /status 聚合显示模式、会话、Token、工具、记忆、工作目录与版本。
 # 构造带工具与记忆的 mock，调 handle_status，断言输出含各关键字段。
 async def test_status_displays_aggregated_info() -> None:
-    tool_registry = _FakeToolRegistry(["tool1", "tool2"])
-    agent = _FakeAgent(model="claude-test", plan_mode=True, tool_registry=tool_registry)
+    tool_registry = _FakeToolRegistry(["tool1", "tool2", "tool3"], disabled={"tool2"})
+    agent = _FakeAgent(
+        model="claude-test",
+        plan_mode=True,
+        registry=tool_registry,
+        context_window=8_000,
+    )
     session = _FakeSession("sess-abc12345")
     memory_manager = _FakeMemoryManager(memories=["m1", "m2", "m3"])
     ui = _FakeUI(token_count=(5000, 100000))
@@ -444,7 +462,7 @@ async def test_status_displays_aggregated_info() -> None:
     assert "claude-test" in text
     assert "Plan 模式：是" in text
     assert "会话 ID：sess-abc12345" in text
-    assert "Token：5000 / 100000" in text
+    assert "Token：5000 / 8000（62%）" in text
     assert "工具数：2" in text
     assert "记忆数：3" in text
     assert "工作目录：" in text
@@ -457,7 +475,7 @@ async def test_status_displays_permission_mode() -> None:
     tool_registry = _FakeToolRegistry(["tool1"])
     agent = _FakeAgent(
         model="claude-test",
-        tool_registry=tool_registry,
+        registry=tool_registry,
         permission_checker=_FakePermissionChecker(mode=PermissionMode.ACCEPT_EDITS),
     )
     ui = _FakeUI(token_count=(0, 100000))
@@ -466,6 +484,20 @@ async def test_status_displays_permission_mode() -> None:
     text = ui.system_messages[0]
     assert "权限模式：" in text
     assert "acceptEdits" in text
+
+
+# 验证 /status 在 Agent 未初始化时保留可读的降级状态。
+# 不传 Agent、会话与记忆管理器，断言不会访问运行时接口并显示默认上下文窗口。
+async def test_status_degrades_gracefully_without_agent() -> None:
+    ui = _FakeUI(token_count=(1_000, 0))
+    ctx = _make_ctx(args="", agent=None, session=None, memory_manager=None, ui=ui)
+
+    await handle_status(ctx)
+
+    text = ui.system_messages[0]
+    assert "权限模式：unknown" in text
+    assert "Token：1000 / 200000（0%）" in text
+    assert "工具数：0" in text
 
 
 # ---------- /clear ----------

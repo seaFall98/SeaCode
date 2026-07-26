@@ -9,7 +9,7 @@ from seacode.commands.registry import Command, CommandContext, CommandType
 
 # /status：聚合 agent / session / memory / 工具 / 工作目录 / 版本信息输出到聊天区。
 async def handle_status(ctx: CommandContext) -> None:
-    used, limit = ctx.ui.get_token_count()
+    used, _ = ctx.ui.get_token_count()
     agent = ctx.agent
     session = ctx.session
     memory_manager = ctx.memory_manager
@@ -23,10 +23,19 @@ async def handle_status(ctx: CommandContext) -> None:
     else:
         mode_str = "unknown"
     session_id = getattr(session, "session_id", "无") if session else "无"
+    context_window = getattr(agent, "context_window", 200_000) if agent else 200_000
+    if not isinstance(context_window, int) or context_window < 1:
+        context_window = 200_000
+    context_percent = int(used / context_window * 100)
+
     tool_count = 0
-    tool_registry = getattr(agent, "tool_registry", None)
+    tool_registry = getattr(agent, "registry", None)
     if tool_registry is not None:
-        tool_count = len(tool_registry.list_tools())
+        tool_count = sum(
+            1
+            for tool in tool_registry.list_tools()
+            if tool_registry.is_enabled(getattr(tool, "name", str(tool)))
+        )
     memory_count = 0
     if memory_manager is not None:
         memories = getattr(memory_manager, "memories", None)
@@ -41,7 +50,7 @@ async def handle_status(ctx: CommandContext) -> None:
         f"  权限模式：{mode_str}",
         f"  Plan 模式：{'是' if plan_mode else '否'}",
         f"  会话 ID：{session_id}",
-        f"  Token：{used} / {limit}",
+        f"  Token：{used} / {context_window}（{context_percent}%）",
         f"  工具数：{tool_count}",
         f"  记忆数：{memory_count}",
         f"  工作目录：{work_dir}",
