@@ -831,11 +831,11 @@ class SeaCodeApp(App[None]):
     @staticmethod
     def _make_banner(work_dir: str = "") -> Text:
         banner = Text()
-        banner.append(" /\\___/\\   ", style="bold #d9a441")
+        banner.append("  _/\\_     ", style="bold #d9a441")
         banner.append("SeaCode\n", style="#c7d2d5")
-        banner.append("( =o.o= )  ", style="bold #d9a441")
+        banner.append(" /  o \\_   ", style="bold #d9a441")
         banner.append(f"{work_dir}\n" if work_dir else "\n", style="#9fb2b6")
-        banner.append(" /| ||| |\\ ", style="bold #d9a441")
+        banner.append("~\\__/|\\_==", style="bold #d9a441")
         return banner
 
     # 构造标题、选择、聊天、输入和横向状态栏五个既定区域。
