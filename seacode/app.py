@@ -746,6 +746,8 @@ class SeaCodeApp(App[None]):
         self._plan_exit_requested = False
         self._plan_approval_active = False
         self._pre_plan_mode = PermissionMode.DEFAULT
+        # 记录本次会话是否曾退出过 Plan Mode，供 /plan 重入时注入 reentry reminder。
+        self._has_exited_plan_mode: bool = False
         self._streaming = False
         # spinner 动画状态：thinking 期间持续旋转，显示 ⠋ verb… (Ns)。
         self._thinking_start: float = 0.0
@@ -1623,6 +1625,8 @@ class SeaCodeApp(App[None]):
         else:
             self.set_permission_mode(self._pre_plan_mode)
 
+        # 标记已退出 Plan Mode，供下次 /plan 重入时注入 reentry reminder。
+        self._has_exited_plan_mode = True
         execute_text = (
             build_plan_mode_exit_reminder(str(plan_path), plan_exists)
             + "\n\nUser has approved your plan. You can now start coding."

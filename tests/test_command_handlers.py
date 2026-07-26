@@ -561,15 +561,42 @@ async def test_plan_with_args_sends_user_message() -> None:
     assert ui.user_messages == ["分析目录"]
 
 
-# 验证 /plan 在已处于 Plan 模式时提示且不重复切换。
-# mock agent plan_mode=True，断言输出"已在 Plan 模式"且未调 set_plan_mode。
+# 验证 /plan 在已处于 Plan 模式时仍切换并提示，且支持重入检测。
+# mock agent plan_mode=True，断言输出"已切换到 Plan 模式"且 set_plan_mode 被调用。
 async def test_plan_warns_when_already_in_plan_mode() -> None:
     agent = _FakeAgent(plan_mode=True)
     ui = _FakeUI()
     ctx = _make_ctx(args="", agent=agent, ui=ui)
     await handle_plan(ctx)
-    assert "已在 Plan 模式" in ui.system_messages[0]
-    assert ui.plan_mode_calls == []
+    assert "已切换到 Plan 模式" in ui.system_messages[0]
+    assert ui.plan_mode_calls == [True]
+
+
+# 验证 /plan 重入检测：app._has_exited_plan_mode=True 且 plan 文件存在时注入 reentry 提示。
+# 预设 _has_exited_plan_mode=True 与 plan_path，断言输出含 "re-entered plan mode"。
+async def test_plan_reentry_injects_reminder_when_plan_exists(
+    tmp_path: Path,
+) -> None:
+    # 构造 plan 文件并预设 _has_exited_plan_mode 标记。
+    plan_path = tmp_path / "bold-idea-0101-1200.md"
+    plan_path.write_text("# Plan", encoding="utf-8")
+
+    class _FakeAgentWithPlanPath:
+        plan_mode = False
+        model = "test-model"
+
+        def _get_plan_path(self) -> Path:
+            return plan_path
+
+    ui = _FakeUI()
+    ui._has_exited_plan_mode = True  # type: ignore[attr-defined]
+    ctx = _make_ctx(args="", agent=_FakeAgentWithPlanPath(), ui=ui)
+    await handle_plan(ctx)
+    msgs = ui.system_messages
+    assert any("re-entered plan mode" in m for m in msgs)
+    assert any(str(plan_path) in m for m in msgs)
+    # 注入后标记应被清除，避免下次重复注入。
+    assert ui._has_exited_plan_mode is False  # type: ignore[attr-defined]
 
 
 # ---------- /session ----------
