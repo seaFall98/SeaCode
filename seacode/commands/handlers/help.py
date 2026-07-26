@@ -6,6 +6,7 @@ from seacode.commands.registry import Command, CommandContext, CommandType
 
 
 # /help：无参列出全部命令，带参显示单命令详情，未找到给出提示。
+# 参数统一小写处理，让 /HELP、/Help 等大小写混用也能匹配命令名。
 async def handle_help(ctx: CommandContext) -> None:
     registry = ctx.config["registry"]
     args = ctx.args.strip()
@@ -18,7 +19,7 @@ async def handle_help(ctx: CommandContext) -> None:
         lines.append("输入 /help <命令名> 查看单命令详情")
         ctx.ui.add_system_message("\n".join(lines))
         return
-    cmd = registry.find(args)
+    cmd = registry.find(args.lower())
     if cmd is None:
         ctx.ui.add_system_message(f"未知命令：{args}，输入 /help 查看可用命令")
         return

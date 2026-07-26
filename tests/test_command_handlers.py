@@ -397,6 +397,19 @@ async def test_help_shows_single_command_detail() -> None:
     assert "显示当前状态" in text
 
 
+# 验证 /help 大小写混用也能匹配命令名。
+# 传 args="STATUS" 调 handle_help，断言能找到 /status 命令。
+async def test_help_case_insensitive_match() -> None:
+    registry = CommandRegistry()
+    register_all_commands(registry)
+    ui = _FakeUI()
+    ctx = _make_ctx(args="STATUS", ui=ui, config={"registry": registry})
+    await handle_help(ctx)
+    text = ui.system_messages[0]
+    assert "命令：/status" in text
+    assert "显示当前状态" in text
+
+
 # 验证 /help 查未知命令给出未知提示。
 # 传 args="unknown" 调 handle_help，断言输出含"未知命令：unknown"。
 async def test_help_unknown_command() -> None:
