@@ -41,6 +41,13 @@ class MCPManager:
     def __init__(self) -> None:
         self._configs: dict[str, MCPServerConfig] = {}
         self._clients: dict[str, MCPClient] = {}
+        self._connect_result: ConnectResult | None = None
+
+    @property
+    def is_initialized(self) -> bool:
+        """MCP 工具是否已在当前应用会话完成首次注册。"""
+
+        return self._connect_result is not None
 
     # 加载 MCP 服务器配置；同名后入者覆盖前者，与两层配置合并语义一致。
     def load_configs(self, configs: list[MCPServerConfig]) -> None:
@@ -76,9 +83,13 @@ class MCPManager:
 
     # 连接所有服务器并把工具注册到 registry，返回 ConnectResult。
     async def register_all_tools(self, registry: ToolRegistry) -> ConnectResult:
+        if self._connect_result is not None:
+            return self._connect_result
+
         result = await self.connect_all()
         for tool in result.tools:
             registry.register(tool)
+        self._connect_result = result
         return result
 
     # 按名获取 client：缓存命中且存活直接返回；未命中且有配置则现场创建；
@@ -114,3 +125,4 @@ class MCPManager:
                     "Error closing MCP server '%s'", name, exc_info=True
                 )
         self._clients.clear()
+        self._connect_result = None

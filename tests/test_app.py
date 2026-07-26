@@ -112,6 +112,24 @@ class _MemorySelectorClient(LLMClient):
         yield StreamComplete()
 
 
+# 记录跨回合初始化次数的 MCP 管理器，不连接真实外部服务。
+class _SessionMCPManager:
+    def __init__(self) -> None:
+        from seacode.mcp.manager import ConnectResult, ServerInfo
+
+        self._result = ConnectResult(
+            servers=[ServerInfo(name="docs", instructions="Use the project docs first.")]
+        )
+        self.is_initialized = False
+        self.register_calls = 0
+
+    async def register_all_tools(self, registry: Any) -> Any:
+        del registry
+        self.register_calls += 1
+        self.is_initialized = True
+        return self._result
+
+
 # 模拟完成计划、请求审批与后续执行的两段模型响应。
 class _PlanApprovalClient(LLMClient):
     def __init__(self) -> None:
@@ -822,6 +840,39 @@ async def test_user_turn_starts_memory_recall_task(
 
     assert len(selector_client.requests) == 1
     assert "Recall the project conventions" in selector_client.requests[0][0].content
+
+
+# 验证连续 TUI 回合复用 MCP 初始化结果，不重复连接或注入服务器说明。
+# 用共享管理器完成两条消息，断言只注册一次且第二次请求没有重复说明。
+@pytest.mark.asyncio
+async def test_consecutive_turns_reuse_mcp_initialization() -> None:
+    client = _FakeClient(
+        [
+            [TextDelta("First response"), StreamComplete()],
+            [TextDelta("Second response"), StreamComplete()],
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    manager = _SessionMCPManager()
+    app._mcp_manager = manager  # type: ignore[assignment]
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("First request")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        input_widget.load_text("Second request")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+    assert manager.register_calls == 1
+    assert len(client.requests) == 2
+    instruction_count = sum(
+        message.content.count("Use the project docs first.")
+        for message in client.requests[1]
+    )
+    assert instruction_count == 1
 
 
 # 验证完成计划后显示审批组件，YOLO 选择会切换权限并带计划内容进入执行回合。

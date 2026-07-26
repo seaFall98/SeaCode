@@ -381,8 +381,10 @@ class Agent:
         )
         # MCP 管理器；为 None 时跳过 MCP 连接与延迟工具搜索。
         self.mcp_manager = mcp_manager
-        # MCP 连接是否已完成；run() 首轮触发一次，避免重复连接。
-        self._mcp_connected = False
+        # MCP 初始化状态属于应用会话；新 Agent 读取 manager 状态避免重复连接。
+        self._mcp_connected = bool(
+            getattr(mcp_manager, "is_initialized", False)
+        )
         # 注册 ToolSearchTool 让模型可发现延迟加载的 MCP 工具；
         # 传入 registry 引用形成运行时循环，通过 TYPE_CHECKING 注解避免导入循环。
         if mcp_manager is not None:

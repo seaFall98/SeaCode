@@ -174,6 +174,26 @@ async def test_register_all_tools_registers_to_registry() -> None:
     assert registry.get("mcp_fs_write") is not None
 
 
+# 验证同一会话内重复注册会复用首次结果，不会再次创建客户端。
+# 连续调用两次后断言客户端构造和工具注册都只发生一次。
+@pytest.mark.asyncio
+async def test_register_all_tools_reuses_initialized_result() -> None:
+    manager = MCPManager()
+    manager.load_configs([_stdio_config("fs")])
+    registry = ToolRegistry()
+    fake_fs = _FakeClient(tools=[_tool_def("read")])
+
+    with patch("seacode.mcp.manager.MCPClient") as mock_client_cls:
+        mock_client_cls.return_value = fake_fs
+        first = await manager.register_all_tools(registry)
+        second = await manager.register_all_tools(registry)
+
+    assert first is second
+    assert manager.is_initialized is True
+    assert mock_client_cls.call_count == 1
+    assert registry.get("mcp_fs_read") is not None
+
+
 # ---------------------------------------------------------------------------
 # get_client
 # ---------------------------------------------------------------------------
