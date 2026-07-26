@@ -22,7 +22,7 @@ class TraceNode:
     parent_id: str | None
     trace_id: str
     status: str = "running"  # running / completed / failed / cancelled
-    start_time: float = field(default_factory=time.time)
+    start_time: float = field(default_factory=time.monotonic)
     end_time: float | None = None
     input_tokens: int = 0
     output_tokens: int = 0
@@ -63,7 +63,7 @@ class TraceManager:
         node = self._nodes.get(agent_id)
         if node is None:
             return
-        node.end_time = time.time()
+        node.end_time = time.monotonic()
         node.status = status
 
     # 按 agent_id 取出节点。
@@ -82,7 +82,7 @@ class TraceManager:
     def complete_all_running(self, parent_id: str) -> None:
         for node in self._nodes.values():
             if node.parent_id == parent_id and node.status == "running":
-                node.end_time = time.time()
+                node.end_time = time.monotonic()
                 node.status = "completed"
 
     # 合计指定调用链的 input/output token。

@@ -42,7 +42,7 @@ class BackgroundTask:
     task: str
     status: str = "running"  # running / completed / failed / cancelled
     result: str = ""
-    start_time: float = field(default_factory=time.time)
+    start_time: float = field(default_factory=time.monotonic)
     end_time: float | None = None
     cancel: Any = None
     progress: ProgressInfo = field(default_factory=ProgressInfo)
@@ -103,7 +103,7 @@ class TaskManager:
             bg.status = "failed"
             bg.result = str(e)
         finally:
-            bg.end_time = time.time()
+            bg.end_time = time.monotonic()
             bg.progress.input_tokens = getattr(agent, "total_input_tokens", 0)
             bg.progress.output_tokens = getattr(agent, "total_output_tokens", 0)
             self._async_tasks.pop(task_id, None)
@@ -205,7 +205,7 @@ class TaskManager:
             bg.status = "failed"
             bg.result = f"{partial_result}\n[error: {e}]"
         finally:
-            bg.end_time = time.time()
+            bg.end_time = time.monotonic()
             bg.progress.input_tokens = getattr(agent, "total_input_tokens", 0)
             bg.progress.output_tokens = getattr(agent, "total_output_tokens", 0)
             self._async_tasks.pop(task_id, None)

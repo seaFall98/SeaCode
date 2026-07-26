@@ -26,7 +26,7 @@ def _format_trace_status(status: str) -> str:
 
 # 递归渲染调用树节点；depth 控制缩进。
 def _render_node(node: Any, all_nodes: list[Any], depth: int = 0) -> str:
-    now = time.time()
+    now = time.monotonic()
     elapsed = (node.end_time or now) - node.start_time
     icon = _format_trace_status(node.status)
     indent = "  " * depth

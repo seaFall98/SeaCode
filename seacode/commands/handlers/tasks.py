@@ -16,14 +16,15 @@ from seacode.commands.registry import Command, CommandContext, CommandType
 _TASK_RESULT_PREVIEW_LIMIT: int = 2000
 
 
-# 状态图标映射；未知状态用 ? 兜底。
+# 状态图标+名称映射；未知状态用 ? 兜底。
 def _format_status(status: str) -> str:
-    return {
+    icon = {
         "running": "⏳",
         "completed": "✓",
         "failed": "✗",
         "cancelled": "⊘",
     }.get(status, "?")
+    return f"{icon} {status}"
 
 
 # 耗时格式化；>= 60 秒显示 X.Xm，否则显示 X.Xs。
@@ -45,7 +46,7 @@ def create_tasks_handler(task_manager: TaskManager) -> Any:
             if not tasks:
                 ctx.ui.add_system_message("没有后台任务")
                 return
-            now = time.time()
+            now = time.monotonic()
             lines = []
             for t in tasks:
                 elapsed = (t.end_time or now) - t.start_time
@@ -68,7 +69,7 @@ def create_tasks_handler(task_manager: TaskManager) -> Any:
             if task is None:
                 ctx.ui.add_system_message(f"未找到任务: {task_id}")
                 return
-            now = time.time()
+            now = time.monotonic()
             elapsed = (task.end_time or now) - task.start_time
             result_preview = task.result[:_TASK_RESULT_PREVIEW_LIMIT]
             # 结果超长时附加截断提示，让用户知道输出被裁剪。

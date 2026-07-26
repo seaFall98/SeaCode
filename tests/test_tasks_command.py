@@ -82,16 +82,16 @@ def _seed_task(
 # 验证 _format_status 四种状态图标映射。
 # 直接断言 running/completed/failed/cancelled 对应图标。
 def test_format_status_four_icons() -> None:
-    assert _format_status("running") == "⏳"
-    assert _format_status("completed") == "✓"
-    assert _format_status("failed") == "✗"
-    assert _format_status("cancelled") == "⊘"
+    assert _format_status("running") == "⏳ running"
+    assert _format_status("completed") == "✓ completed"
+    assert _format_status("failed") == "✗ failed"
+    assert _format_status("cancelled") == "⊘ cancelled"
 
 
-# 验证 _format_status 未知状态返回问号。
-# 直接断言未知状态返回 "?"。
+# 验证 _format_status 未知状态返回问号+状态名。
+# 直接断言未知状态返回 "? unknown"。
 def test_format_status_unknown_returns_question() -> None:
-    assert _format_status("unknown") == "?"
+    assert _format_status("unknown") == "? unknown"
 
 
 # 验证 _format_elapsed >= 60 秒显示 X.Xm 格式。
