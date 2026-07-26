@@ -8,7 +8,8 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from textual.containers import Horizontal
+from rich.text import Text
+from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, OptionList, Static
 
 from seacode.app import (
@@ -197,9 +198,8 @@ async def test_single_profile_streams_with_enter_and_has_no_send_button() -> Non
             (Message(role="user", content="Hi"),)
         ]
         assert "Ready" in str(app.query_one("#turn-status").render())
-        assert "First thought. Second thought." in str(
-            app.query_one(".thinking-message").render()
-        )
+        # thinking 内容不直接在 TUI 显示；回合结束后展示 thinking-done 行。
+        assert app.query_one(".thinking-done") is not None
 
 
 # 验证 Shift+Enter 在输入框插入换行而不会提前发送。
@@ -590,6 +590,35 @@ async def test_permission_dialog_appears_for_write_in_default_mode() -> None:
         assert _has_permission_dialog(app)
 
         # 清理：Esc 拒绝以结束回合。
+        await pilot.press("escape")
+        await _wait_done(app, pilot)
+
+
+# 验证受限窗口和长聊天历史下，写入确认组件完整显示在聊天区底部。
+# 构造溢出聊天历史后触发 WriteFile，断言刷新后的组件高度和滚动位置正确。
+@pytest.mark.asyncio
+async def test_permission_dialog_is_fully_visible_in_short_viewport() -> None:
+    client = _FakeClient(_write_file_call_and_reply())
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    app._tool_registry.register(_MockPermWriteFile())
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        _reset_rule_engine(app)
+        for index in range(28):
+            await app._append_static(Text(f"history {index}"), "message system-message")
+
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Write file")
+        await pilot.press("enter")
+        await _wait_for_permission_dialog(app, pilot)
+        await pilot.pause()
+
+        chat = app.query_one("#chat-area", VerticalScroll)
+        dialog = app.query_one("#perm-inline", InlinePermissionWidget)
+        assert dialog.region.height > 1
+        assert chat.scroll_y == chat.max_scroll_y
+        assert dialog.region.bottom <= chat.region.bottom
+
         await pilot.press("escape")
         await _wait_done(app, pilot)
 

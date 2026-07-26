@@ -44,8 +44,18 @@ Screen {
     padding: 0 2;
 }
 
+.user-row {
+    height: auto;
+    width: 100%;
+}
+
 .user-message {
     color: #f2f5f5;
+}
+
+.ai-row {
+    height: auto;
+    width: 100%;
 }
 
 .assistant-message,
@@ -60,6 +70,22 @@ Screen {
 
 .error-message {
     color: #ff9c9c;
+}
+
+/* thinking 期间持续旋转的 spinner 标签，固定单行高度避免撑开聊天区。 */
+#spinner-live {
+    height: 1;
+    padding: 0 2;
+}
+
+#perm-inline {
+    height: auto;
+    padding: 0 0;
+    margin: 0 0;
+}
+
+#perm-content {
+    padding: 0 0;
 }
 
 .tool-block-loading {

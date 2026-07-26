@@ -20,6 +20,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message as TextualMessage
+from textual.timer import Timer
 from textual.widgets import Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
@@ -122,6 +123,9 @@ MAX_TRUNCATED_LINES: int = 20
 
 # 可折叠的工具集合：只读工具在多工具回合时折叠为摘要。
 COLLAPSIBLE_TOOLS: frozenset[str] = frozenset({"ReadFile", "Glob", "Grep"})
+
+# braille spinner 动画帧，每帧 80ms 切换；thinking 期间持续旋转。
+SPINNER_FRAMES: str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 # thinking-done 行使用的动词列表，循环时随机选取一个。
 THINKING_VERBS: list[str] = [
@@ -729,6 +733,12 @@ class SeaCodeApp(App[None]):
         self._selected_provider: ProviderConfig | None = None
         self._tool_registry = create_default_registry()
         self._streaming = False
+        # spinner 动画状态：thinking 期间持续旋转，显示 ⠋ verb… (Ns)。
+        self._thinking_start: float = 0.0
+        self._thinking_verb: str = ""
+        self._spinner_idx: int = 0
+        self._spinner_timer: Timer | None = None
+        self._spinner_label: Static | None = None
         self._agent_task: asyncio.Task[None] | None = None
         self._max_steps = max_steps
         # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，默认全关闭。
@@ -831,11 +841,13 @@ class SeaCodeApp(App[None]):
     @staticmethod
     def _make_banner(work_dir: str = "") -> Text:
         banner = Text()
-        banner.append("  _/\\_     ", style="bold #d9a441")
+        banner.append("    ╱─╲    ", style="bold #5eb6c8")
         banner.append("SeaCode\n", style="#c7d2d5")
-        banner.append(" /  o \\_   ", style="bold #d9a441")
+        banner.append("   ║ █ ║   ", style="bold #5eb6c8")
         banner.append(f"{work_dir}\n" if work_dir else "\n", style="#9fb2b6")
-        banner.append("~\\__/|\\_==", style="bold #d9a441")
+        banner.append("  ╱╲ ", style="bold #5eb6c8")
+        banner.append("▄", style="bold #d9a441")
+        banner.append(" ╱╲  ", style="bold #5eb6c8")
         return banner
 
     # 构造标题、选择、聊天、输入和横向状态栏五个既定区域。
@@ -1550,13 +1562,14 @@ class SeaCodeApp(App[None]):
         chat = self.query_one("#chat-area", VerticalScroll)
         ai_row = Vertical(classes="ai-row")
         await chat.mount(ai_row)
-        live_answer = Static(Text(""), classes="message assistant-message")
+        live_answer: Static | None = Static("", classes="message assistant-message")
+        # 初始 live_answer 一定非 None，mount 后才允许后续置 None。
+        assert live_answer is not None
         await ai_row.mount(live_answer)
         started = time.monotonic()
-        thinking_verb = random.choice(THINKING_VERBS)
+        self._thinking_start = started
+        self._thinking_verb = random.choice(THINKING_VERBS)
         answer = ""
-        thinking_widget: Static | None = None
-        thinking = ""
         # batch12：tool_blocks 同时容纳 ToolCallBlock 与 SubAgentBlock；
         # SubAgentBlock 用于 "Agent" 工具调用，ToolCallBlock 用于其它工具。
         tool_blocks: dict[str, ToolCallBlock | SubAgentBlock] = {}
@@ -1641,24 +1654,49 @@ class SeaCodeApp(App[None]):
             # 持久化游标：记录已写入 JSONL 的历史末尾位置。
             # TurnComplete 增量追加新消息；CompactNotification 先写 boundary 再推进游标。
             history_cursor = len(self._conversation.messages)
+            # 在聊天区底部 mount 持续旋转的 spinner，thinking 期间显示 ⠋ verb… (Ns)。
+            self._spinner_idx = 0
+            self._spinner_label = Static(
+                f"  {SPINNER_FRAMES[0]} {self._thinking_verb}…",
+                id="spinner-live",
+            )
+            await chat.mount(self._spinner_label)
+            self._start_spinner()
+            self.call_after_refresh(chat.scroll_end, animate=False)
+            await asyncio.sleep(0)
             async for event in agent.run(self._conversation):
                 if isinstance(event, StreamText):
+                    # 首个 StreamText 到达时重建 live_answer，确保样式干净。
+                    if live_answer is not None and not answer:
+                        await live_answer.remove()
+                        live_answer = Static("", classes="message assistant-message")
+                        await ai_row.mount(live_answer)
                     answer += event.text
                     live_text = Text()
                     live_text.append("● ", style="bold #d9a441")
                     live_text.append(answer)
-                    live_answer.update(live_text)
+                    if live_answer is not None:
+                        live_answer.update(live_text)
                     chat.scroll_end(animate=False)
                 elif isinstance(event, ThinkingText):
-                    thinking += event.text
-                    if thinking_widget is None:
-                        thinking_widget = Static(
-                            Text("Thinking"), classes="message thinking-message"
-                        )
-                        await chat.mount(thinking_widget)
-                    thinking_widget.update(Text(f"Thinking\n{thinking}"))
-                    chat.scroll_end(animate=False)
+                    # thinking 内容不在 TUI 显示，只滚动到底部让 spinner 保持可见。
+                    self.call_after_refresh(chat.scroll_end, animate=False)
                 elif isinstance(event, ToolUseEvent):
+                    # 工具调用前把已累积的流式文本转为 Markdown 持久化到当前 ai_row，
+                    # 避免 live_answer 残留旧文本导致后续回合答案串接或丢失。
+                    if answer:
+                        if live_answer is not None:
+                            await live_answer.remove()
+                        prefix = Static(Text("●  ", style="bold #d9a441"), classes="message")
+                        await ai_row.mount(prefix)
+                        await ai_row.mount(
+                            Markdown(answer, classes="message assistant-markdown")
+                        )
+                        live_answer = None
+                        answer = ""
+                    elif live_answer is not None:
+                        await live_answer.remove()
+                        live_answer = None
                     # batch12：Agent 工具调用用 SubAgentBlock 呈现；其它工具用 ToolCallBlock。
                     if self._is_subagent_tool(event.tool_name):
                         agent_type = event.arguments.get("subagent_type", "") or "agent"
@@ -1709,7 +1747,8 @@ class SeaCodeApp(App[None]):
                     self._pending_permission = event
                     widget = InlinePermissionWidget(event.tool_name, event.description)
                     await chat.mount(widget)
-                    chat.scroll_end(animate=False)
+                    # 确认组件高度需在本次刷新后才能计算，随后再滚到底部。
+                    self.call_after_refresh(chat.scroll_end, animate=False)
                     input_widget.disabled = True
                 elif isinstance(event, MCPConnectEvent):
                     # MCP 批量连接完成：刷新状态栏摘要，连接错误以系统消息展示。
@@ -1765,14 +1804,14 @@ class SeaCodeApp(App[None]):
                     tool_blocks.clear()
                     ai_row = Vertical(classes="ai-row")
                     await chat.mount(ai_row)
-                    live_answer = Static(Text(""), classes="message assistant-message")
+                    live_answer = Static("", classes="message assistant-message")
                     await ai_row.mount(live_answer)
                     answer = ""
                     chat.scroll_end(animate=False)
                 elif isinstance(event, LoopComplete):
                     total_time = time.monotonic() - started
                     done_label = Static(
-                        f"✻ {_to_past_tense(thinking_verb)} for {total_time:.1f}s",
+                        f"✻ {_to_past_tense(self._thinking_verb)} for {total_time:.1f}s",
                         classes="message thinking-done",
                     )
                     await ai_row.mount(done_label)
@@ -1788,20 +1827,24 @@ class SeaCodeApp(App[None]):
                         )
                         asyncio.ensure_future(self._update_session_summary())
 
-            # 收尾：渲染剩余的累积文本。
-            await live_answer.remove()
-            final_answer = answer or "*(The provider completed without text.)*"
-            await ai_row.mount(
-                Markdown(final_answer, classes="message assistant-markdown")
-            )
+            # 收尾：把剩余的累积文本转为 Markdown 持久化到当前 ai_row。
+            # live_answer 为 None 时（工具调用后已转 Markdown）不再处理。
+            if answer and live_answer is not None:
+                await live_answer.remove()
+                await ai_row.mount(
+                    Markdown(answer, classes="message assistant-markdown")
+                )
+            elif live_answer is not None:
+                await live_answer.remove()
             elapsed = time.monotonic() - started
             self._set_status(
                 f"Ready  {elapsed:.1f}s  in {total_input} / out {total_output}"
             )
         except asyncio.CancelledError:
             # 保留已累积的流式文本并追加 [cancelled] 标记。
-            await live_answer.remove()
             if answer:
+                if live_answer is not None:
+                    await live_answer.remove()
                 await ai_row.mount(
                     Markdown(
                         answer + "\n\n*[cancelled]*",
@@ -1822,11 +1865,48 @@ class SeaCodeApp(App[None]):
             )
             self._set_status("Ready")
         finally:
+            # 停止 spinner 动画并移除 label，无论回合成功/失败/取消。
+            self._stop_spinner()
+            if self._spinner_label is not None:
+                try:
+                    self._spinner_label.remove()
+                except Exception:
+                    pass
+                self._spinner_label = None
             self._streaming = False
             self._agent_task = None
             input_widget.disabled = self._client is None
             if not input_widget.disabled:
                 input_widget.focus()
+
+    # 启动 braille spinner 动画（每帧 80ms），thinking 期间持续旋转。
+    def _start_spinner(self) -> None:
+        if self._spinner_timer is not None:
+            return
+        self._spinner_timer = self.set_interval(0.08, self._tick_spinner)
+
+    # 停止 spinner 动画。
+    def _stop_spinner(self) -> None:
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+
+    # 推进 spinner 标签上的动画帧，每 5 帧滚动一次聊天区。
+    def _tick_spinner(self) -> None:
+        self._spinner_idx += 1
+        frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+        elapsed = time.monotonic() - self._thinking_start
+        if self._spinner_label is not None:
+            self._spinner_label.update(
+                f"  {frame} {self._thinking_verb}…  ({elapsed:.0f}s)"
+            )
+            if self._spinner_idx % 5 == 0:
+                try:
+                    self.query_one("#chat-area", VerticalScroll).scroll_end(
+                        animate=False
+                    )
+                except Exception:
+                    pass
 
     # 回滚本回合新增的所有消息，避免不完整历史污染后续请求。
     def _rollback_turn(self, turn_start_len: int) -> None:
