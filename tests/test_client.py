@@ -15,6 +15,7 @@ from seacode.client import (
     TextDelta,
     ThinkingComplete,
     ThinkingDelta,
+    _supports_adaptive_thinking,
     create_client,
     resolve_context_window,
 )
@@ -212,6 +213,48 @@ async def test_anthropic_client_uses_messages_protocol() -> None:
     assert fake.request["system"] == [
         {"type": "text", "text": "System prompt", "cache_control": {"type": "ephemeral"}}
     ]
+
+
+# 验证 adaptive thinking 只对已支持的 4 系列小版本启用。
+# 参数化相邻版本，防止宽泛的系列匹配向不支持的模型发送零预算。
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-opus-4-1", False),
+        ("claude-sonnet-4-5", False),
+        ("claude-opus-4-6", True),
+        ("claude-sonnet-4-6", True),
+        ("claude-opus-5-0", False),
+    ],
+)
+def test_adaptive_thinking_requires_supported_model_version(
+    model: str, expected: bool
+) -> None:
+    assert _supports_adaptive_thinking(model) is expected
+
+
+# 验证不支持 adaptive thinking 的模型使用明确的正数预算。
+# 通过记录 Anthropic 请求，断言 claude-opus-4-1 不携带 budget_tokens=0。
+@pytest.mark.asyncio
+async def test_anthropic_client_uses_positive_thinking_budget_for_unsupported_version() -> None:
+    delta = SimpleNamespace(type="text_delta", text="Hello")
+    event = SimpleNamespace(type="content_block_delta", delta=delta)
+    final = SimpleNamespace(usage=SimpleNamespace(input_tokens=5, output_tokens=3))
+    fake = _FakeAnthropicClient([event], final)
+    config = ProviderConfig(
+        name="anthropic-profile",
+        protocol="anthropic",
+        model="claude-opus-4-1",
+        base_url="https://api.anthropic.test",
+        api_key="test-key",
+        thinking=True,
+    )
+    client = AnthropicClient(config, client=fake)
+
+    await _events(client)
+
+    assert fake.request is not None
+    assert fake.request["thinking"] == {"type": "enabled", "budget_tokens": 8191}
 
 
 # 验证客户端工厂只根据 protocol 创建对应适配器。

@@ -157,15 +157,16 @@ def _api_key(config: ProviderConfig) -> str:
     return api_key
 
 
-# 识别支持 adaptive thinking 的 Anthropic 模型（claude-opus-4 / claude-sonnet-4 系列）。
-# adaptive thinking 模型允许 budget_tokens=0 表示"由模型自行决定思考预算"，
-# 旧模型必须显式给正数 budget_tokens（通常用 max_output_tokens - 1）。
+# 识别支持 adaptive thinking 的 Anthropic 模型。
+# 仅确认的 4 系列小版本允许 budget_tokens=0，其余模型保留明确的正数预算。
 def _supports_adaptive_thinking(model: str) -> bool:
-    m = model.lower()
-    if "claude-opus-4" in m or "claude-sonnet-4" in m:
-        return True
-    if "claude-opus-5" in m or "claude-sonnet-5" in m:
-        return True
+    normalized_model = model.lower()
+    for family in ("claude-opus-4-", "claude-sonnet-4-"):
+        if not normalized_model.startswith(family):
+            continue
+        version_suffix = normalized_model[len(family) :]
+        if version_suffix and version_suffix[0].isdigit() and int(version_suffix[0]) >= 6:
+            return True
     return False
 
 
