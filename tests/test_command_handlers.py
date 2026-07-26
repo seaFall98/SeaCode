@@ -438,6 +438,23 @@ async def test_status_displays_aggregated_info() -> None:
     assert "版本：0.1.0" in text
 
 
+# 验证 /status 输出权限模式字段。
+# 预设 agent.permission_mode，断言输出含 "权限模式：" 与 mode value。
+async def test_status_displays_permission_mode() -> None:
+    tool_registry = _FakeToolRegistry(["tool1"])
+    agent = _FakeAgent(
+        model="claude-test",
+        tool_registry=tool_registry,
+        permission_checker=_FakePermissionChecker(mode=PermissionMode.ACCEPT_EDITS),
+    )
+    ui = _FakeUI(token_count=(0, 100000))
+    ctx = _make_ctx(args="", agent=agent, ui=ui)
+    await handle_status(ctx)
+    text = ui.system_messages[0]
+    assert "权限模式：" in text
+    assert "acceptEdits" in text
+
+
 # ---------- /clear ----------
 
 

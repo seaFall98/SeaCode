@@ -16,6 +16,12 @@ async def handle_status(ctx: CommandContext) -> None:
 
     model = getattr(agent, "model", "未知")
     plan_mode = getattr(agent, "plan_mode", False)
+    # 权限模式：default / acceptEdits / bypassPermissions / plan；agent 为 None 时 unknown。
+    if agent is not None:
+        permission_mode = getattr(agent, "permission_mode", None)
+        mode_str = permission_mode.value if permission_mode is not None else "unknown"
+    else:
+        mode_str = "unknown"
     session_id = getattr(session, "session_id", "无") if session else "无"
     tool_count = 0
     tool_registry = getattr(agent, "tool_registry", None)
@@ -32,6 +38,7 @@ async def handle_status(ctx: CommandContext) -> None:
     lines = [
         "SeaCode 当前状态",
         f"  模型：{model}",
+        f"  权限模式：{mode_str}",
         f"  Plan 模式：{'是' if plan_mode else '否'}",
         f"  会话 ID：{session_id}",
         f"  Token：{used} / {limit}",
