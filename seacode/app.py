@@ -75,6 +75,7 @@ from .commands.handlers.tasks import create_tasks_command
 from .commands.handlers.trace import create_trace_command
 from .commands.handlers.worktree import create_worktree_command
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig, WorktreeConfig
+from .context import CompactCircuitBreaker, RecoveryState, create_replacement_state
 from .conversation import ConversationManager, Message
 from .filehistory.history import FileHistory
 from .hooks import HookContext, HookEngine
@@ -738,6 +739,11 @@ class SeaCodeApp(App[None]):
         self._conversation = ConversationManager()
         self._selected_provider: ProviderConfig | None = None
         self._tool_registry = create_default_registry()
+        # 压缩恢复状态属于应用会话，跨每条用户消息新建的 Agent 保持连续。
+        self._recovery_state = RecoveryState()
+        self._compact_breaker = CompactCircuitBreaker()
+        self._replacement_state = create_replacement_state()
+        self._active_skills: dict[str, str] = {}
         self._plan_exit_requested = False
         self._plan_approval_active = False
         self._pre_plan_mode = PermissionMode.DEFAULT
@@ -1726,6 +1732,11 @@ class SeaCodeApp(App[None]):
                 # batch11：注入 HookEngine；Agent.run 在 8 个注入点触发对应生命周期事件。
                 hook_engine=self._hook_engine,
             )
+            # Agent 每回合重建，恢复快照和压缩状态必须复用当前应用会话对象。
+            agent.recovery_state = self._recovery_state
+            agent.compact_breaker = self._compact_breaker
+            agent.replacement_state = self._replacement_state
+            agent.active_skills = self._active_skills
             if (
                 self._permission_checker is not None
                 and self._permission_checker.plan_file_path

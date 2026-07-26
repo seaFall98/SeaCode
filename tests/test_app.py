@@ -33,6 +33,7 @@ from seacode.client import (
 )
 from seacode.commands.registry import Command, CommandContext, CommandType
 from seacode.config import ProviderConfig
+from seacode.context import build_recovery_attachment
 from seacode.conversation import Message
 from seacode.permission_dialog import InlinePermissionWidget
 from seacode.permissions import PermissionMode, RuleEngine
@@ -873,6 +874,46 @@ async def test_consecutive_turns_reuse_mcp_initialization() -> None:
         for message in client.requests[1]
     )
     assert instruction_count == 1
+
+
+# 验证跨用户回合保留压缩恢复快照与熔断状态。
+# 在首回合写入文件快照和熔断记录，第二回合断言新 Agent 仍引用同一会话状态。
+@pytest.mark.asyncio
+async def test_consecutive_turns_preserve_context_recovery_state() -> None:
+    client = _FakeClient(
+        [
+            [TextDelta("First response"), StreamComplete()],
+            [TextDelta("Second response"), StreamComplete()],
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("First request")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        first_agent = app._agent
+        assert first_agent is not None
+        first_agent.recovery_state.record_file_read("/workspace/settings.py", "PORT = 8080")
+        first_agent.compact_breaker.record_failure()
+        first_agent.replacement_state.seen_ids.add("tool-result-1")
+        first_agent.active_skills["review"] = "Inspect the latest diff."
+
+        input_widget.load_text("Second request")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        second_agent = app._agent
+        assert second_agent is not None
+        assert second_agent.recovery_state is first_agent.recovery_state
+        assert second_agent.compact_breaker is first_agent.compact_breaker
+        assert second_agent.replacement_state is first_agent.replacement_state
+        assert second_agent.active_skills is first_agent.active_skills
+        attachment = build_recovery_attachment(second_agent.recovery_state, [])
+        assert "settings.py" in attachment
+        assert "PORT = 8080" in attachment
 
 
 # 验证完成计划后显示审批组件，YOLO 选择会切换权限并带计划内容进入执行回合。
