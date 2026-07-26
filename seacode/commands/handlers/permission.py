@@ -13,8 +13,11 @@ from seacode.permissions import PermissionMode
 #   add     解析 "ToolName(pattern) allow|deny" 并追加到本地规则文件
 #   reset   清空本地规则文件
 async def handle_permission(ctx: CommandContext) -> None:
-    if ctx.agent is None:
-        ctx.ui.add_system_message("Agent 未初始化")
+    checker = ctx.permission_checker
+    if checker is None and ctx.agent is not None:
+        checker = ctx.agent.permission_checker
+    if checker is None and ctx.agent is None:
+        ctx.ui.add_system_message("权限系统未初始化")
         return
 
     parts = ctx.args.split(None, 1)
@@ -23,8 +26,7 @@ async def handle_permission(ctx: CommandContext) -> None:
 
     if sub == "":
         # 显示当前模式与规则数量；rule_engine 缺失时只显示模式。
-        mode = ctx.agent.permission_mode
-        checker = ctx.agent.permission_checker
+        mode = checker.mode if checker is not None else ctx.agent.permission_mode
         rule_count = 0
         if checker and checker.rule_engine:
             tiers = checker.rule_engine._load_tiers()
@@ -51,14 +53,14 @@ async def handle_permission(ctx: CommandContext) -> None:
             modes = ", ".join(m.value for m in PermissionMode)
             ctx.ui.add_system_message(f"未知模式：{arg}\n可选：{modes}")
             return
-        ctx.agent.set_permission_mode(target_mode)
-        ctx.ui.refresh_status()
+        if ctx.agent is not None:
+            ctx.agent.set_permission_mode(target_mode)
+        ctx.ui.set_permission_mode(target_mode)
         ctx.ui.add_system_message(f"权限模式已切换为：{target_mode.value}")
         return
 
     if sub == "rules":
         # 按三层（用户级/项目级/本地级）展示规则，便于定位来源。
-        checker = ctx.agent.permission_checker
         if not checker or not checker.rule_engine:
             ctx.ui.add_system_message("规则引擎未初始化")
             return
@@ -97,7 +99,6 @@ async def handle_permission(ctx: CommandContext) -> None:
         except ValueError as e:
             ctx.ui.add_system_message(str(e))
             return
-        checker = ctx.agent.permission_checker
         if checker and checker.rule_engine:
             checker.rule_engine.append_local_rule(rule)
             ctx.ui.add_system_message(
@@ -109,7 +110,6 @@ async def handle_permission(ctx: CommandContext) -> None:
 
     if sub == "reset":
         # 清空本地规则文件内容，保留文件本身以便后续 append_local_rule 续写。
-        checker = ctx.agent.permission_checker
         if checker and checker.rule_engine and checker.rule_engine._local_path:
             path = checker.rule_engine._local_path
             if path.exists():

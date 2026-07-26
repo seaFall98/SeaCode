@@ -587,6 +587,43 @@ async def test_shift_tab_cycles_permission_modes() -> None:
         assert "[default]" in str(app.query_one("#mode-label", Static).render())
 
 
+# 验证 /permission 在首回合及后续回合均同步 App、检查器与 Agent 的权限模式。
+# 首回合前切换后完成两次普通回合，断言新建 Agent 始终继承同一模式。
+@pytest.mark.asyncio
+async def test_permission_command_syncs_modes_across_turns() -> None:
+    client = _FakeClient(
+        [
+            [TextDelta("first"), StreamComplete(input_tokens=1, output_tokens=1)],
+            [TextDelta("second"), StreamComplete(input_tokens=1, output_tokens=1)],
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        assert await app._dispatch_command("/permission mode acceptEdits")
+        assert app._permission_mode == PermissionMode.ACCEPT_EDITS
+        assert app._permission_checker is not None
+        assert app._permission_checker.mode == PermissionMode.ACCEPT_EDITS
+
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("first turn")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+        assert app._agent is not None
+        assert app._agent.permission_mode == PermissionMode.ACCEPT_EDITS
+
+        assert await app._dispatch_command("/permission mode bypassPermissions")
+        assert app._permission_mode == PermissionMode.BYPASS
+        assert app._permission_checker.mode == PermissionMode.BYPASS
+        assert app._agent.permission_mode == PermissionMode.BYPASS
+
+        input_widget.load_text("second turn")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+        assert app._agent is not None
+        assert app._agent.permission_mode == PermissionMode.BYPASS
+
+
 # 验证 DEFAULT 模式下 WriteFile 触发内联权限对话框。
 # 提交触发 WriteFile 的文本后，断言 InlinePermissionWidget 挂载且 _pending_permission 非空。
 @pytest.mark.asyncio

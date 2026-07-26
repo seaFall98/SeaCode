@@ -30,6 +30,7 @@ class _FakeUI:
         self.system_messages: list[str] = []
         self.user_messages: list[str] = []
         self.plan_mode_calls: list[bool] = []
+        self.permission_mode_calls: list[PermissionMode] = []
         self.refresh_calls = 0
         self._token_count = token_count
 
@@ -41,6 +42,9 @@ class _FakeUI:
 
     def set_plan_mode(self, enabled: bool) -> None:
         self.plan_mode_calls.append(enabled)
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        self.permission_mode_calls.append(mode)
 
     def get_token_count(self) -> tuple[int, int]:
         return self._token_count
@@ -771,7 +775,7 @@ async def test_permission_mode_switches() -> None:
     assert agent.permission_mode == PermissionMode.ACCEPT_EDITS
     assert checker.mode == PermissionMode.ACCEPT_EDITS
     assert "权限模式已切换为：acceptEdits" in ui.system_messages[0]
-    assert ui.refresh_calls == 1
+    assert ui.permission_mode_calls == [PermissionMode.ACCEPT_EDITS]
 
 
 # 验证 /permission mode 未知模式给出提示。

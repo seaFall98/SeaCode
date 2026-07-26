@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
+from seacode.permissions import PermissionMode
+
 
 # 命令类型：LOCAL 直接输出、LOCAL_UI 附带 UI 状态操作、PROMPT 构造提示词发给 LLM。
 # 继承 StrEnum 使成员既是字符串又支持字符串比较，便于序列化与分发层判断。
@@ -22,6 +24,7 @@ class UIController(Protocol):
     def add_system_message(self, text: str) -> None: ...
     def send_user_message(self, text: str) -> None: ...
     def set_plan_mode(self, enabled: bool) -> None: ...
+    def set_permission_mode(self, mode: PermissionMode) -> None: ...
     def get_token_count(self) -> tuple[int, int]: ...
     def refresh_status(self) -> None: ...
 
@@ -41,6 +44,7 @@ class CommandContext:
     memory_manager: Any
     ui: UIController
     config: Any
+    permission_checker: Any = None
 
 
 # 命令定义：name 为主键，aliases 为别名列表，hidden 控制是否在 /help 中列出。

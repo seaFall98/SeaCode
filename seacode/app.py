@@ -1275,6 +1275,7 @@ class SeaCodeApp(App[None]):
             session_manager=self._session_manager,
             memory_manager=self._memory_manager,
             ui=self,  # SeaCodeApp 实现 UIController Protocol
+            permission_checker=self._permission_checker,
             config={
                 "registry": self._command_registry,
                 "set_session": self._set_session,
@@ -1340,12 +1341,18 @@ class SeaCodeApp(App[None]):
         self._streaming = True
         self._agent_task = asyncio.create_task(self._run_turn(text))
 
-    # UIController: 切换 Plan 模式；同步 permission_checker.mode 保持一致。
+    # UIController: 切换 Plan 模式；同步权限状态保持一致。
     def set_plan_mode(self, enabled: bool) -> None:
         new_mode = PermissionMode.PLAN if enabled else PermissionMode.DEFAULT
-        self._permission_mode = new_mode
+        self.set_permission_mode(new_mode)
+
+    # UIController: 统一切换权限模式，保持状态栏、检查器与当前 Agent 一致。
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        self._permission_mode = mode
         if self._permission_checker is not None:
-            self._permission_checker.mode = new_mode
+            self._permission_checker.mode = mode
+        if self._agent is not None:
+            self._agent.set_permission_mode(mode)
         self._update_mode_label()
 
     # UIController: 返回当前 token 用量与上限，供 /status 与 /compact 使用。
@@ -1484,10 +1491,7 @@ class SeaCodeApp(App[None]):
             return
         current_idx = _MODE_CYCLE.index(self._permission_mode)
         next_mode = _MODE_CYCLE[(current_idx + 1) % len(_MODE_CYCLE)]
-        self._permission_mode = next_mode
-        if self._permission_checker is not None:
-            self._permission_checker.mode = next_mode
-        self._update_mode_label()
+        self.set_permission_mode(next_mode)
 
     # 更新状态栏右侧的模式标签，显示当前模式名与对应颜色。
     def _update_mode_label(self) -> None:
