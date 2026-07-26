@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import AsyncIterator, Sequence
+from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from seacode.__main__ import _run_prompt, main
+from seacode.agent import LoopComplete
 from seacode.client import LLMClient, StreamComplete, StreamEvent, TextDelta
 from seacode.config import AppConfig, ProviderConfig
 from seacode.conversation import Message
@@ -88,3 +91,89 @@ async def test_prompt_json_output_is_single_final_result(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"text": "completed"}
+
+
+# 验证 -p 装配的团队工具可创建成员并为成员提供 worktree 管理器。
+# 替换模型与 worktree 外部边界，执行 TeamCreate 和带 team_name 的 Agent 调用验证真实装配链路。
+@pytest.mark.asyncio
+async def test_prompt_runtime_starts_team_member_with_worktree_manager(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    provider = _provider()
+    config = AppConfig(providers=(provider,))
+    agents: list[Any] = []
+
+    class _PromptAgent:
+        def __init__(self, **kwargs: Any) -> None:
+            self.client = kwargs["client"]
+            self.registry = kwargs["registry"]
+            self.protocol = kwargs["protocol"]
+            self.context_window = kwargs["context_window"]
+            self.agent_id = f"agent-{len(agents)}"
+            self._full_registry: Any = None
+            self._team_manager: Any = None
+            self.coordinator_mode = False
+            self.team_result: Any = None
+            agents.append(self)
+
+        async def run(self, conversation: Any) -> AsyncIterator[Any]:
+            del conversation
+            create = self.registry.get("TeamCreate")
+            created = await create.execute(
+                SimpleNamespace(team_name="demo", description="test")
+            )
+            assert not created.is_error
+            member = self.registry.get("Agent")
+            self.team_result = await member.execute(
+                SimpleNamespace(
+                    team_name="demo",
+                    name="worker",
+                    prompt="inspect",
+                    description="inspect files",
+                    subagent_type="",
+                    run_in_background=False,
+                    model=None,
+                ),
+                conversation=None,
+                parent_agent=self,
+            )
+            yield LoopComplete(total_turns=1)
+
+    class _WorktreeManager:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def create(self, name: str, base_branch: str) -> Any:
+            return SimpleNamespace(
+                name=name,
+                path=str(tmp_path / "worktree"),
+                branch="worktree-test",
+                based_on=base_branch,
+                head_commit="abc123",
+                created=datetime.now(),
+            )
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
+    monkeypatch.setattr("seacode.client.create_client", lambda _: object())
+    monkeypatch.setattr("seacode.agent.Agent", _PromptAgent)
+    monkeypatch.setattr("seacode.worktree.WorktreeManager", _WorktreeManager)
+    monkeypatch.setattr("seacode.__main__.asyncio.sleep", no_sleep)
+    monkeypatch.setattr(
+        "seacode.teams.spawn_inprocess.spawn_inprocess_teammate",
+        lambda *args, **kwargs: SimpleNamespace(task=None, progress=None),
+    )
+
+    await _run_prompt("start a team", "text", None)
+
+    lead = agents[0]
+    assert lead.team_result is not None
+    assert not lead.team_result.is_error
+    member_tool = lead.registry.get("Agent")
+    assert member_tool.worktree_manager is not None
+    team = member_tool.team_manager.get_team("demo")
+    assert team is not None
+    assert [member.name for member in team.members] == ["worker"]

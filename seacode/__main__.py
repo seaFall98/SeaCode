@@ -158,8 +158,7 @@ async def _run_prompt(
     )
 
     # 注册高级工具：ToolSearch / AgentTool / TeamCreate / TeamDelete。
-    # 让 -p 模式也能使用子代理委托与团队协作能力；worktree_manager=None
-    # 表示 -p 模式不使用 worktree 隔离，团队仅走 in-process 路径。
+    # 非交互运行同样需要完整 worktree 装配，团队成员才能在隔离目录中启动。
     from types import SimpleNamespace
 
     from .agents.loader import AgentLoader
@@ -170,13 +169,18 @@ async def _run_prompt(
     from .tools.team_create import TeamCreateTool
     from .tools.team_delete import TeamDeleteTool
     from .tools.tool_search import ToolSearchTool
+    from .worktree import WorktreeManager
 
     trace_manager = TraceManager()
     task_manager = TaskManager()
     agent_loader = AgentLoader(Path(cwd))
     agent_loader.load_all()
+    worktree_manager = WorktreeManager(
+        repo_root=cwd,
+        symlink_directories=list(config.worktree.symlink_directories),
+    )
     team_manager = TeamManager(
-        worktree_manager=None, trace_manager=trace_manager
+        worktree_manager=worktree_manager, trace_manager=trace_manager
     )
     teams_config = SimpleNamespace(
         teammate_mode="in-process",
@@ -190,7 +194,7 @@ async def _run_prompt(
         parent_agent=agent,
         enable_fork=False,
         provider_config=provider,
-        worktree_manager=None,
+        worktree_manager=worktree_manager,
         team_manager=team_manager,
     )
     registry.register(agent_tool)
