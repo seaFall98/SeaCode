@@ -6,6 +6,7 @@ import json
 import sys
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -157,6 +158,7 @@ async def test_prompt_runtime_starts_team_member_with_worktree_manager(
         return None
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
     monkeypatch.setattr("seacode.client.create_client", lambda _: object())
     monkeypatch.setattr("seacode.agent.Agent", _PromptAgent)
@@ -177,3 +179,69 @@ async def test_prompt_runtime_starts_team_member_with_worktree_manager(
     team = member_tool.team_manager.get_team("demo")
     assert team is not None
     assert [member.name for member in team.members] == ["worker"]
+
+
+# 验证 -p 未传 --mode 时采用配置权限模式，并将项目指令和 Hook 注入 Agent。
+# 使用捕获 Agent 替代模型调用，只断言运行时装配的三个输入，避免依赖外部服务。
+@pytest.mark.asyncio
+async def test_prompt_runtime_uses_config_mode_instructions_and_hooks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    provider = _provider()
+    config = AppConfig(
+        providers=(provider,),
+        permission_mode="acceptEdits",
+        raw_hooks=[
+            {
+                "event": "pre_send",
+                "action": {"type": "prompt", "message": "Apply local rules."},
+            }
+        ],
+    )
+    created: list[Any] = []
+
+    class _CaptureAgent:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.agent_id = "lead"
+            self.registry = kwargs["registry"]
+            self.coordinator_mode = False
+            created.append(self)
+
+        async def run(self, conversation: Any) -> AsyncIterator[Any]:
+            del conversation
+            yield LoopComplete(total_turns=1)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
+    monkeypatch.setattr("seacode.client.create_client", lambda _: object())
+    monkeypatch.setattr("seacode.agent.Agent", _CaptureAgent)
+    monkeypatch.setattr(
+        "seacode.memory.instructions.load_instructions",
+        lambda _: "Project instructions",
+    )
+
+    await _run_prompt("verify", "text", None)
+
+    agent = created[0]
+    assert agent.kwargs["permission_checker"].mode.value == "acceptEdits"
+    assert agent.kwargs["instructions_content"] == "Project instructions"
+    assert agent.kwargs["hook_engine"] is not None
+    assert len(agent.kwargs["hook_engine"].hooks) == 1
+
+
+# 验证非法 Hook 会在 -p 启动前以明确配置错误终止。
+# 构造缺失 action 的 Hook，断言不会在带错误运行配置下继续执行任务。
+@pytest.mark.asyncio
+async def test_prompt_runtime_rejects_invalid_hook_configuration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = AppConfig(
+        providers=(_provider(),), raw_hooks=[{"event": "pre_send"}]
+    )
+    monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
+
+    with pytest.raises(SystemExit, match="1"):
+        await _run_prompt("verify", "text", None)
+
+    assert "hook configuration error" in capsys.readouterr().err.lower()

@@ -48,6 +48,21 @@ def test_load_config_prefers_later_provider_layer(tmp_path: Path) -> None:
     assert [provider.name for provider in config.providers] == ["project-local"]
 
 
+# 验证配置文件中的权限模式会被解析为应用运行配置。
+# 写入有效模式后加载配置，断言入口可直接使用解析后的字符串。
+def test_load_config_reads_permission_mode(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config(path, name="primary")
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\npermission_mode: acceptEdits\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.permission_mode == "acceptEdits"
+
+
 # 验证解析失败不会把 Provider 密钥放入异常文本。
 # 故意省略必需字段，同时使用可识别的秘密占位符。
 def test_invalid_config_error_redacts_api_key(tmp_path: Path) -> None:

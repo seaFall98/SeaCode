@@ -97,6 +97,7 @@ async def _run_prompt(
     )
     from .client import create_client
     from .conversation import ConversationManager
+    from .memory.instructions import load_instructions
     from .permissions import PermissionChecker, PermissionMode
     from .permissions.dangerous import DangerousCommandDetector
     from .permissions.rules import RuleEngine
@@ -113,6 +114,13 @@ async def _run_prompt(
         print("SeaCode configuration error: no provider configured", file=sys.stderr)
         raise SystemExit(1)
 
+    try:
+        hooks = load_hooks(config.raw_hooks)
+    except HookConfigError as error:
+        print(f"SeaCode hook configuration error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    hook_engine = HookEngine(hooks) if hooks else None
+
     provider = config.providers[0]
     try:
         client = create_client(provider)
@@ -120,8 +128,8 @@ async def _run_prompt(
         print(f"SeaCode client error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
 
-    # 解析权限模式：--mode 优先，否则默认 DEFAULT（与 TUI 模式一致）。
-    permission_mode = PermissionMode(mode_str) if mode_str else PermissionMode.DEFAULT
+    # 解析权限模式：--mode 优先，否则采用配置中的默认权限模式。
+    permission_mode = PermissionMode(mode_str or config.permission_mode)
 
     # 装配默认工具注册表与权限检查器；sandbox_enabled 关闭让 Bash 走常规确认。
     # -p 模式下无法弹 HITL 对话框，PermissionRequest 事件在事件循环中自动批准。
@@ -155,6 +163,8 @@ async def _run_prompt(
         max_iterations=_read_max_steps(),
         permission_checker=checker,
         context_window=provider.get_context_window(),
+        instructions_content=load_instructions(cwd),
+        hook_engine=hook_engine,
     )
 
     # 注册高级工具：ToolSearch / AgentTool / TeamCreate / TeamDelete。

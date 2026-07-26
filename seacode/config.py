@@ -11,7 +11,12 @@ from urllib.parse import urlsplit
 
 import yaml
 
-from .validator import DEFAULT_CONTEXT_WINDOW, lookup_model_context_window, validate_hooks
+from .validator import (
+    DEFAULT_CONTEXT_WINDOW,
+    lookup_model_context_window,
+    validate_hooks,
+    validate_permission_mode,
+)
 
 SUPPORTED_PROTOCOLS: Final = frozenset({"anthropic", "openai", "openai-compat"})
 _ENV_KEY_NAMES: Final = {
@@ -137,6 +142,8 @@ class AppConfig:
     """保存启动本批次对话应用所需的已校验配置。"""
 
     providers: tuple[ProviderConfig, ...]
+    # 默认权限模式；命令行未显式指定时由各运行入口采用。
+    permission_mode: str = "default"
     # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，三层合并任一层开启即开启。
     sandbox: SandboxAppConfig = SandboxAppConfig()
     # MCP 服务器配置列表；三层合并按 name 去重覆盖（同 name 替换、新 name 追加）。
@@ -209,10 +216,12 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
     sandbox = _parse_sandbox(raw.get("sandbox"), path)
     mcp_servers = _parse_mcp_servers(raw.get("mcp_servers"), path)
     raw_hooks = validate_hooks(raw.get("hooks"))
+    permission_mode = _parse_permission_mode(raw.get("permission_mode"), path)
     worktree = _parse_worktree(raw.get("worktree"), path)
     teammate_mode, enable_coordinator_mode = _parse_teammate_fields(raw, path)
     return AppConfig(
         providers=providers,
+        permission_mode=permission_mode,
         sandbox=sandbox,
         mcp_servers=mcp_servers,
         raw_hooks=raw_hooks,
@@ -220,6 +229,18 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
         teammate_mode=teammate_mode,
         enable_coordinator_mode=enable_coordinator_mode,
     )
+
+
+# 解析可选权限模式，缺失时采用默认；非法值在配置边界给出明确错误。
+def _parse_permission_mode(raw: Any, path: Path) -> str:
+    if raw is None:
+        return "default"
+    if not isinstance(raw, str):
+        raise ConfigError(f"permission_mode must be a string: {path}")
+    try:
+        return str(validate_permission_mode(raw).value)
+    except ValueError as error:
+        raise ConfigError(f"invalid permission_mode: {path}") from error
 
 
 # 解析 mcp_servers 段；缺失或非 list 时返回空元组，逐条校验字段。
@@ -409,6 +430,7 @@ def load_config(
     merged_symlinks: list[str] = []
     merged_interval: int = 3600
     merged_cutoff: int = 24
+    merged_permission_mode = "default"
     # batch14：团队字段合并；teammate_mode 后层非空覆盖前层，
     # enable_coordinator_mode 后层 True 覆盖前层（与 sandbox 的 OR 语义一致，更安全）。
     merged_teammate_mode: str = ""
@@ -418,6 +440,8 @@ def load_config(
             continue
         layer = _load_file(candidate)
         loaded = layer
+        if layer.permission_mode != "default":
+            merged_permission_mode = layer.permission_mode
         # sandbox 字段三层合并：任一层开启即开启（与 Provider 列表的"后层替换"语义不同）。
         sandbox_enabled = sandbox_enabled or layer.sandbox.enabled
         sandbox_auto_allow = sandbox_auto_allow or layer.sandbox.auto_allow
@@ -450,6 +474,7 @@ def load_config(
         )
     return AppConfig(
         providers=loaded.providers,
+        permission_mode=merged_permission_mode,
         sandbox=SandboxAppConfig(
             enabled=sandbox_enabled,
             auto_allow=sandbox_auto_allow,
