@@ -156,6 +156,53 @@ async def _run_prompt(
         context_window=provider.get_context_window(),
     )
 
+    # 注册高级工具：ToolSearch / AgentTool / TeamCreate / TeamDelete。
+    # 让 -p 模式也能使用子代理委托与团队协作能力；worktree_manager=None
+    # 表示 -p 模式不使用 worktree 隔离，团队仅走 in-process 路径。
+    from types import SimpleNamespace
+
+    from .agents.loader import AgentLoader
+    from .agents.task_manager import TaskManager
+    from .agents.trace import TraceManager
+    from .teams.manager import TeamManager
+    from .tools.agent_tool import AgentTool
+    from .tools.team_create import TeamCreateTool
+    from .tools.team_delete import TeamDeleteTool
+    from .tools.tool_search import ToolSearchTool
+
+    trace_manager = TraceManager()
+    task_manager = TaskManager()
+    agent_loader = AgentLoader(Path(cwd))
+    agent_loader.load_all()
+    team_manager = TeamManager(
+        worktree_manager=None, trace_manager=trace_manager
+    )
+    teams_config = SimpleNamespace(
+        teammate_mode="in-process",
+        enable_coordinator_mode=False,
+    )
+    registry.register(ToolSearchTool(registry, protocol=provider.protocol))
+    agent_tool = AgentTool(
+        agent_loader=agent_loader,
+        task_manager=task_manager,
+        trace_manager=trace_manager,
+        parent_agent=agent,
+        enable_fork=False,
+        provider_config=provider,
+        worktree_manager=None,
+        team_manager=team_manager,
+    )
+    registry.register(agent_tool)
+    registry.register(TeamCreateTool(agent, team_manager, teams_config))
+    registry.register(TeamDeleteTool(agent, team_manager))
+
+    # Lead 邮箱 draining：teammate 完成/空闲时通知会写入 lead mailbox，
+    # agent 在每轮开始时通过 notification_fn 取出并注入为 system-reminder。
+    def drain_mailbox_only() -> list[str]:
+        return team_manager.drain_lead_mailbox()
+
+    agent.notification_fn = drain_mailbox_only
+
     # Windows 默认 GBK 无法编码 emoji 等 Unicode 字符，强制 stdout 用 UTF-8。
     try:
         # TextIO 在类型存根中没有 reconfigure，但 CPython 运行时存在该方法。
@@ -265,6 +312,37 @@ async def _run_prompt(
         else:
             print(f"SeaCode run error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
+
+    # 团队轮询：如果 -p 模式创建了团队，LoopComplete 后 teammate 可能仍在运行。
+    # 轮询收取 teammate 完成通知与 lead 邮箱消息，注入为 system-reminder 后
+    # 用 run_to_completion 让 Lead 处理通知并继续，直到所有 teammate 完成。
+    if not team_manager._teams:
+        return
+    for _ in range(90):
+        await asyncio.sleep(2)
+        running = any(not t.done() for t in task_manager._async_tasks.values())
+        notes: list[str] = []
+        for t in task_manager.poll_completed():
+            notes.append(
+                f"<task-notification>\n<task_id>{t.id}</task_id>\n"
+                f"<status>{t.status}</status>\n<result>{t.result}</result>\n"
+                f"</task-notification>"
+            )
+        notes.extend(team_manager.drain_lead_mailbox())
+        if not notes:
+            if not running:
+                break
+            continue
+        for note in notes:
+            conv.add_system_reminder(note)
+        # 后续 team 轮询用 run_to_completion，避免重复事件流输出。
+        last_result = await agent.run_to_completion(
+            "Teammate notifications received. Process them and continue.", conv
+        )
+        if is_json:
+            emit_json({"type": "assistant", "text": last_result})
+        else:
+            print(last_result, flush=True)
 
 
 # batch14：teammate worker 入口；加载 config → 注册 self/lead 名字 → 构造 Agent → spawn。
