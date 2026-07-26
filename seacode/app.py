@@ -717,6 +717,7 @@ class SeaCodeApp(App[None]):
         *,
         client_factory: Callable[[ProviderConfig], LLMClient] = create_client,
         max_steps: int = 100,
+        permission_mode: PermissionMode = PermissionMode.DEFAULT,
         sandbox_cfg: SandboxAppConfig | None = None,
         mcp_servers: tuple[MCPServerConfig, ...] | list[MCPServerConfig] | None = None,
         hook_engine: HookEngine | None = None,
@@ -757,6 +758,8 @@ class SeaCodeApp(App[None]):
         self._spinner_label: Static | None = None
         self._agent_task: asyncio.Task[None] | None = None
         self._max_steps = max_steps
+        # 启动模式由 CLI 的显式参数或配置文件决定，装配检查器时一次性应用。
+        self._initial_permission_mode = permission_mode
         # OS 级沙箱配置；从 .seacode/config.yaml 的 sandbox 段加载，默认全关闭。
         self._sandbox_cfg = sandbox_cfg or SandboxAppConfig()
         # batch13：Worktree 隔离工作区配置与运行时管理器。
@@ -1231,10 +1234,10 @@ class SeaCodeApp(App[None]):
             detector=DangerousCommandDetector(),
             sandbox=PathSandbox(project_root=work_dir),
             rule_engine=rule_engine,
-            mode=PermissionMode.DEFAULT,
+            mode=self._initial_permission_mode,
             sandbox_enabled=checker_sandbox_enabled,
         )
-        self._permission_mode = PermissionMode.DEFAULT
+        self._permission_mode = self._initial_permission_mode
 
     # 在客户端创建失败时展示脱敏启动错误。
     def _show_startup_error(self, error: LLMError) -> None:

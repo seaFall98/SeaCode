@@ -245,3 +245,57 @@ async def test_prompt_runtime_rejects_invalid_hook_configuration(
         await _run_prompt("verify", "text", None)
 
     assert "hook configuration error" in capsys.readouterr().err.lower()
+
+
+# 验证普通 TUI 将配置权限模式与显式 --mode 一并传入应用。
+# 替换应用实例和上下文窗口解析，只检查入口解析后的模式，不启动真实终端界面。
+@pytest.mark.parametrize(
+    ("argv", "config_mode", "expected_mode"),
+    [
+        (["sea"], "acceptEdits", "acceptEdits"),
+        (["sea", "--mode", "default"], "acceptEdits", "default"),
+        (["sea", "--mode", "acceptEdits"], "default", "acceptEdits"),
+        (["sea", "--mode", "plan"], "default", "plan"),
+        (["sea", "--mode", "bypassPermissions"], "default", "bypassPermissions"),
+    ],
+)
+def test_main_passes_effective_permission_mode_to_tui(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    config_mode: str,
+    expected_mode: str,
+) -> None:
+    created: list[Any] = []
+
+    class _FakeApp:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.driver_class: Any = None
+            created.append(self)
+
+        def run(self) -> None:
+            return None
+
+    async def no_context_window_lookup(_: Any) -> None:
+        return None
+
+    config = AppConfig(providers=(_provider(),), permission_mode=config_mode)
+    monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
+    monkeypatch.setattr("seacode.__main__._resolve_context_windows_async", no_context_window_lookup)
+    monkeypatch.setattr("seacode.app.SeaCodeApp", _FakeApp)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    assert created[0].kwargs["permission_mode"].value == expected_mode
+
+
+# 验证非法 --mode 仍由 argparse 在启动前拒绝。
+# 传入未定义模式并断言入口不构造 TUI，保留命令行错误语义。
+def test_main_rejects_invalid_permission_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["sea", "--mode", "unsupported"])
+
+    with pytest.raises(SystemExit, match="2"):
+        main()

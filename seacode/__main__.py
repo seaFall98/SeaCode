@@ -501,6 +501,8 @@ def main() -> None:
         print(f"SeaCode configuration error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
 
+    permission_mode = PermissionMode(args.mode or config.permission_mode)
+
     # 加载 Hook 配置；字段级校验失败打印错误并退出，不让 SeaCode 带着错误配置启动。
     try:
         hooks = load_hooks(config.raw_hooks)
@@ -523,6 +525,7 @@ def main() -> None:
     app = SeaCodeApp(
         providers=config.providers,
         max_steps=_read_max_steps(),
+        permission_mode=permission_mode,
         hook_engine=hook_engine,
         # batch14：透传团队协调配置；teammate_mode 指定 spawn 后端，
         # enable_coordinator_mode 开启 Lead 工具收敛与协调者提示词。
