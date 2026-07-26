@@ -19,7 +19,10 @@ class TeamDeleteParams(BaseModel):
 class TeamDeleteTool(Tool):
     # 删除团队工具；全链路清理后若 Lead 无剩余团队则恢复全量注册表。
     name = "TeamDelete"
-    description = "删除团队并全链路清理（活跃成员、worktree、邮箱、目录）"
+    description = (
+        "删除团队：终止所有 pane 进程、移除 worktree、清理邮箱与团队目录。"
+        "要求所有成员处于 idle 状态，否则需要先等待或手动收尾。"
+    )
     params_model = TeamDeleteParams
     category = ToolCategory.COMMAND
     is_concurrency_safe = False

@@ -26,7 +26,14 @@ class InstallSkill(Tool):
     """
 
     name: str = "InstallSkill"
-    description: str = "从 URL 安装第三方 Skill 包到用户全局目录"
+    description: str = (
+        "从 URL 下载并安装第三方 Skill 包到用户全局目录（~/.seacode/skills/）。"
+        "支持三种 URL 格式：skills.sh 短链（https://www.skills.sh/<owner>/<repo>/<name>）、"
+        "GitHub tree 路径（https://github.com/<owner>/<repo>/tree/<ref>/<path>）、"
+        "以及指向 SKILL.md 的原始 URL。"
+        "安装完成后可通过 /<name> 命令或 LoadSkill 工具激活使用。"
+        "当用户粘贴 Skill URL 并要求安装时调用此工具。"
+    )
     params_model: type[BaseModel] = _InstallSkillParams
     category: ToolCategory = ToolCategory.WRITE
     is_system_tool: bool = True

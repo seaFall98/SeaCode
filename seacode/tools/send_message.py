@@ -28,7 +28,11 @@ class SendMessageParams(BaseModel):
 class SendMessageTool(Tool):
     # 团队消息工具；to="*" 广播排除发送者，非 lead 发送时带 lead。
     name = "SendMessage"
-    description = "向团队成员发送消息（text / shutdown_request / shutdown_response）"
+    description = (
+        "向团队成员发送消息，可按名字或 agent_id 指定接收人。"
+        "to='*' 表示广播给所有队友；text 消息应附带 5-10 词的简短摘要。"
+        "支持结构化类型：shutdown_request（请求队友关闭）、shutdown_response（关闭应答）。"
+    )
     params_model = SendMessageParams
     category = ToolCategory.COMMAND
     is_concurrency_safe = True

@@ -55,8 +55,10 @@ class AskUserTool(Tool):
 
     name = "AskUserQuestion"
     description = (
-        "Ask the user a set of questions (text/radio/select/checkbox). "
-        "Use when you need clarification to proceed."
+        "Ask the user one or more questions when you need information "
+        "that cannot be determined from code or context alone. "
+        "Supports text input, radio (single select), select, and checkbox "
+        "(multi select) question types."
     )
     category = ToolCategory.READ
     is_system_tool = True
