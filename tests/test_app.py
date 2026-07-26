@@ -95,6 +95,23 @@ class _PlanModeCaptureClient(LLMClient):
         yield StreamComplete(input_tokens=1, output_tokens=1)
 
 
+# 独立记忆选择器客户端，避免与主对话的预设流混用。
+class _MemorySelectorClient(LLMClient):
+    def __init__(self) -> None:
+        self.requests: list[tuple[Message, ...]] = []
+
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        system: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        del system, tools
+        self.requests.append(tuple(messages))
+        yield TextDelta('{"selected_memories": ["conventions.md"]}')
+        yield StreamComplete()
+
+
 # 模拟完成计划、请求审批与后续执行的两段模型响应。
 class _PlanApprovalClient(LLMClient):
     def __init__(self) -> None:
@@ -776,6 +793,35 @@ async def test_plan_mode_is_injected_into_next_model_request(
     assert app._permission_checker is not None
     plan_path = Path(app._permission_checker.plan_file_path)
     assert plan_path.parent == tmp_path / ".seacode" / "plans"
+
+
+# 验证主 TUI 回合会为用户消息启动非阻塞的记忆召回任务。
+# 替换召回入口为可观察协程，断言实际查询文本由当前回合传入。
+@pytest.mark.asyncio
+async def test_user_turn_starts_memory_recall_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    memory_dir = tmp_path / ".seacode" / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "conventions.md").write_text(
+        "---\ndescription: project conventions\ntype: project\n---\n\nUse the established API.",
+        encoding="utf-8",
+    )
+    client = _FakeClient([[TextDelta("Done"), StreamComplete()]])
+    selector_client = _MemorySelectorClient()
+    clients = iter([client, selector_client])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: next(clients))
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Recall the project conventions")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+        await pilot.pause(0.1)
+
+    assert len(selector_client.requests) == 1
+    assert "Recall the project conventions" in selector_client.requests[0][0].content
 
 
 # 验证完成计划后显示审批组件，YOLO 选择会切换权限并带计划内容进入执行回合。

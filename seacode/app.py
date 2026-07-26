@@ -53,6 +53,7 @@ from .client import (
     LLMError,
     NetworkError,
     RateLimitError,
+    TextDelta,
     create_client,
 )
 from .commands import (
@@ -82,9 +83,11 @@ from .memory import (
     MemoryManager,
     Session,
     SessionManager,
+    find_relevant_memories,
     generate_session_summary,
     load_instructions,
     make_compact_boundary,
+    render_reminder,
 )
 from .permission_dialog import InlinePermissionWidget
 from .permissions import (
@@ -1624,6 +1627,40 @@ class SeaCodeApp(App[None]):
             execute_text += "\n\nApproved Plan:\n" + plan_content
         self.send_user_message(execute_text)
 
+    # 为当前回合预取相关记忆；使用独立客户端避免与主流式请求竞争。
+    async def _prefetch_relevant_memories(self, query: str) -> str:
+        if self._memory_manager is None or self._selected_provider is None:
+            return ""
+
+        try:
+            side_client = self._client_factory(self._selected_provider)
+            # 工厂若复用主客户端则跳过本次召回，避免并发流抢占主对话。
+            if side_client is self._client:
+                return ""
+
+            async def selector(system_prompt: str, user_message: str) -> str:
+                messages = [Message(role="user", content=user_message)]
+                collected = ""
+                async for event in side_client.stream(messages, system=system_prompt):
+                    if isinstance(event, TextDelta):
+                        collected += event.text
+                return collected
+
+            memories = await asyncio.wait_for(
+                find_relevant_memories(
+                    query=query,
+                    user_mem_dir=self._memory_manager.user_mem_dir,
+                    project_mem_dir=self._memory_manager.project_mem_dir,
+                    recent_tools=None,
+                    already_surfaced=None,
+                    selector=selector,
+                ),
+                timeout=8.0,
+            )
+            return render_reminder(memories)
+        except Exception:
+            return ""
+
     # 执行一条完整 Agent Loop 回合，消费 AgentEvent 流并管理 TUI 展示与取消。
     async def _run_turn(self, text: str) -> None:
         client = self._client
@@ -1740,6 +1777,11 @@ class SeaCodeApp(App[None]):
             # 同步当前会话 ID 给 Agent，仅用于压缩摘要里的 transcript_path 提示。
             if self._session is not None:
                 agent.session_id = self._session.session_id
+            if text:
+                agent.memory_recall_task = asyncio.create_task(
+                    self._prefetch_relevant_memories(text)
+                )
+                agent._memory_recall_consumed = False
             # 持久化游标：记录已写入 JSONL 的历史末尾位置。
             # TurnComplete 增量追加新消息；CompactNotification 先写 boundary 再推进游标。
             history_cursor = len(self._conversation.messages)

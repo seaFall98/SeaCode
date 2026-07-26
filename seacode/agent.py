@@ -404,6 +404,9 @@ class Agent:
         # 为 None 时跳过长期记忆注入与提取（向后兼容 batch01-07 行为）。
         self.instructions_content = instructions_content
         self.memory_manager = memory_manager
+        # 记忆召回由应用层预取，工具执行后再把已完成结果注入当前对话。
+        self.memory_recall_task: asyncio.Task[str] | None = None
+        self._memory_recall_consumed = False
         # 记忆提取合并策略（对齐 v1 既定 inProgress + pendingContext）：
         # _extracting: 标记是否有提取正在进行
         # _pending_extraction: 提取期间又触发了新请求，标记需要尾随提取
@@ -1074,6 +1077,17 @@ class Agent:
                 break
 
             conversation.add_tool_results_message(tool_results)
+
+            # 召回不会阻塞主请求；仅消费已经完成的预取结果，失败保持静默。
+            if self.memory_recall_task is not None and not self._memory_recall_consumed:
+                if self.memory_recall_task.done():
+                    try:
+                        recall = self.memory_recall_task.result()
+                        if recall:
+                            conversation.add_system_reminder(recall)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    self._memory_recall_consumed = True
             yield TurnComplete(turn=iteration)
 
             if exit_plan_succeeded:

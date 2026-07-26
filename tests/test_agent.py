@@ -221,6 +221,36 @@ async def test_failed_plan_exit_keeps_agent_loop_running() -> None:
     assert conversation.messages[-1].content == "Please create the plan first."
 
 
+# 验证已完成的记忆召回会在工具执行后注入下一轮模型请求。
+# 首轮调用工具让异步任务获得完成机会，断言第二轮能看到召回提醒。
+@pytest.mark.asyncio
+async def test_completed_memory_recall_is_injected_after_tool_execution() -> None:
+    registry = ToolRegistry()
+    registry.register(_MockTool())
+    client = _FakeClient(
+        [
+            _tool_call_stream("tool-1", "MockTool"),
+            _text_stream("Memory-aware response."),
+        ]
+    )
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+
+    async def recall() -> str:
+        return "<system-reminder>Relevant memory: use the established API.</system-reminder>"
+
+    agent.memory_recall_task = asyncio.create_task(recall())
+    conversation = ConversationManager()
+    conversation.add_user_message("Use the established API")
+
+    await _collect(agent.run(conversation))
+
+    assert len(client.requests) == 2
+    assert any(
+        "Relevant memory: use the established API." in message.content
+        for message in client.requests[1]
+    )
+
+
 # ---------------------------------------------------------------------------
 # 单轮工具闭环
 # ---------------------------------------------------------------------------
