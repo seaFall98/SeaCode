@@ -72,7 +72,8 @@ def _parse_teammate_flags(argv: list[str]) -> tuple[bool, str, str]:
 # 让 LLM 仍可调用 ReadFile / Bash 等完成实际任务。
 # -p 模式默认 DEFAULT 权限模式，PermissionRequest 事件自动批准避免阻塞；
 # 用户可通过 --mode bypassPermissions 完全跳过权限确认，或 --mode acceptEdits 放行写操作。
-# output_format 支持 text（默认，仅打印最终文本）与 stream-json（NDJSON 事件流）。
+# output_format 支持 text（默认最终文本）、json（单个最终结果）与
+# stream-json（NDJSON 事件流）。
 async def _run_prompt(
     prompt: str, output_format: str, mode_str: str | None
 ) -> None:
@@ -212,7 +213,8 @@ async def _run_prompt(
     except (AttributeError, OSError):
         pass
 
-    is_json = output_format == "stream-json"
+    is_stream_json = output_format == "stream-json"
+    final_text = ""
 
     def emit_json(obj: dict) -> None:
         """输出一行 NDJSON 到 stdout。"""
@@ -232,14 +234,14 @@ async def _run_prompt(
         async for event in agent.run(conv):
             if isinstance(event, StreamText):
                 text_buf += event.text
-                if is_json:
+                if is_stream_json:
                     emit_json({"type": "assistant", "text": event.text})
             elif isinstance(event, ThinkingText):
-                if is_json:
+                if is_stream_json:
                     emit_json({"type": "thinking", "text": event.text})
             elif isinstance(event, ToolUseEvent):
                 tool_calls.append({"name": event.tool_name, "is_error": False})
-                if is_json:
+                if is_stream_json:
                     emit_json({
                         "type": "tool_use",
                         "tool_name": event.tool_name,
@@ -250,7 +252,7 @@ async def _run_prompt(
                 # 回填最后一个同名 tool_call 的 is_error 状态。
                 if tool_calls:
                     tool_calls[-1]["is_error"] = event.is_error
-                if is_json:
+                if is_stream_json:
                     emit_json({
                         "type": "tool_result",
                         "tool_name": event.tool_name,
@@ -262,19 +264,20 @@ async def _run_prompt(
             elif isinstance(event, UsageEvent):
                 total_input = event.input_tokens
                 total_output = event.output_tokens
-                if is_json:
+                if is_stream_json:
                     emit_json({
                         "type": "usage",
                         "input_tokens": event.input_tokens,
                         "output_tokens": event.output_tokens,
                     })
             elif isinstance(event, TurnComplete):
-                if is_json:
+                if is_stream_json:
                     emit_json({"type": "turn_complete", "turn": event.turn})
             elif isinstance(event, LoopComplete):
-                # 最终结果：stream-json 输出 result 行，text 模式直接打印文本。
+                # 最终结果：stream-json 输出 result 行；json 在轮询完成后输出单对象。
                 elapsed_ms = int((time.monotonic() - start) * 1000)
-                if is_json:
+                final_text = text_buf
+                if is_stream_json:
                     emit_json({
                         "type": "result",
                         "result": text_buf,
@@ -287,27 +290,27 @@ async def _run_prompt(
                         },
                         "stop_reason": "end_turn",
                     })
-                else:
+                elif output_format == "text":
                     sys.stdout.write(text_buf)
                     if not text_buf.endswith("\n"):
                         sys.stdout.write("\n")
                 break
             elif isinstance(event, ErrorEvent):
-                if is_json:
+                if is_stream_json:
                     emit_json({"type": "error", "message": event.message})
                 else:
                     print(f"Error: {event.message}", file=sys.stderr, flush=True)
             elif isinstance(event, CompactNotification):
-                if is_json:
+                if is_stream_json:
                     emit_json({"type": "compact", "message": event.message})
             elif isinstance(event, RetryEvent):
-                if is_json:
+                if is_stream_json:
                     emit_json({"type": "retry", "reason": event.reason})
             elif isinstance(event, PermissionRequest):
                 # -p 非交互模式：自动批准所有权限请求，避免事件循环阻塞。
                 event.future.set_result(PermissionResponse.ALLOW)
     except Exception as error:
-        if is_json:
+        if output_format in {"json", "stream-json"}:
             emit_json({"type": "error", "message": str(error)})
         else:
             print(f"SeaCode run error: {error}", file=sys.stderr)
@@ -316,33 +319,36 @@ async def _run_prompt(
     # 团队轮询：如果 -p 模式创建了团队，LoopComplete 后 teammate 可能仍在运行。
     # 轮询收取 teammate 完成通知与 lead 邮箱消息，注入为 system-reminder 后
     # 用 run_to_completion 让 Lead 处理通知并继续，直到所有 teammate 完成。
-    if not team_manager._teams:
-        return
-    for _ in range(90):
-        await asyncio.sleep(2)
-        running = any(not t.done() for t in task_manager._async_tasks.values())
-        notes: list[str] = []
-        for t in task_manager.poll_completed():
-            notes.append(
-                f"<task-notification>\n<task_id>{t.id}</task_id>\n"
-                f"<status>{t.status}</status>\n<result>{t.result}</result>\n"
-                f"</task-notification>"
+    if team_manager._teams:
+        for _ in range(90):
+            await asyncio.sleep(2)
+            running = any(not t.done() for t in task_manager._async_tasks.values())
+            notes: list[str] = []
+            for t in task_manager.poll_completed():
+                notes.append(
+                    f"<task-notification>\n<task_id>{t.id}</task_id>\n"
+                    f"<status>{t.status}</status>\n<result>{t.result}</result>\n"
+                    f"</task-notification>"
+                )
+            notes.extend(team_manager.drain_lead_mailbox())
+            if not notes:
+                if not running:
+                    break
+                continue
+            for note in notes:
+                conv.add_system_reminder(note)
+            # 后续 team 轮询用 run_to_completion，避免重复事件流输出。
+            last_result = await agent.run_to_completion(
+                "Teammate notifications received. Process them and continue.", conv
             )
-        notes.extend(team_manager.drain_lead_mailbox())
-        if not notes:
-            if not running:
-                break
-            continue
-        for note in notes:
-            conv.add_system_reminder(note)
-        # 后续 team 轮询用 run_to_completion，避免重复事件流输出。
-        last_result = await agent.run_to_completion(
-            "Teammate notifications received. Process them and continue.", conv
-        )
-        if is_json:
-            emit_json({"type": "assistant", "text": last_result})
-        else:
-            print(last_result, flush=True)
+            final_text = last_result
+            if is_stream_json:
+                emit_json({"type": "assistant", "text": last_result})
+            elif output_format == "text":
+                print(last_result, flush=True)
+
+    if output_format == "json":
+        print(json.dumps({"text": final_text}, ensure_ascii=False), flush=True)
 
 
 # batch14：teammate worker 入口；加载 config → 注册 self/lead 名字 → 构造 Agent → spawn。
@@ -455,22 +461,24 @@ def main() -> None:
     )
     parser.add_argument(
         "-p",
+        "--prompt",
+        dest="prompt",
         metavar="PROMPT",
         default=None,
         help="Run non-interactively: execute the prompt and print the result to stdout",
     )
     parser.add_argument(
         "--output-format",
-        choices=["text", "stream-json"],
+        choices=["text", "json", "stream-json"],
         default="text",
         help="Output format for -p mode: 'text' (default) prints final text, "
-        "'stream-json' emits NDJSON events",
+        "'json' prints one final result object, and 'stream-json' emits NDJSON events",
     )
     args = parser.parse_args()
 
-    # 非交互模式优先：-p 触发 _run_prompt，直接执行并输出到 stdout。
-    if args.p is not None:
-        asyncio.run(_run_prompt(args.p, args.output_format, args.mode))
+    # 非交互模式优先：-p / --prompt 触发 _run_prompt，直接执行并输出到 stdout。
+    if args.prompt is not None:
+        asyncio.run(_run_prompt(args.prompt, args.output_format, args.mode))
         return
 
     try:
