@@ -43,8 +43,13 @@ def _render_node(node: Any, all_nodes: list[Any], depth: int = 0) -> str:
     return line
 
 
-# 构造 /trace handler；闭包捕获 trace_manager 与 lead_agent_id。
+# 构造 /trace handler；闭包仅捕获 trace_manager，lead_agent_id 从 ctx.agent 动态读取。
+# 之所以不闭包捕获 lead_agent_id，是因为 SeaCode 每回合重建 Agent，
+# 闭包捕获会让 lead_agent_id 永远停留在首次注册时的值。
 def create_trace_handler(trace_manager: TraceManager, lead_agent_id: str | None) -> Any:
+    # lead_agent_id 仅作为向后兼容的占位参数；实际运行时从 ctx.agent.agent_id 取值。
+    del lead_agent_id
+
     async def handler(ctx: CommandContext) -> None:
         nodes = list(trace_manager._nodes.values())
         if not nodes:
@@ -57,7 +62,17 @@ def create_trace_handler(trace_manager: TraceManager, lead_agent_id: str | None)
             n for n in nodes
             if n.parent_id is None or n.parent_id not in node_ids
         ]
+        lines = ["Agent 追踪树:"]
+        # Lead agent 标识显示在树顶，让用户知道当前主 Agent 的 agent_id。
+        # 每回合重建 Agent，所以从 ctx.agent 动态读取而非闭包捕获。
+        agent = getattr(ctx, "agent", None)
+        if agent is not None:
+            lead_id = getattr(agent, "agent_id", "")
+            if lead_id:
+                lines.append(f"  Lead: {lead_id[:8]}")
+        # 根节点 depth=0 不缩进，子节点逐层缩进。
         tree_text = "\n".join(_render_node(r, nodes, 0) for r in roots)
+        lines.append(tree_text)
 
         # 合计 token：取第一个根节点的 trace_id（单调用链场景）。
         if roots:
@@ -66,7 +81,8 @@ def create_trace_handler(trace_manager: TraceManager, lead_agent_id: str | None)
             total_in, total_out = 0, 0
 
         ctx.ui.add_system_message(
-            f"{tree_text}\n合计 {len(nodes)} 个 Agent，"
+            "\n".join(lines)
+            + f"\n合计 {len(nodes)} 个 Agent，"
             f"↑{total_in} ↓{total_out} tokens"
         )
 

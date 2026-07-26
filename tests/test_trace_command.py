@@ -34,11 +34,14 @@ class _FakeUI:
         return None
 
 
-# 构造 CommandContext；args 为空，ui 捕获输出。
-def _make_ctx(ui: _FakeUI | None = None) -> CommandContext:
+# 构造 CommandContext；args 为空，ui 捕获输出。agent 默认 None，可注入用于 Lead 显示测试。
+def _make_ctx(
+    ui: _FakeUI | None = None,
+    agent: object | None = None,
+) -> CommandContext:
     return CommandContext(
         args="",
-        agent=None,
+        agent=agent,  # type: ignore[arg-type]
         conversation=None,
         session=None,
         session_manager=None,
@@ -324,3 +327,29 @@ async def test_trace_renders_without_lead_agent_id() -> None:
     output = ui.system_messages[0]
     assert "main" in output
     assert "1 个 Agent" in output
+
+
+# 验证 /trace 在 ctx.agent 存在时显示 Lead agent_id 前缀。
+# 构造带 agent_id 的 agent，断言输出含 "Lead:" 与 agent_id 前 8 位。
+async def test_trace_displays_lead_agent_id() -> None:
+    trm = TraceManager()
+    _seed_node(
+        trm,
+        agent_id="root000000001",
+        agent_type="main",
+        parent_id=None,
+        trace_id="trace1",
+        status="completed",
+    )
+
+    class _FakeAgent:
+        agent_id = "leadabcd1234"
+
+    handler = create_trace_handler(trm, lead_agent_id=None)
+    ui = _FakeUI()
+    ctx = _make_ctx(ui=ui, agent=_FakeAgent())
+
+    await handler(ctx)
+
+    output = ui.system_messages[0]
+    assert "Lead: leadabcd" in output
