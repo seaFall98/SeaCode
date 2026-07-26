@@ -138,7 +138,8 @@ class WorktreeManager:
                 )
                 self.active[name] = wt
                 return wt
-            # 全新创建：调用 git worktree add。
+            # 全新创建：显式创建父目录，避免 .seacode/worktrees 不存在时 git 失败。
+            os.makedirs(self.worktree_dir, exist_ok=True)
             result = await self._run_git(
                 ["worktree", "add", "-B", branch, str(wt_path), base_branch]
             )
@@ -163,11 +164,23 @@ class WorktreeManager:
             if name not in self.active:
                 raise WorktreeError(f"worktree {name} not found")
             wt = self.active[name]
-            original_cwd = str(self.repo_root)
-            result = await self._run_git(["rev-parse", "--abbrev-ref", "HEAD"])
-            original_branch = result.stdout.strip() or "HEAD"
-            result = await self._run_git(["rev-parse", "HEAD"])
-            original_head_commit = result.stdout.strip()
+            # 记录当前工作目录，退出 worktree 后回到此处；不能强制回到仓库根。
+            original_cwd = os.getcwd()
+            # git 调用加容错：失败时回退到 HEAD/空串，不让 worktree 进入因此阻塞。
+            try:
+                result = await self._run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+                original_branch = (
+                    result.stdout.strip() if result.returncode == 0 else "HEAD"
+                )
+            except (subprocess.SubprocessError, OSError):
+                original_branch = "HEAD"
+            try:
+                result = await self._run_git(["rev-parse", "HEAD"])
+                original_head_commit = (
+                    result.stdout.strip() if result.returncode == 0 else ""
+                )
+            except (subprocess.SubprocessError, OSError):
+                original_head_commit = ""
             session = WorktreeSession(
                 original_cwd=original_cwd,
                 worktree_path=wt.path,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -184,6 +185,7 @@ async def test_create_duplicate_raises(tmp_path: Path) -> None:
 
 # 验证 enter 记录 original_cwd/branch/head_commit 并持久化 session。
 # mock _run_git 返回分支与 HEAD，断言 current_session 字段正确。
+# original_cwd 应为调用 enter 时的工作目录（os.getcwd()），而非仓库根。
 async def test_enter_records_session(tmp_path: Path) -> None:
     manager = WorktreeManager(tmp_path)
     manager.active["feat-x"] = _make_worktree()
@@ -195,12 +197,19 @@ async def test_enter_records_session(tmp_path: Path) -> None:
             return _completed(stdout="head_sha_123\n")
         return _completed()
 
-    with (
-        patch.object(manager, "_run_git", new_callable=AsyncMock, side_effect=fake_run),
-        patch("seacode.worktree.manager.save_worktree_session") as m_save,
-        patch("seacode.worktree.manager.os.chdir") as m_chdir,
-    ):
-        session = await manager.enter("feat-x")
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        with (
+            patch.object(
+                manager, "_run_git", new_callable=AsyncMock, side_effect=fake_run
+            ),
+            patch("seacode.worktree.manager.save_worktree_session") as m_save,
+            patch("seacode.worktree.manager.os.chdir") as m_chdir,
+        ):
+            session = await manager.enter("feat-x")
+    finally:
+        os.chdir(original_cwd)
 
     assert session.original_cwd == str(tmp_path)
     assert session.original_branch == "main"
