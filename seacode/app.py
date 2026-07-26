@@ -65,7 +65,6 @@ from .commands import (
     parse_command,
 )
 from .commands.handlers import register_all_commands
-from .commands.handlers.rewind import create_rewind_command
 from .commands.handlers.skill import SKILL_COMMAND
 from .commands.handlers.skill_register import (
     make_skill_register_callback,
@@ -1064,11 +1063,10 @@ class SeaCodeApp(App[None]):
             self._tool_registry.register(
                 ExitWorktreeTool(self.worktree_manager)
             )
-            # 注册 /worktree /rewind 命令。
+            # 注册 /worktree 命令；/rewind 已在 register_all_commands 中无条件注册。
             self._command_registry.register_sync(
                 create_worktree_command(self.worktree_manager)
             )
-            self._command_registry.register_sync(create_rewind_command())
             # 调度 restore_session；_run_turn 创建 Agent 前 await 结果，
             # 据恢复的 session 切换 agent.work_dir 到 worktree 路径。
             if self._restore_session_task is None:

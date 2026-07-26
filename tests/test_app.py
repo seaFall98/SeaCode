@@ -1353,7 +1353,7 @@ async def test_pilot_help_command_lists_commands(
 
 
 # 验证通过 Pilot 输入 /clear 回车后聊天区被清空并创建新会话。
-# 测试设计为先 /status 制造消息，再 /clear，断言只剩 "已清空" 且会话已切换。
+# 测试设计为先 /status 制造消息，再 /clear，断言只剩新会话提示且会话已切换。
 @pytest.mark.asyncio
 async def test_pilot_clear_command_clears_chat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1372,13 +1372,13 @@ async def test_pilot_clear_command_clears_chat(
         # 提交 /clear 清空聊天并创建新会话。
         input_widget.load_text("/clear")
         await pilot.press("enter")
-        ok = await _wait_for_system_message(app, pilot, "已清空")
+        ok = await _wait_for_system_message(app, pilot, "对话已清除")
         assert ok
         await pilot.pause()
 
-        # 旧消息已移除，仅剩 "已清空"。
+        # 旧消息已移除，仅剩新会话提示。
         text = "\n".join(str(m.render()) for m in app.query(".system-message"))
-        assert "已清空" in text
+        assert "对话已清除" in text
         assert "SeaCode 当前状态" not in text
         # 新会话已创建。
         assert app._session is not None

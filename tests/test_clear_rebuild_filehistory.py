@@ -19,15 +19,22 @@ from seacode.filehistory.history import FileHistory
 class _FakeUI:
     def __init__(self) -> None:
         self.system_messages: list[str] = []
+        self.refresh_calls = 0
 
     def add_system_message(self, text: str) -> None:
         self.system_messages.append(text)
+
+    def refresh_status(self) -> None:
+        self.refresh_calls += 1
 
 
 # 假 Session：携带可读 session_id。
 class _FakeSession:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
+
+    def close(self) -> None:
+        pass
 
 
 # 假 SessionManager：create() 返回新 session，session_id 递增。
@@ -58,11 +65,12 @@ class _FakeRegistry:
         return list(self._tools)
 
 
-# 假回调：记录 clear_chat / set_session 调用。
+# 假回调：记录 clear_chat / set_session / set_conversation 调用。
 class _FakeCallbacks:
     def __init__(self) -> None:
         self.clear_chat_calls = 0
         self.set_session_calls: list[Any] = []
+        self.set_conversation_calls: list[Any] = []
 
     def clear_chat(self) -> None:
         self.clear_chat_calls += 1
@@ -70,8 +78,11 @@ class _FakeCallbacks:
     def set_session(self, session: Any) -> None:
         self.set_session_calls.append(session)
 
+    def set_conversation(self, conv: Any) -> None:
+        self.set_conversation_calls.append(conv)
 
-# 假 Agent：携带 work_dir / registry / file_history / history_cursor 属性。
+
+# 假 Agent：携带 work_dir / registry / file_history / _loop_count / tokens / active_skills。
 class _FakeAgent:
     def __init__(
         self,
@@ -82,7 +93,13 @@ class _FakeAgent:
         self.work_dir = work_dir
         self.registry = registry
         self.file_history = file_history
-        self.history_cursor = 5
+        self._loop_count = 5
+        self.total_input_tokens = 100
+        self.total_output_tokens = 50
+        self.active_skills: dict[str, str] = {"old": "sop"}
+
+    def clear_active_skills(self) -> None:
+        self.active_skills.clear()
 
 
 # 构造 CommandContext。
@@ -110,6 +127,7 @@ def _config(cb: _FakeCallbacks) -> dict[str, Any]:
     return {
         "clear_chat": cb.clear_chat,
         "set_session": cb.set_session,
+        "set_conversation": cb.set_conversation,
     }
 
 
@@ -222,7 +240,7 @@ async def test_clear_without_agent_does_not_raise() -> None:
 
     assert cb.clear_chat_calls == 1
     assert sm.create_calls == 1
-    assert ui.system_messages[0] == "已清空"
+    assert "对话已清除" in ui.system_messages[0]
 
 
 # 验证 /clear 在 session_manager 为 None 时跳过 FileHistory 重建。
@@ -245,8 +263,8 @@ async def test_clear_without_session_manager_skips_rebuild(
     assert agent.file_history is old_fh
 
 
-# 验证 /clear 仍然走原有清屏 + 创新会话 + 重置游标路径。
-# 完整流程调用，断言 clear_chat、set_session、history_cursor 三项主行为保留。
+# 验证 /clear 完整流程：清屏 + 创新会话 + 重建 ConversationManager +
+# 重置 _loop_count / active_skills / token 计数 + refresh_status。
 @pytest.mark.asyncio
 async def test_clear_preserves_original_behavior(tmp_path: Any) -> None:
     work_dir = str(tmp_path)
@@ -264,5 +282,12 @@ async def test_clear_preserves_original_behavior(tmp_path: Any) -> None:
     assert cb.clear_chat_calls == 1
     assert sm.create_calls == 1
     assert len(cb.set_session_calls) == 1
-    assert agent.history_cursor == 0
-    assert ui.system_messages[0] == "已清空"
+    assert len(cb.set_conversation_calls) == 1
+    # Agent 运行时状态已重置。
+    assert agent._loop_count == 0
+    assert agent.total_input_tokens == 0
+    assert agent.total_output_tokens == 0
+    assert agent.active_skills == {}
+    # UI 刷新已调用。
+    assert ui.refresh_calls == 1
+    assert "对话已清除" in ui.system_messages[0]

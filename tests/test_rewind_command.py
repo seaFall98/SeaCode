@@ -1,11 +1,11 @@
-"""/rewind 命令单元测试：覆盖无快照、列出快照、回滚成功、越界与无效索引。"""
+"""/rewind 命令单元测试：覆盖无快照、列出快照、三种回滚模式、越界与无效输入。"""
 
 from __future__ import annotations
 
 import datetime
 from typing import Any
 
-from seacode.commands.handlers.rewind import create_rewind_command
+from seacode.commands.handlers.rewind import REWIND_COMMAND
 from seacode.commands.registry import CommandContext
 from seacode.filehistory.history import Backup, Snapshot
 
@@ -37,11 +37,9 @@ class _FakeFileHistory:
         self,
         snapshots: list[Snapshot] | None = None,
         rewind_result: list[str] | None = None,
-        rewind_raises: Exception | None = None,
     ) -> None:
         self._snapshots = snapshots or []
         self._rewind_result = rewind_result if rewind_result is not None else []
-        self._rewind_raises = rewind_raises
         self.rewind_calls: list[int] = []
 
     def get_snapshots(self) -> list[Snapshot]:
@@ -52,9 +50,21 @@ class _FakeFileHistory:
 
     def rewind(self, idx: int) -> list[str]:
         self.rewind_calls.append(idx)
-        if self._rewind_raises is not None:
-            raise self._rewind_raises
         return self._rewind_result
+
+
+# 假 Conversation：记录 replace_history 调用。
+class _FakeConversation:
+    def __init__(self, history: list[Any] | None = None) -> None:
+        self._history = history or []
+        self.replace_calls: list[list[Any]] = []
+
+    @property
+    def history(self) -> list[Any]:
+        return list(self._history)
+
+    def replace_history(self, new_history: list[Any]) -> None:
+        self.replace_calls.append(list(new_history))
 
 
 # 假 Agent：保留 file_history 字段。
@@ -65,15 +75,17 @@ class _FakeAgent:
 
 # 构造 /rewind 命令与 ctx；file_history 默认 None。
 def _make_command_and_ctx(
-    args: str, file_history: Any = None
+    args: str,
+    file_history: Any = None,
+    conversation: Any = None,
 ) -> tuple[Any, CommandContext, _FakeUI]:
-    cmd = create_rewind_command()
+    cmd = REWIND_COMMAND
     ui = _FakeUI()
     agent = _FakeAgent(file_history=file_history)
     ctx = CommandContext(
         args=args,
         agent=agent,
-        conversation=None,
+        conversation=conversation or _FakeConversation(),
         session=None,
         session_manager=None,
         memory_manager=None,
@@ -84,17 +96,16 @@ def _make_command_and_ctx(
 
 
 # 验证 file_history 未初始化时提示。
-# agent.file_history=None，断言 ui.messages 含 "文件历史未初始化"。
+# agent.file_history=None，断言 ui.messages 含 "No checkpoints to rewind to."。
 async def test_no_file_history_shows_message() -> None:
-    cmd, ctx, ui = _make_command_and_ctx("0", file_history=None)
+    cmd, ctx, ui = _make_command_and_ctx("1", file_history=None)
 
     await cmd.handler(ctx)
 
-    assert any("文件历史未初始化" in m for m in ui.messages)
+    assert any("No checkpoints to rewind to." in m for m in ui.messages)
 
 
 # 验证无快照时 /rewind 提示 "No checkpoints to rewind to."。
-# fake FileHistory 返回空 snapshots，断言 ui.messages 含提示。
 async def test_no_snapshots_shows_message() -> None:
     fh = _FakeFileHistory(snapshots=[])
     cmd, ctx, ui = _make_command_and_ctx("", file_history=fh)
@@ -104,9 +115,9 @@ async def test_no_snapshots_shows_message() -> None:
     assert any("No checkpoints to rewind to." in m for m in ui.messages)
 
 
-# 验证无参数列出快照。
-# fake FileHistory 返回 2 个快照，断言 ui.messages 含每个快照的 message_index 与版本数。
-async def test_list_snapshots_shows_message_index_and_file_count() -> None:
+# 验证无参数列出快照与 Options 说明。
+# fake FileHistory 返回 2 个快照，断言 ui.messages 含 1-based 索引与 Options 说明。
+async def test_list_snapshots_shows_options_and_1based_index() -> None:
     ts = datetime.datetime.now()
     snap1 = Snapshot(
         message_index=0,
@@ -129,66 +140,139 @@ async def test_list_snapshots_shows_message_index_and_file_count() -> None:
     await cmd.handler(ctx)
 
     text = "\n".join(ui.messages)
-    assert "[0]" in text
-    assert "msg#0" in text
-    assert "files=1" in text
+    # 1-based 索引
     assert "[1]" in text
-    assert "msg#1" in text
-    assert "files=2" in text
+    assert "[2]" in text
+    # Options 说明
+    assert "Options after selecting:" in text
+    assert "1) Restore code and conversation" in text
+    assert "2) Restore conversation only" in text
+    assert "3) Restore code only" in text
 
 
-# 验证 /rewind <idx> 调用 rewind(idx) 显示 changed 列表。
-# fake FileHistory rewind 返回 ["/a", "/b"]，断言 ui.messages 含两个文件路径。
-async def test_rewind_with_idx_returns_changed_files() -> None:
-    fh = _FakeFileHistory(rewind_result=["/a", "/b"])
-    cmd, ctx, ui = _make_command_and_ctx("0", file_history=fh)
+# 验证 /rewind 1（默认 option=1）同时回滚代码与对话。
+async def test_rewind_default_option_restores_code_and_conversation() -> None:
+    ts = datetime.datetime.now()
+    snap = Snapshot(
+        message_index=2,
+        user_text="test",
+        backups={"/a": Backup(path="/bp/a", version=1, timestamp=ts)},
+        timestamp=ts,
+    )
+    fh = _FakeFileHistory(snapshots=[snap], rewind_result=["/a"])
+    conv = _FakeConversation(history=["m0", "m1", "m2", "m3"])
+    cmd, ctx, ui = _make_command_and_ctx("1", file_history=fh, conversation=conv)
+
+    await cmd.handler(ctx)
+
+    # rewind 用 0-based 内部索引 0 调用
+    assert fh.rewind_calls == [0]
+    # 对话历史被截断到 snap.message_index=2
+    assert conv.replace_calls == [["m0", "m1"]]
+    text = "\n".join(ui.messages)
+    assert "Restored 1 file(s) and conversation" in text
+
+
+# 验证 /rewind 1 2（option=2）只回滚对话，不动文件。
+async def test_rewind_option_2_restores_conversation_only() -> None:
+    ts = datetime.datetime.now()
+    snap = Snapshot(
+        message_index=1,
+        user_text="test",
+        backups={"/a": Backup(path="/bp/a", version=1, timestamp=ts)},
+        timestamp=ts,
+    )
+    fh = _FakeFileHistory(snapshots=[snap], rewind_result=["/a"])
+    conv = _FakeConversation(history=["m0", "m1", "m2"])
+    cmd, ctx, ui = _make_command_and_ctx("1 2", file_history=fh, conversation=conv)
+
+    await cmd.handler(ctx)
+
+    # 不调用 rewind
+    assert fh.rewind_calls == []
+    # 对话历史被截断到 snap.message_index=1
+    assert conv.replace_calls == [["m0"]]
+    text = "\n".join(ui.messages)
+    assert "Rewound conversation" in text
+    assert "Files unchanged" in text
+
+
+# 验证 /rewind 1 3（option=3）只回滚文件，不动对话。
+async def test_rewind_option_3_restores_code_only() -> None:
+    ts = datetime.datetime.now()
+    snap = Snapshot(
+        message_index=1,
+        user_text="test",
+        backups={"/a": Backup(path="/bp/a", version=1, timestamp=ts)},
+        timestamp=ts,
+    )
+    fh = _FakeFileHistory(snapshots=[snap], rewind_result=["/a", "/b"])
+    conv = _FakeConversation(history=["m0", "m1", "m2"])
+    cmd, ctx, ui = _make_command_and_ctx("1 3", file_history=fh, conversation=conv)
 
     await cmd.handler(ctx)
 
     assert fh.rewind_calls == [0]
+    # 对话历史未被修改
+    assert conv.replace_calls == []
     text = "\n".join(ui.messages)
-    assert "已回滚到快照 0" in text
-    assert "还原 2 个文件" in text
-    assert "/a" in text
-    assert "/b" in text
+    assert "Restored 2 file(s)" in text
+    assert "Conversation unchanged" in text
 
 
-# 验证 /rewind 越界 idx 提示 "无需还原或越界"。
-# fake FileHistory rewind 返回空列表，断言 ui.messages 含 "无需还原或越界"。
-async def test_rewind_out_of_range_shows_message() -> None:
-    fh = _FakeFileHistory(rewind_result=[])
-    cmd, ctx, ui = _make_command_and_ctx("99", file_history=fh)
-
-    await cmd.handler(ctx)
-
-    assert any("无需还原或越界" in m for m in ui.messages)
-
-
-# 验证 /rewind 非数字 idx 提示 "无效的快照索引"。
-# 传入 "abc"，断言 ui.messages 含 "无效的快照索引: abc"。
-async def test_rewind_non_numeric_idx_shows_message() -> None:
-    fh = _FakeFileHistory(rewind_result=[])
-    cmd, ctx, ui = _make_command_and_ctx("abc", file_history=fh)
+# 验证无效 option 提示 "Invalid option"。
+async def test_rewind_invalid_option_shows_message() -> None:
+    ts = datetime.datetime.now()
+    snap = Snapshot(
+        message_index=0,
+        user_text="test",
+        backups={},
+        timestamp=ts,
+    )
+    fh = _FakeFileHistory(snapshots=[snap], rewind_result=[])
+    cmd, ctx, ui = _make_command_and_ctx("1 9", file_history=fh)
 
     await cmd.handler(ctx)
 
-    assert any("无效的快照索引" in m and "abc" in m for m in ui.messages)
-    assert fh.rewind_calls == []
+    assert any("Invalid option" in m for m in ui.messages)
 
 
-# 验证 /rewind rewind 抛异常时显示 "回滚失败"。
-# fake FileHistory rewind_raises=RuntimeError("disk error")，断言 ui.messages 含 "回滚失败"。
-async def test_rewind_raises_shows_error() -> None:
-    fh = _FakeFileHistory(rewind_raises=RuntimeError("disk error"))
+# 验证 /rewind 0（1-based 越界）提示 "not found"。
+async def test_rewind_zero_index_shows_not_found() -> None:
+    ts = datetime.datetime.now()
+    snap = Snapshot(
+        message_index=0,
+        user_text="test",
+        backups={},
+        timestamp=ts,
+    )
+    fh = _FakeFileHistory(snapshots=[snap], rewind_result=[])
     cmd, ctx, ui = _make_command_and_ctx("0", file_history=fh)
 
     await cmd.handler(ctx)
 
-    assert any("回滚失败" in m and "disk error" in m for m in ui.messages)
+    assert any("not found" in m for m in ui.messages)
+
+
+# 验证 /rewind abc（非数字）提示 "Invalid checkpoint number."。
+async def test_rewind_non_numeric_idx_shows_message() -> None:
+    ts = datetime.datetime.now()
+    snap = Snapshot(
+        message_index=0,
+        user_text="test",
+        backups={},
+        timestamp=ts,
+    )
+    fh = _FakeFileHistory(snapshots=[snap], rewind_result=[])
+    cmd, ctx, ui = _make_command_and_ctx("abc", file_history=fh)
+
+    await cmd.handler(ctx)
+
+    assert any("Invalid checkpoint number" in m for m in ui.messages)
+    assert fh.rewind_calls == []
 
 
 # 验证列表中的 user_text 超过截断长度时被截断。
-# 构造 user_text 长度 > 60，断言 ui.messages 含 "..."。
 async def test_list_truncates_long_user_text() -> None:
     ts = datetime.datetime.now()
     long_text = "x" * 100
@@ -204,4 +288,4 @@ async def test_list_truncates_long_user_text() -> None:
     await cmd.handler(ctx)
 
     text = "\n".join(ui.messages)
-    assert "..." in text
+    assert "…" in text

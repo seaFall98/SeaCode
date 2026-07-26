@@ -12,6 +12,7 @@ from seacode.commands.handlers.memory import MEMORY_COMMAND
 from seacode.commands.handlers.permission import PERMISSION_COMMAND
 from seacode.commands.handlers.plan import PLAN_COMMAND
 from seacode.commands.handlers.review import REVIEW_COMMAND
+from seacode.commands.handlers.rewind import REWIND_COMMAND
 from seacode.commands.handlers.sandbox import SANDBOX_COMMAND
 from seacode.commands.handlers.session import SESSION_COMMAND
 from seacode.commands.handlers.status import STATUS_COMMAND
@@ -31,6 +32,7 @@ ALL_COMMANDS: list[Command] = [
     REVIEW_COMMAND,
     MCP_COMMAND,
     SANDBOX_COMMAND,
+    REWIND_COMMAND,
 ]
 
 

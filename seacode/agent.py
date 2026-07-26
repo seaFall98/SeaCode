@@ -373,6 +373,8 @@ class Agent:
         self.max_iterations = max_iterations
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        # 循环计数器：用于记忆提取节流与 /clear、/session 重置。
+        self._loop_count = 0
         # 权限检查器；为 None 时跳过权限检查（向后兼容 batch02-04 行为）。
         self.permission_checker = permission_checker
         # 当前权限模式；同步 permission_checker.mode 避免 dual source of truth。
@@ -537,6 +539,10 @@ class Agent:
     # batch10：激活 Skill，把 SOP 存入 active_skills 供压缩恢复与 /skill 查看。
     def activate_skill(self, name: str, prompt: str) -> None:
         self.active_skills[name] = prompt
+
+    # 清空已激活 Skill；/clear 与 /session new/resume 时调用，避免旧技能残留。
+    def clear_active_skills(self) -> None:
+        self.active_skills.clear()
 
     # batch10：设置 Skill 目录摘要文本，每轮注入环境上下文。
     def set_skill_catalog(self, text: str) -> None:
@@ -932,6 +938,8 @@ class Agent:
                 conversation.add_assistant_message(
                     response.text, thinking_blocks=conv_thinking
                 )
+                # 循环计数 +1，用于记忆提取节流与 /clear、/session 重置。
+                self._loop_count += 1
                 # Loop 结束时异步触发记忆提取与整理门控检查。
                 # 提取用裸 LLM 调用不带工具，合并策略见 _extract_memories。
                 # 整理门控由 consolidator 自管，5 级门控全通过才 fork 子 Agent。

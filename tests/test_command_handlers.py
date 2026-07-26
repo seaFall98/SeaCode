@@ -156,6 +156,12 @@ class _FakeAgent:
         self.registry = kwargs.get("registry")
         self.work_dir = kwargs.get("work_dir", "/tmp/fake-work")
         self.history_cursor = kwargs.get("history_cursor", 0)
+        # /clear 需要重置的运行时状态。
+        self._loop_count = kwargs.get("_loop_count", 0)
+        self.total_input_tokens = kwargs.get("total_input_tokens", 0)
+        self.total_output_tokens = kwargs.get("total_output_tokens", 0)
+        self.active_skills: dict[str, str] = kwargs.get("active_skills", {})
+        self.file_history = kwargs.get("file_history")
         # manual_compact 行为记录；可注入返回值或抛出异常。
         self.manual_compact_calls = 0
         self.manual_compact_result = kwargs.get("manual_compact_result")
@@ -166,6 +172,10 @@ class _FakeAgent:
         self.permission_mode = mode
         if self.permission_checker is not None:
             self.permission_checker.mode = mode
+
+    # 清空已激活 Skill；/clear 时调用。
+    def clear_active_skills(self) -> None:
+        self.active_skills.clear()
 
     async def manual_compact(self, conversation: Any) -> Any:
         self.manual_compact_calls += 1
@@ -433,12 +443,22 @@ async def test_status_displays_aggregated_info() -> None:
 
 # 验证 /clear 清屏、创新会话并重置 Agent 历史游标。
 # 构造回调与 session_manager，调 handle_clear，断言各回调被调用且游标归零。
-async def test_clear_resets_chat_and_creates_session() -> None:
+async def test_clear_resets_chat_and_creates_session(
+    tmp_path: Path,
+) -> None:
     cb = _FakeCallbacks()
     new_session = _FakeSession("new-1")
     sm = _FakeSessionManager()
     sm.created = new_session
-    agent = _FakeAgent(history_cursor=5)
+    agent = _FakeAgent(
+        history_cursor=5,
+        _loop_count=3,
+        total_input_tokens=100,
+        total_output_tokens=50,
+        active_skills={"old": "sop"},
+        registry=_FakeToolRegistry(),
+        work_dir=str(tmp_path),
+    )
     ui = _FakeUI()
     ctx = _make_ctx(
         args="",
@@ -450,8 +470,12 @@ async def test_clear_resets_chat_and_creates_session() -> None:
     await handle_clear(ctx)
     assert cb.clear_chat_calls == 1
     assert cb.set_session_calls == [new_session]
-    assert ui.system_messages[0] == "已清空"
-    assert agent.history_cursor == 0
+    assert "对话已清除" in ui.system_messages[0]
+    # Agent 运行时状态已重置。
+    assert agent._loop_count == 0
+    assert agent.total_input_tokens == 0
+    assert agent.total_output_tokens == 0
+    assert agent.active_skills == {}
 
 
 # ---------- /compact ----------
@@ -1063,7 +1087,7 @@ async def test_sandbox_agent_not_initialized() -> None:
 
 # 验证 register_all_commands 批量注册 11 条内置命令。
 # 构造空注册中心，调 register_all_commands，断言 list_commands 返回 11 条。
-def test_register_all_commands_registers_eleven() -> None:
+def test_register_all_commands_registers_twelve() -> None:
     registry = CommandRegistry()
     register_all_commands(registry)
-    assert len(registry.list_commands()) == 11
+    assert len(registry.list_commands()) == 12
