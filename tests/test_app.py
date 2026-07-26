@@ -76,6 +76,23 @@ class _FakeClient(LLMClient):
             yield event
 
 
+# 捕获 Plan 模式下实际交给模型的上下文，不连接真实 Provider。
+class _PlanModeCaptureClient(LLMClient):
+    def __init__(self) -> None:
+        self.requests: list[tuple[Message, ...]] = []
+
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        system: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        del system, tools
+        self.requests.append(tuple(messages))
+        yield TextDelta("Plan context received")
+        yield StreamComplete(input_tokens=1, output_tokens=1)
+
+
 # 表示已产生部分流事件后才失败的 Provider 回合。
 class _PartialFailure:
     # 保存失败前事件和随后抛出的错误。
@@ -621,6 +638,41 @@ async def test_permission_dialog_is_fully_visible_in_short_viewport() -> None:
 
         await pilot.press("escape")
         await _wait_done(app, pilot)
+
+
+# 验证 /plan 后下一次模型请求收到 Plan 提醒与计划文件路径。
+# 通过真实 TUI 命令切换后发送普通消息，捕获 Provider 输入并断言运行时语义。
+@pytest.mark.asyncio
+async def test_plan_mode_is_injected_into_next_model_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _PlanModeCaptureClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        assert await app._dispatch_command("/plan") is True
+        assert app._permission_mode == PermissionMode.PLAN
+
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("当前是什么模式？")
+        await pilot.press("enter")
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if client.requests:
+                break
+        assert client.requests
+        await _wait_done(app, pilot)
+
+    request = next(
+        request
+        for request in client.requests
+        if any("当前是什么模式？" in message.content for message in request)
+    )
+    assert any("Plan mode is active" in message.content for message in request)
+    assert app._permission_checker is not None
+    plan_path = Path(app._permission_checker.plan_file_path)
+    assert plan_path.parent == tmp_path / ".seacode" / "plans"
 
 
 # 验证权限对话框 Enter 确认（默认光标在 Yes）放行工具执行。

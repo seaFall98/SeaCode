@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import random
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -53,7 +55,11 @@ from .memory.recall import (
 )
 from .permissions import PermissionChecker, PermissionMode
 from .permissions.rules import Rule, extract_content
-from .prompts import build_environment_context, build_system_prompt
+from .prompts import (
+    build_environment_context,
+    build_plan_mode_reminder,
+    build_system_prompt,
+)
 from .tools import ToolRegistry
 from .tools.base import MAX_OUTPUT_CHARS, ToolResult
 from .tools.tool_search import ToolSearchTool
@@ -452,6 +458,8 @@ class Agent:
         # batch13：文件历史快照；app.py 在装配阶段注入，None 时跳过 make_snapshot。
         # 在每轮用户回合起点记录已跟踪文件的当前内容，供 /rewind 回滚。
         self.file_history: Any = None
+        # Plan 模式下同一 Agent Loop 复用的计划文件路径。
+        self._plan_path_cache: Path | None = None
 
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
@@ -463,6 +471,28 @@ class Agent:
     @property
     def plan_mode(self) -> bool:
         return self.permission_mode == PermissionMode.PLAN
+
+    # 为当前 Plan 会话惰性创建唯一计划文件路径。
+    def _get_plan_path(self) -> Path:
+        if self._plan_path_cache is not None:
+            return self._plan_path_cache
+
+        adjectives = (
+            "bold", "bright", "calm", "clear", "deep", "fair", "fast", "fine",
+            "glad", "keen", "kind", "lean", "mild", "neat", "pure", "safe",
+            "slim", "soft", "tall", "warm", "wise", "grand", "swift", "vivid",
+        )
+        nouns = (
+            "sketch", "draft", "spark", "bloom", "trail", "ridge", "creek", "grove",
+            "cliff", "cloud", "field", "forge", "frost", "haven", "pearl", "stone",
+            "storm", "river", "tower", "delta", "flame", "orbit", "pulse", "shore",
+        )
+        plans_dir = Path(self.work_dir) / ".seacode" / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%m%d-%H%M")
+        name = f"{random.choice(adjectives)}-{random.choice(nouns)}-{timestamp}.md"
+        self._plan_path_cache = plans_dir / name
+        return self._plan_path_cache
 
     # 手动触发 Layer 2 压缩：跳过阈值检查与熔断器直接走压缩流程。
     # 成功返回 CompactNotification（携带结构化 boundary 供 /compact 持久化），
@@ -708,6 +738,16 @@ class Agent:
                 coordinator_mode=self.coordinator_mode,
                 agent_catalog=self._agent_catalog_list,
             )
+
+            if self.plan_mode:
+                plan_path = self._get_plan_path()
+                if self.permission_checker is not None:
+                    self.permission_checker.plan_file_path = str(plan_path)
+                conversation.add_system_reminder(
+                    build_plan_mode_reminder(
+                        str(plan_path), plan_path.exists(), iteration
+                    )
+                )
 
             # 延迟工具名 reminder：每轮注入未发现的延迟工具名，引导模型用 ToolSearch 发现。
             # mark_discovered 后下一轮 get_all_schemas 包含完整 Schema，此 reminder 自动缩短。
