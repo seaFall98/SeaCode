@@ -92,6 +92,9 @@ async def handle_session(ctx: CommandContext) -> None:
         for msg in result.messages:
             conv.history.append(msg)
         ctx.config["set_conversation"](conv)
+        # 恢复会话时重置 Agent 循环计数，让压缩/终止判定按新会话重新计数。
+        if ctx.agent:
+            ctx.agent._loop_count = 0
         await ctx.config["render_restored"](result.messages)
         ctx.ui.add_system_message(
             f"会话已恢复：{session_id} ({result.session.meta.message_count} msgs)"
@@ -105,6 +108,9 @@ async def handle_session(ctx: CommandContext) -> None:
         new_session = sm.create()
         ctx.config["set_session"](new_session)
         ctx.config["set_conversation"](ConversationManager())
+        # 新会话重置 Agent 循环计数，避免跨会话累计导致提前触发压缩或终止。
+        if ctx.agent:
+            ctx.agent._loop_count = 0
         ctx.config["clear_chat"]()
         ctx.ui.add_system_message(f"新会话已创建：{new_session.session_id}")
         return

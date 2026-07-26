@@ -709,6 +709,41 @@ async def test_session_new_clears_and_creates() -> None:
     assert "新会话已创建" in ui.system_messages[0]
 
 
+# 验证 /session new 重置 Agent._loop_count，避免跨会话累计导致提前触发压缩。
+# 预设 agent._loop_count=10，调用 /session new，断言 _loop_count 被重置为 0。
+async def test_session_new_resets_agent_loop_count() -> None:
+    agent = _FakeAgent(_loop_count=10)
+    sm = _FakeSessionManager()
+    cb = _FakeCallbacks()
+    ui = _FakeUI()
+    ctx = _make_ctx(
+        args="new", agent=agent, session_manager=sm, ui=ui, config=_config(cb)
+    )
+    await handle_session(ctx)
+    assert agent._loop_count == 0
+
+
+# 验证 /session resume 重置 Agent._loop_count，让压缩/终止按新会话重新计数。
+# 预设 agent._loop_count=10，调用 /session resume，断言 _loop_count 被重置为 0。
+async def test_session_resume_resets_agent_loop_count() -> None:
+    agent = _FakeAgent(_loop_count=10)
+    restored_session = _FakeSession("sess-x")
+    sm = _FakeSessionManager(
+        resume_result=_FakeResumeResult(session=restored_session, messages=[]),
+    )
+    cb = _FakeCallbacks()
+    ui = _FakeUI()
+    ctx = _make_ctx(
+        args="resume sess-x",
+        agent=agent,
+        session_manager=sm,
+        ui=ui,
+        config=_config(cb),
+    )
+    await handle_session(ctx)
+    assert agent._loop_count == 0
+
+
 # 验证 /session delete 按 ID 删除会话。
 # 传 args="delete sess-aaa11111"，断言 delete 收到该 ID 且提示"已删除"。
 async def test_session_delete_by_id() -> None:
