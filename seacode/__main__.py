@@ -490,6 +490,12 @@ def main() -> None:
         help="Output format for -p mode: 'text' (default) prints final text, "
         "'json' prints one final result object, and 'stream-json' emits NDJSON events",
     )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        default=False,
+        help="Start the browser remote service on 0.0.0.0:18888",
+    )
     args = parser.parse_args()
 
     # 非交互模式优先：-p / --prompt 触发 _run_prompt，直接执行并输出到 stdout。
@@ -520,6 +526,17 @@ def main() -> None:
         asyncio.run(_resolve_context_windows_async(config.providers))
     except Exception:
         pass
+
+    if args.remote:
+        from .remote import RemoteServer
+
+        server = RemoteServer(
+            providers=config.providers,
+            mcp_servers=config.mcp_servers,
+            hook_engine=hook_engine,
+        )
+        asyncio.run(server.run())
+        return
 
     from .app import SeaCodeApp
     from .driver import NoAltScreenDriver

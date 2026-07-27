@@ -353,3 +353,52 @@ def test_main_rejects_invalid_permission_mode(
 
     with pytest.raises(SystemExit, match="2"):
         main()
+
+
+# 验证 --remote 在非交互入口启动浏览器服务而不是终端 TUI。
+# 替换远程服务和上下文查询，只断言 CLI 完成了正确的运行时装配。
+def test_main_starts_remote_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider()
+    config = AppConfig(providers=(provider,))
+    created: list[Any] = []
+
+    class _Remote:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            created.append(self)
+
+        async def run(self) -> None:
+            return None
+
+    async def no_context_window_lookup(_: Any) -> None:
+        return None
+
+    monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
+    monkeypatch.setattr("seacode.__main__._resolve_context_windows_async", no_context_window_lookup)
+    monkeypatch.setattr("seacode.remote.RemoteServer", _Remote)
+    monkeypatch.setattr(sys, "argv", ["sea", "--remote"])
+
+    main()
+
+    assert created[0].kwargs["providers"] == config.providers
+    assert created[0].kwargs["mcp_servers"] == config.mcp_servers
+
+
+# 验证 -p 与 --remote 同时出现时仍优先执行非交互任务。
+# 替换两条入口，断言远程服务没有被构造。
+def test_main_prompt_takes_priority_over_remote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[tuple[str, str, str | None]] = []
+
+    async def capture_prompt(prompt: str, output_format: str, mode: str | None) -> None:
+        received.append((prompt, output_format, mode))
+
+    monkeypatch.setattr("seacode.__main__._run_prompt", capture_prompt)
+    monkeypatch.setattr(sys, "argv", ["sea", "--remote", "-p", "inspect"])
+
+    main()
+
+    assert received == [("inspect", "text", None)]
