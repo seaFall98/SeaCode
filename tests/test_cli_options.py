@@ -247,8 +247,8 @@ async def test_prompt_runtime_rejects_invalid_hook_configuration(
     assert "hook configuration error" in capsys.readouterr().err.lower()
 
 
-# 验证普通 TUI 将配置权限模式与显式 --mode 一并传入应用。
-# 替换应用实例和上下文窗口解析，只检查入口解析后的模式，不启动真实终端界面。
+# 验证普通 TUI 将配置权限模式、可选子 Agent 开关与显式 --mode 一并传入应用。
+# 替换应用实例和上下文窗口解析，只检查入口装配结果，不启动真实终端界面。
 @pytest.mark.parametrize(
     ("argv", "config_mode", "expected_mode"),
     [
@@ -279,7 +279,12 @@ def test_main_passes_effective_permission_mode_to_tui(
     async def no_context_window_lookup(_: Any) -> None:
         return None
 
-    config = AppConfig(providers=(_provider(),), permission_mode=config_mode)
+    config = AppConfig(
+        providers=(_provider(),),
+        permission_mode=config_mode,
+        enable_fork=True,
+        enable_verification_agent=True,
+    )
     monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
     monkeypatch.setattr("seacode.__main__._resolve_context_windows_async", no_context_window_lookup)
     monkeypatch.setattr("seacode.app.SeaCodeApp", _FakeApp)
@@ -288,6 +293,55 @@ def test_main_passes_effective_permission_mode_to_tui(
     main()
 
     assert created[0].kwargs["permission_mode"].value == expected_mode
+    assert created[0].kwargs["enable_fork"] is True
+    assert created[0].kwargs["enable_verification_agent"] is True
+
+
+# 验证 -p 入口将配置开关传给实际使用的子 Agent 装配。
+# 替换模型和加载器，仅检查 Fork 与 Verification 的入口参数，不连接外部服务。
+@pytest.mark.asyncio
+async def test_prompt_runtime_passes_subagent_feature_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = _provider()
+    config = AppConfig(
+        providers=(provider,),
+        enable_fork=True,
+        enable_verification_agent=True,
+    )
+    loaders: list[Any] = []
+    agents: list[Any] = []
+
+    class _CaptureLoader:
+        def __init__(self, work_dir: Path, *, enable_verification: bool = False) -> None:
+            self.work_dir = work_dir
+            self.enable_verification = enable_verification
+            loaders.append(self)
+
+        def load_all(self) -> None:
+            return None
+
+    class _CaptureAgent:
+        def __init__(self, **kwargs: Any) -> None:
+            self.registry = kwargs["registry"]
+            self.agent_id = "lead"
+            self.coordinator_mode = False
+            agents.append(self)
+
+        async def run(self, conversation: Any) -> AsyncIterator[Any]:
+            del conversation
+            yield LoopComplete(total_turns=1)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("seacode.__main__.load_config", lambda: config)
+    monkeypatch.setattr("seacode.client.create_client", lambda _: object())
+    monkeypatch.setattr("seacode.agent.Agent", _CaptureAgent)
+    monkeypatch.setattr("seacode.agents.loader.AgentLoader", _CaptureLoader)
+
+    await _run_prompt("verify", "text", None)
+
+    assert loaders[0].enable_verification is True
+    assert agents[0].registry.get("Agent").enable_fork is True
 
 
 # 验证非法 --mode 仍由 argparse 在启动前拒绝。

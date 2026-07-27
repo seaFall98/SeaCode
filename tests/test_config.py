@@ -63,6 +63,63 @@ def test_load_config_reads_permission_mode(tmp_path: Path) -> None:
     assert config.permission_mode == "acceptEdits"
 
 
+# 验证子 Agent 可选能力开关能从配置层读取并在后续层叠加保留。
+# 用户层开启 Fork、项目本地层开启 Verification，最终两个能力都应可用。
+def test_load_config_merges_subagent_feature_flags(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    user_config = home / ".seacode" / "config.yaml"
+    local_config = project / ".seacode" / "config.local.yaml"
+    _write_config(user_config, name="user")
+    _write_config(local_config, name="local")
+    user_config.write_text(
+        user_config.read_text(encoding="utf-8") + "\nenable_fork: true\n",
+        encoding="utf-8",
+    )
+    local_config.write_text(
+        local_config.read_text(encoding="utf-8")
+        + "\nenable_verification_agent: true\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(cwd=project, home=home)
+
+    assert config.enable_fork is True
+    assert config.enable_verification_agent is True
+
+
+# 验证配置缺少可选子 Agent 开关时维持默认关闭。
+# 使用最小有效配置加载，断言不会改变既有用户的运行路径。
+def test_load_config_defaults_subagent_feature_flags_to_disabled(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config(path, name="primary")
+
+    config = load_config(path)
+
+    assert config.enable_fork is False
+    assert config.enable_verification_agent is False
+
+
+# 验证子 Agent 开关只接受布尔值。
+# 逐项写入错误类型，确保错误在配置边界被拒绝。
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [("enable_fork", "invalid"), ("enable_verification_agent", "1")],
+)
+def test_load_config_rejects_non_boolean_subagent_feature_flags(
+    tmp_path: Path, field_name: str, field_value: str
+) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config(path, name="primary")
+    path.write_text(
+        path.read_text(encoding="utf-8") + f"\n{field_name}: {field_value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=f"{field_name} must be a boolean"):
+        load_config(path)
+
+
 # 验证解析失败不会把 Provider 密钥放入异常文本。
 # 故意省略必需字段，同时使用可识别的秘密占位符。
 def test_invalid_config_error_redacts_api_key(tmp_path: Path) -> None:

@@ -183,7 +183,9 @@ async def _run_prompt(
 
     trace_manager = TraceManager()
     task_manager = TaskManager()
-    agent_loader = AgentLoader(Path(cwd))
+    agent_loader = AgentLoader(
+        Path(cwd), enable_verification=config.enable_verification_agent
+    )
     agent_loader.load_all()
     worktree_manager = WorktreeManager(
         repo_root=cwd,
@@ -202,7 +204,7 @@ async def _run_prompt(
         task_manager=task_manager,
         trace_manager=trace_manager,
         parent_agent=agent,
-        enable_fork=False,
+        enable_fork=config.enable_fork,
         provider_config=provider,
         worktree_manager=worktree_manager,
         team_manager=team_manager,
@@ -527,6 +529,8 @@ def main() -> None:
         max_steps=_read_max_steps(),
         permission_mode=permission_mode,
         hook_engine=hook_engine,
+        enable_fork=config.enable_fork,
+        enable_verification_agent=config.enable_verification_agent,
         # batch14：透传团队协调配置；teammate_mode 指定 spawn 后端，
         # enable_coordinator_mode 开启 Lead 工具收敛与协调者提示词。
         teammate_mode=config.teammate_mode,

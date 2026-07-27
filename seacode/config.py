@@ -151,6 +151,9 @@ class AppConfig:
     # Hook 原始配置列表；三层叠加合并（与 Provider 列表完整替换语义不同），
     # 字段级校验延迟到 hooks.loader.load_hooks 中做。
     raw_hooks: list[dict] = field(default_factory=list)
+    # 子 Agent 可选能力默认关闭；配置层任一位置显式开启后保持开启。
+    enable_fork: bool = False
+    enable_verification_agent: bool = False
     # batch13：Worktree 隔离工作区配置；三层合并按字段覆盖（与 sandbox 同语义）。
     worktree: WorktreeConfig = WorktreeConfig()
     # batch14：团队协调配置；teammate_mode 指定 spawn 后端（空/ tmux / iterm2 / in-process），
@@ -217,6 +220,7 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
     mcp_servers = _parse_mcp_servers(raw.get("mcp_servers"), path)
     raw_hooks = validate_hooks(raw.get("hooks"))
     permission_mode = _parse_permission_mode(raw.get("permission_mode"), path)
+    enable_fork, enable_verification_agent = _parse_subagent_feature_flags(raw, path)
     worktree = _parse_worktree(raw.get("worktree"), path)
     teammate_mode, enable_coordinator_mode = _parse_teammate_fields(raw, path)
     return AppConfig(
@@ -225,6 +229,8 @@ def _parse_config(raw: Any, path: Path) -> AppConfig:
         sandbox=sandbox,
         mcp_servers=mcp_servers,
         raw_hooks=raw_hooks,
+        enable_fork=enable_fork,
+        enable_verification_agent=enable_verification_agent,
         worktree=worktree,
         teammate_mode=teammate_mode,
         enable_coordinator_mode=enable_coordinator_mode,
@@ -241,6 +247,17 @@ def _parse_permission_mode(raw: Any, path: Path) -> str:
         return str(validate_permission_mode(raw).value)
     except ValueError as error:
         raise ConfigError(f"invalid permission_mode: {path}") from error
+
+
+# 解析子 Agent 可选能力开关；缺失时保持关闭，避免改变既有启动行为。
+def _parse_subagent_feature_flags(raw: dict[str, Any], path: Path) -> tuple[bool, bool]:
+    flags: list[bool] = []
+    for field_name in ("enable_fork", "enable_verification_agent"):
+        value = raw.get(field_name, False)
+        if not isinstance(value, bool):
+            raise ConfigError(f"{field_name} must be a boolean: {path}")
+        flags.append(value)
+    return flags[0], flags[1]
 
 
 # 解析 mcp_servers 段；缺失或非 list 时返回空元组，逐条校验字段。
@@ -431,6 +448,9 @@ def load_config(
     merged_interval: int = 3600
     merged_cutoff: int = 24
     merged_permission_mode = "default"
+    # 子 Agent 开关采用 OR 语义；用户级配置启用后，项目配置不会意外关闭它。
+    merged_enable_fork = False
+    merged_enable_verification_agent = False
     # batch14：团队字段合并；teammate_mode 后层非空覆盖前层，
     # enable_coordinator_mode 后层 True 覆盖前层（与 sandbox 的 OR 语义一致，更安全）。
     merged_teammate_mode: str = ""
@@ -442,6 +462,10 @@ def load_config(
         loaded = layer
         if layer.permission_mode != "default":
             merged_permission_mode = layer.permission_mode
+        merged_enable_fork = merged_enable_fork or layer.enable_fork
+        merged_enable_verification_agent = (
+            merged_enable_verification_agent or layer.enable_verification_agent
+        )
         # sandbox 字段三层合并：任一层开启即开启（与 Provider 列表的"后层替换"语义不同）。
         sandbox_enabled = sandbox_enabled or layer.sandbox.enabled
         sandbox_auto_allow = sandbox_auto_allow or layer.sandbox.auto_allow
@@ -482,6 +506,8 @@ def load_config(
         ),
         mcp_servers=tuple(merged_mcp.values()),
         raw_hooks=merged_raw_hooks,
+        enable_fork=merged_enable_fork,
+        enable_verification_agent=merged_enable_verification_agent,
         worktree=WorktreeConfig(
             symlink_directories=tuple(merged_symlinks),
             stale_cleanup_interval=merged_interval,
