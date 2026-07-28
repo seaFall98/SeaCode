@@ -5,15 +5,31 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 from seacode.commands.registry import Command, CommandContext, CommandRegistry, CommandType
-from seacode.skills.executor import SkillExecutor
-from seacode.skills.loader import SkillLoader
+from seacode.skills.parser import SkillDef
 
 logger = logging.getLogger(__name__)
 
 # 模块级集合跟踪已注册 Skill 命令名；reload 时先清理再重注册。
 _REGISTERED_SKILL_NAMES: set[str] = set()
+
+
+class SkillCommandLoader(Protocol):
+    """Skill 命令读取目录和单条定义所需的能力。"""
+
+    def get(self, name: str) -> SkillDef | None: ...
+
+    def get_catalog(self) -> list[tuple[str, str]]: ...
+
+
+class SkillCommandExecutor(Protocol):
+    """Skill 命令执行 inline 和 fork 模式所需的能力。"""
+
+    async def execute_inline(self, skill: SkillDef, args: str = "") -> str: ...
+
+    async def execute_fork(self, skill: SkillDef, args: str = "") -> str: ...
 
 
 # 清理旧 Skill 命令；reload 时调用避免重复注册。
@@ -25,7 +41,7 @@ def _clear_registered(registry: CommandRegistry) -> None:
 
 # 工厂函数立即绑定 skill_name，避免闭包延迟绑定问题。
 def make_skill_handler(
-    skill_name: str, loader: SkillLoader, executor: SkillExecutor
+    skill_name: str, loader: SkillCommandLoader, executor: SkillCommandExecutor
 ) -> Callable[[CommandContext], Awaitable[None]]:
     async def handler(ctx: CommandContext) -> None:
         skill = loader.get(skill_name)
@@ -47,10 +63,10 @@ def make_skill_handler(
 
 # fork 模式后台执行：调 execute_fork 后把结果作为系统消息返回主对话。
 async def _run_fork(
-    skill: object, ctx: CommandContext, executor: SkillExecutor
+    skill: SkillDef, ctx: CommandContext, executor: SkillCommandExecutor
 ) -> None:
     try:
-        result = await executor.execute_fork(skill, ctx.args)  # type: ignore[arg-type]
+        result = await executor.execute_fork(skill, ctx.args)
         ctx.ui.add_system_message(
             f"[Skill {getattr(skill, 'name', '')} fork 结果]\n\n{result}"
         )
@@ -63,7 +79,9 @@ async def _run_fork(
 # 遍历 loader.get_catalog() 把每个 Skill 注册为 PROMPT 类型斜杠命令。
 # 重名 Skill 命令跳过并 warning 日志，避免覆盖已有命令。
 def register_skill_commands(
-    registry: CommandRegistry, loader: SkillLoader, executor: SkillExecutor
+    registry: CommandRegistry,
+    loader: SkillCommandLoader,
+    executor: SkillCommandExecutor,
 ) -> None:
     _clear_registered(registry)
     for skill_name, description in loader.get_catalog():
@@ -87,7 +105,9 @@ def register_skill_commands(
 
 # 返回闭包供 app.py 注册到 loader.register_reload_callback。
 def make_skill_register_callback(
-    registry: CommandRegistry, loader: SkillLoader, executor: SkillExecutor
+    registry: CommandRegistry,
+    loader: SkillCommandLoader,
+    executor: SkillCommandExecutor,
 ) -> Callable[[], None]:
     def callback() -> None:
         register_skill_commands(registry, loader, executor)

@@ -106,8 +106,8 @@ async def _collect(agent_run: Any) -> list[Any]:
     return [event async for event in agent_run]
 
 
-# 假 HookEngine：记录所有调用并支持预设 rejection / prompt_messages / notifications。
-class _FakeHookEngine:
+# 受 HookEngine 契约约束的测试引擎，记录调用并支持预设结果。
+class _FakeHookEngine(HookEngine):
     def __init__(
         self,
         *,
@@ -115,6 +115,7 @@ class _FakeHookEngine:
         prompt_messages: list[str] | None = None,
         notifications: list[HookNotification] | None = None,
     ) -> None:
+        super().__init__()
         self.run_hooks_calls: list[tuple[str, HookContext]] = []
         self.run_pre_tool_hooks_calls: list[HookContext] = []
         self.get_prompt_messages_calls = 0
@@ -149,7 +150,7 @@ class _FakeHookEngine:
 def _build_agent(
     client: _FakeClient,
     *,
-    hook_engine: Any = None,
+    hook_engine: HookEngine | None = None,
 ) -> tuple[Agent, ToolRegistry, ConversationManager]:
     """构造带 MockTool 的 Agent 与空对话；hook_engine 可选注入。"""
     tool = _MockTool(name="MockTool", result=ToolResult(content="ok"))

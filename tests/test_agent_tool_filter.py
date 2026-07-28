@@ -263,6 +263,7 @@ def test_clone_registry_for_fork_marks_agent_tool_with_query_source() -> None:
     fork_tool = new_reg.get("Agent")
     assert fork_tool is not None
     assert fork_tool is not agent_tool  # 是浅复制
+    assert isinstance(fork_tool, AgentTool)
     assert fork_tool.query_source == FORK_QUERY_SOURCE
 
 

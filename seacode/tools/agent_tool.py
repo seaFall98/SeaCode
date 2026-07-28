@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
@@ -23,15 +23,12 @@ from seacode.agents.fork import (
     ForkError,
     build_forked_messages,
 )
-from seacode.agents.loader import AgentLoader
 from seacode.agents.parser import AgentDef
-from seacode.agents.task_manager import TaskManager
 from seacode.agents.tool_filter import (
     build_teammate_tools,
     clone_registry_for_fork,
     resolve_agent_tools,
 )
-from seacode.agents.trace import TraceManager
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 from seacode.worktree.integration import build_worktree_notice, generate_worktree_name
 from seacode.worktree.manager import WorktreeError, WorktreeManager
@@ -55,6 +52,44 @@ TEAMMATE_ADDENDUM = (
     "isolated worktree; use relative paths for all file operations.\n"
     "[/TEAMMATE CONTEXT]"
 )
+
+
+class AgentDefinitionProvider(Protocol):
+    """子 Agent 调度所需的定义查询能力。"""
+
+    def get(self, name: str) -> AgentDef | None: ...
+
+    def list_agents(self) -> list[tuple[str, str]]: ...
+
+
+class TaskLauncher(Protocol):
+    """后台子 Agent 调度所需的最小任务入口。"""
+
+    async def launch(
+        self,
+        agent: Any,
+        task: str,
+        name: str,
+        fork_conversation: Any = None,
+    ) -> str: ...
+
+
+class TraceNodeRef(Protocol):
+    """子 Agent 追踪节点向调度器暴露的标识。"""
+
+    agent_id: str
+
+
+class TraceRecorder(Protocol):
+    """子 Agent 调度所需的调用链记录能力。"""
+
+    def create(
+        self, agent_type: str, parent_id: str | None, trace_id: str
+    ) -> TraceNodeRef: ...
+
+    def update(self, agent_id: str, **kwargs: Any) -> None: ...
+
+    def complete(self, agent_id: str, status: str = "completed") -> None: ...
 
 
 class AgentToolParams(BaseModel):
@@ -92,9 +127,9 @@ class AgentTool(Tool):
 
     def __init__(
         self,
-        agent_loader: AgentLoader,
-        task_manager: TaskManager,
-        trace_manager: TraceManager,
+        agent_loader: AgentDefinitionProvider,
+        task_manager: TaskLauncher,
+        trace_manager: TraceRecorder,
         parent_agent: Any,
         enable_fork: bool = False,
         provider_config: Any = None,

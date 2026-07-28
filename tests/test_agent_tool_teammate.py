@@ -134,7 +134,15 @@ class _FakeTraceManager:
 
 
 class _FakeTaskManager:
-    pass
+    async def launch(
+        self,
+        agent: Any,
+        task: str,
+        name: str,
+        fork_conversation: Any = None,
+    ) -> str:
+        del agent, task, name, fork_conversation
+        return "fake-task"
 
 
 # 假 handle：spawn_inprocess_teammate 的返回值。

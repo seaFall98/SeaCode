@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,6 +21,7 @@ from seacode.agents.tool_filter import (
 from seacode.teams.manager import TeamManager
 from seacode.teams.models import BackendType, TeammateInfo
 from seacode.teams.progress import TeammateProgress
+from seacode.tools import ToolRegistry
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 from seacode.tools.team_create import TeamCreateParams, TeamCreateTool
 from seacode.tools.team_delete import TeamDeleteParams, TeamDeleteTool
@@ -41,23 +43,12 @@ class _FakeTool(Tool):
         return ToolResult(content="")
 
 
-# 假 ToolRegistry：list_tools 返回注入的工具列表，register 记录调用。
-class _FakeRegistry:
-    def __init__(self, tools: list[Tool] | None = None) -> None:
-        self._tools: dict[str, Tool] = {}
-        for t in tools or []:
-            self._tools[t.name] = t
-        self.register_calls: list[Tool] = []
-
-    def register(self, tool: Tool) -> None:
-        self._tools[tool.name] = tool
-        self.register_calls.append(tool)
-
-    def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
-
-    def list_tools(self) -> list[Tool]:
-        return list(self._tools.values())
+# 受 ToolRegistry 契约约束的测试注册表，预置可过滤的工具集。
+class _FakeRegistry(ToolRegistry):
+    def __init__(self, tools: Sequence[Tool] | None = None) -> None:
+        super().__init__()
+        for tool in tools or []:
+            self.register(tool)
 
 
 # 假父 Agent：提供 TeamCreate/Delete 所需的最小属性集合 + registry 可替换。
