@@ -9,6 +9,7 @@ import pytest
 from seacode.client import (
     ANTHROPIC_MODEL_FETCH_TIMEOUT,
     AnthropicClient,
+    LLMClient,
     OpenAIClient,
     OpenAICompatClient,
     StreamComplete,
@@ -128,12 +129,13 @@ def _provider(protocol: str) -> ProviderConfig:
 @pytest.mark.parametrize("protocol", ["anthropic", "openai", "openai-compat"])
 def test_clients_expose_configured_model(protocol: str) -> None:
     config = _provider(protocol)
-    client_type = {
-        "anthropic": AnthropicClient,
-        "openai": OpenAIClient,
-        "openai-compat": OpenAICompatClient,
-    }[protocol]
-    client = client_type(config, client=object())
+    client: LLMClient
+    if protocol == "anthropic":
+        client = AnthropicClient(config, client=object())
+    elif protocol == "openai":
+        client = OpenAIClient(config, client=object())
+    else:
+        client = OpenAICompatClient(config, client=object())
     assert client.model == "test-model"
 
 
