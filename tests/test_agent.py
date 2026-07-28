@@ -28,6 +28,8 @@ from seacode.agent import (
 )
 from seacode.client import (
     LLMClient,
+    NetworkError,
+    RequestError,
     StreamComplete,
     StreamEvent,
     TextDelta,
@@ -556,12 +558,12 @@ async def test_second_request_failure_propagates_and_keeps_committed_turn() -> N
     agent, conversation, client = _setup(tool)
     client._outcomes = [
         _tool_call_stream("c1", "MockTool", {"input": "x"}),
-        RuntimeError("model provider failed"),
-        RuntimeError("model provider failed"),
+        NetworkError("model provider failed"),
+        NetworkError("model provider failed"),
     ]
     conversation.add_user_message("Run tool then fail")
 
-    with pytest.raises(RuntimeError, match="model provider failed"):
+    with pytest.raises(NetworkError, match="model provider failed"):
         await _collect(agent.run(conversation))
 
     # 第一轮的助手消息与工具结果已提交，第二轮未写入任何消息。
@@ -583,7 +585,7 @@ async def test_post_tool_provider_failure_retries_without_rerunning_tools() -> N
     agent, conversation, client = _setup(tool)
     client._outcomes = [
         _tool_call_stream("c1", "MockTool", {"input": "x"}),
-        RuntimeError("temporary provider failure"),
+        NetworkError("temporary provider failure"),
         _text_stream("Recovered"),
     ]
     conversation.add_user_message("Run tool then retry")
@@ -593,8 +595,29 @@ async def test_post_tool_provider_failure_retries_without_rerunning_tools() -> N
     assert isinstance(events[-1], LoopComplete)
     assert conversation.messages[-1].content == "Recovered"
     assert len(client.requests) == 3
+    retry_events = [event for event in events if isinstance(event, RetryEvent)]
+    assert [event.reason for event in retry_events] == ["network provider retry"]
     assert len([event for event in events if isinstance(event, ToolResultEvent)]) == 1
     assert conversation.messages[3].tool_results[0].content == "ok"
+
+
+# 验证工具结果回灌后的不可重试请求错误不会被重复提交。
+# 请求契约错误应直接传播，工具只执行一次且 Provider 仅收到一次失败请求。
+@pytest.mark.asyncio
+async def test_post_tool_request_error_does_not_retry() -> None:
+    tool = _MockTool(name="MockTool", result=ToolResult(content="ok"))
+    agent, conversation, client = _setup(tool)
+    client._outcomes = [
+        _tool_call_stream("c1", "MockTool", {"input": "x"}),
+        RequestError("invalid request"),
+    ]
+    conversation.add_user_message("Run tool then reject")
+
+    with pytest.raises(RequestError, match="invalid request"):
+        await _collect(agent.run(conversation))
+
+    assert len(client.requests) == 2
+    assert len(conversation.messages[3].tool_results) == 1
 
 
 # ---------------------------------------------------------------------------

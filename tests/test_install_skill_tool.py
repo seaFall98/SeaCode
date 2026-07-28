@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from seacode.skills.install import InstallReport
@@ -9,11 +10,23 @@ from seacode.tools.base import ToolCategory
 from seacode.tools.install_skill import InstallSkill, _InstallSkillParams
 
 
-# 假 loader：携带 _user_dir 与 reload 调用计数，模拟 SkillLoader 接口。
+# 测试 loader：只实现 SkillLoader 的公开安装目录契约和 reload 行为。
 class _FakeLoader:
-    def __init__(self, user_dir: str = "/home/.seacode/skills") -> None:
-        self._user_dir = user_dir
+    def __init__(
+        self,
+        project_dir: str = "/repo/.seacode/skills",
+        user_dir: str = "/home/.seacode/skills",
+    ) -> None:
+        self.project_dir = Path(project_dir)
+        self.user_dir = Path(user_dir)
         self.reload_calls = 0
+
+    def get_install_root(self, scope: str) -> Path:
+        if scope == "project":
+            return self.project_dir
+        if scope == "user":
+            return self.user_dir
+        raise ValueError(f"unsupported scope: {scope}")
 
     def reload(self) -> None:
         self.reload_calls += 1
@@ -50,6 +63,8 @@ def test_install_skill_input_schema_contains_url() -> None:
     schema = InstallSkill().get_schema()["input_schema"]
     assert "url" in schema["properties"]
     assert "url" in schema.get("required", [])
+    assert schema["properties"]["scope"]["enum"] == ["project", "user"]
+    assert schema["properties"]["scope"]["default"] == "project"
 
 
 # ---------- execute 正常分支 ----------
@@ -75,12 +90,15 @@ async def test_install_skill_success_invokes_install_reload_callback() -> None:
     )
     with _patch_install_skill(fake_install):
         result = await tool.execute(
-            _InstallSkillParams(url="https://skills.sh/user/repo/commit")
+            _InstallSkillParams(
+                url="https://skills.sh/user/repo/commit", scope="user"
+            )
         )
 
     assert result.is_error is False
     assert "已安装" in result.content
     assert "commit" in result.content
+    assert "user" in result.content
     fake_install.assert_awaited_once()
     assert loader.reload_calls == 1
     assert callback.calls == 1
@@ -101,12 +119,68 @@ async def test_install_skill_no_callback_does_not_raise() -> None:
     )
     with _patch_install_skill(fake_install):
         result = await tool.execute(
-            _InstallSkillParams(url="https://skills.sh/user/repo/x")
+            _InstallSkillParams(url="https://skills.sh/user/repo/x", scope="project")
         )
 
     assert result.is_error is False
     assert "已安装" in result.content
     assert loader.reload_calls == 1
+
+
+# 验证未指定 scope 时安装到项目级目录，并把项目范围写入结果。
+# loader 只暴露公开 get_install_root，断言工具不会依赖用户目录私有字段。
+async def test_install_skill_defaults_to_project_scope() -> None:
+    loader = _FakeLoader(project_dir="/repo/.seacode/skills")
+    tool = InstallSkill()
+    tool.set_loader(loader)
+
+    fake_install = AsyncMock(
+        return_value=InstallReport(
+            skill_name="frontend-design",
+            target_dir="/repo/.seacode/skills/frontend-design",
+        )
+    )
+    with _patch_install_skill(fake_install):
+        result = await tool.execute(
+            _InstallSkillParams(url="https://skills.sh/user/repo/frontend-design")
+        )
+
+    assert result.is_error is False
+    assert "project" in result.content
+    assert "/repo/.seacode/skills/frontend-design" in result.content
+    fake_install.assert_awaited_once_with(
+        fake_install.call_args.args[0], install_root=Path("/repo/.seacode/skills")
+    )
+
+
+# 验证 scope=project 选择 loader 的项目根目录，而不是用户根目录。
+# 返回项目目标路径，断言安装器收到项目根目录并触发 reload。
+async def test_install_skill_project_scope_uses_project_root() -> None:
+    loader = _FakeLoader(
+        project_dir="/workspace/.seacode/skills",
+        user_dir="/home/.seacode/skills",
+    )
+    tool = InstallSkill()
+    tool.set_loader(loader)
+
+    fake_install = AsyncMock(
+        return_value=InstallReport(
+            skill_name="frontend-design",
+            target_dir="/workspace/.seacode/skills/frontend-design",
+        )
+    )
+    with _patch_install_skill(fake_install):
+        result = await tool.execute(
+            _InstallSkillParams(
+                url="https://skills.sh/user/repo/frontend-design", scope="project"
+            )
+        )
+
+    assert result.is_error is False
+    assert "/workspace/.seacode/skills/frontend-design" in result.content
+    assert fake_install.call_args.kwargs["install_root"] == Path(
+        "/workspace/.seacode/skills"
+    )
 
 
 # ---------- execute 错误分支 ----------

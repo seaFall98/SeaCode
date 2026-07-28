@@ -24,6 +24,7 @@ from seacode.app import (
 from seacode.client import (
     LLMClient,
     NetworkError,
+    RequestError,
     StreamComplete,
     StreamEvent,
     TextDelta,
@@ -362,6 +363,77 @@ async def test_stream_error_recovers_without_polluting_conversation_history() ->
             (Message(role="user", content="Second"),),
         ]
         assert "Ready" in str(app.query_one("#turn-status").render())
+
+
+# 验证未知运行时异常不会被误报为模型配置错误。
+# 让真实 App 回合收到非 LLMError 异常，断言界面给出内部错误和诊断标识。
+@pytest.mark.asyncio
+async def test_unexpected_turn_error_has_internal_diagnostic() -> None:
+    client = _FakeClient([RuntimeError("secret provider response")])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Trigger runtime failure")
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        error_text = "\n".join(str(message.render()) for message in app.query(".error-message"))
+        assert "internal" in error_text.lower()
+        assert "model configuration" not in error_text.lower()
+        assert "Diagnostic ID:" in error_text
+        assert "secret provider response" not in error_text
+
+
+# 验证 LLMError 也携带可关联诊断标识，并保留网络类别提示。
+# 使一次网络错误结束回合，断言 TUI 展示类别和稳定的诊断字段。
+@pytest.mark.asyncio
+async def test_llm_error_has_diagnostic_id() -> None:
+    client = _FakeClient([NetworkError("connection detail")])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Trigger network failure")
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        error_text = "\n".join(str(message.render()) for message in app.query(".error-message"))
+        assert "provider could not be reached" in error_text.lower()
+        assert "Diagnostic ID:" in error_text
+
+
+# 验证工具已经执行后 Provider 失败会明确提示可能存在工作区结果。
+# 让真实 Agent 执行一次 ReadFile，再由不可重试请求错误结束，断言 TUI 不声称完全未执行。
+@pytest.mark.asyncio
+async def test_provider_error_after_tool_warns_about_workspace_changes() -> None:
+    client = _FakeClient(
+        [
+            [
+                ToolCallStart(tool_name="ReadFile", tool_id="read-1"),
+                ToolCallComplete(
+                    tool_id="read-1",
+                    tool_name="ReadFile",
+                    arguments={"file_path": "missing.txt"},
+                ),
+                StreamComplete(),
+            ],
+            RequestError("invalid request"),
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Read a file, then fail")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+        error_text = "\n".join(
+            str(message.render()) for message in app.query(".error-message")
+        )
+        assert "changed the workspace" in error_text
+        assert "Diagnostic ID:" in error_text
 
 
 # 验证等待首字节期间输入被锁定，不能建立第二个并发回合。

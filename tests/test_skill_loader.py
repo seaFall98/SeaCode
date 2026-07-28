@@ -46,6 +46,18 @@ def test_load_all_nonexistent_dirs_return_empty(tmp_path: Path) -> None:
     assert loader.load_all() == {}
 
 
+# 验证公开安装根目录契约返回规范化绝对路径。
+# 传入相对项目/用户目录，断言两种 scope 都被解析为绝对路径。
+def test_get_install_root_returns_absolute_paths() -> None:
+    loader = SkillLoader(
+        project_dir=Path("relative-project"),
+        user_dir=Path("relative-user"),
+    )
+
+    assert loader.get_install_root("project").is_absolute()
+    assert loader.get_install_root("user").is_absolute()
+
+
 # 验证单文件解析失败 warning 跳过不影响其它。
 # 项目级放 bad.md（缺 frontmatter）与 good.md（合法），断言 good 加载、bad 为 None。
 def test_load_all_skips_unparseable_file(tmp_path: Path) -> None:

@@ -24,12 +24,20 @@ class SkillLoader:
     """
 
     def __init__(self, project_dir: Path, user_dir: Path) -> None:
-        self._project_dir = project_dir
-        self._user_dir = user_dir
+        self._project_dir = project_dir.resolve()
+        self._user_dir = user_dir.resolve()
         self._skills: dict[str, SkillDef] = {}
         self._cache: dict[str, SkillDef] = {}
         self._dir_mod_times: dict[Path, float] = {}
         self._reload_callbacks: list[Callable[[], None]] = []
+
+    # 返回受控的 Skill 安装根目录；调用方不能通过此接口写入任意路径。
+    def get_install_root(self, scope: str) -> Path:
+        if scope == "project":
+            return self._project_dir
+        if scope == "user":
+            return self._user_dir
+        raise ValueError(f"不支持的 Skill 安装范围：{scope}")
 
     # 全量扫描项目级 + 用户级 + 内置钩子；not in seen 实现先到先得优先级。
     def load_all(self) -> dict[str, SkillDef]:

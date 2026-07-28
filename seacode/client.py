@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -19,25 +21,73 @@ from .serialization import (
     build_openai_input,
 )
 
+log = logging.getLogger(__name__)
+
+
+def create_diagnostic_id() -> str:
+    """生成不包含请求内容的本地诊断标识。"""
+    return f"SC-{uuid.uuid4().hex[:10]}"
+
 
 class LLMError(Exception):
     """表示可安全展示给用户的模型请求失败。"""
+
+    category = "internal"
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic_id: str | None = None,
+        phase: str = "provider",
+        reason: str | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic_id = diagnostic_id or create_diagnostic_id()
+        self.phase = phase
+        self.reason = " ".join(reason.split())[:64] if reason else None
+        if retryable is not None:
+            self.retryable = retryable
 
 
 class AuthenticationError(LLMError):
     """表示模型端点拒绝凭据。"""
 
+    category = "authentication"
+
 
 class RateLimitError(LLMError):
     """表示模型端点暂时限制请求。"""
+
+    category = "rate_limit"
+    retryable = True
 
 
 class NetworkError(LLMError):
     """表示模型端点连接或传输失败。"""
 
+    category = "network"
+    retryable = True
+
+
+class RequestError(LLMError):
+    """表示 Provider 拒绝了请求参数或请求契约。"""
+
+    category = "request"
+
+
+class ContextWindowError(LLMError):
+    """表示请求超过 Provider 的上下文限制。"""
+
+    category = "context_window"
+
 
 class ProtocolError(LLMError):
     """表示端点返回了无法完成回合的响应。"""
+
+    category = "protocol"
 
 
 @dataclass(frozen=True)
@@ -137,21 +187,79 @@ def _usage_value(usage: Any, field_name: str) -> int:
     return value if isinstance(value, int) else 0
 
 
-# 将 SDK 异常转换成不包含请求内容或凭据的有限错误类别。
+# 将 SDK 异常转换成不包含请求内容或凭据的有限错误类别，并记录安全诊断字段。
 def _normalize_error(error: Exception) -> LLMError:
     if isinstance(error, LLMError):
+        _log_provider_error(error, None)
         return error
+
     name = type(error).__name__.lower()
+    detail = " ".join(str(error).split()).lower()
     status_code = getattr(error, "status_code", None)
+    if not isinstance(status_code, int):
+        status_code = None
+
     if status_code in {401, 403} or "authentication" in name or "permission" in name:
-        return AuthenticationError("The model provider rejected the configured credentials.")
-    if status_code == 429 or "ratelimit" in name or "rate_limit" in name:
-        return RateLimitError(
+        normalized: LLMError = AuthenticationError(
+            "The model provider rejected the configured credentials."
+        )
+    elif status_code == 429 or "ratelimit" in name or "rate_limit" in name:
+        normalized = RateLimitError(
             "The model provider is rate limiting this request. Try again shortly."
         )
-    if "connection" in name or "timeout" in name or "network" in name:
-        return NetworkError("Unable to reach the model provider. Check the network and endpoint.")
-    return ProtocolError("The model provider returned an unusable response.")
+    elif any(
+        marker in detail
+        for marker in (
+            "context window",
+            "context_length",
+            "maximum context",
+            "too many tokens",
+            "prompt is too long",
+            "max context",
+        )
+    ):
+        normalized = ContextWindowError(
+            "The request exceeds the model provider context window."
+        )
+    elif status_code in {400, 422} or any(
+        marker in name for marker in ("badrequest", "invalidrequest", "invalid_request")
+    ):
+        normalized = RequestError(
+            "The model provider rejected the request parameters."
+        )
+    elif (
+        status_code in {408, 409}
+        or "connection" in name
+        or "timeout" in name
+        or "network" in name
+    ):
+        normalized = NetworkError(
+            "Unable to reach the model provider. Check the network and endpoint."
+        )
+    elif status_code is not None and status_code >= 500:
+        normalized = ProtocolError(
+            "The model provider returned a temporary server error.", retryable=True
+        )
+    else:
+        normalized = ProtocolError("The model provider returned an unusable response.")
+
+    _log_provider_error(normalized, status_code)
+    return normalized
+
+
+def _log_provider_error(error: LLMError, status_code: int | None) -> None:
+    """记录定位 Provider 失败所需的最小脱敏字段。"""
+    log.warning(
+        "Provider request failed diagnostic_id=%s category=%s phase=%s "
+        "reason=%s retryable=%s status_code=%s error_type=%s",
+        error.diagnostic_id,
+        error.category,
+        error.phase,
+        error.reason,
+        error.retryable,
+        status_code,
+        type(error).__name__,
+    )
 
 
 # 确保构造 SDK 客户端前已有 YAML 密钥或兼容环境变量。
@@ -508,7 +616,11 @@ class OpenAIClient(LLMClient):
             raise _normalize_error(error) from error
 
         if not completed:
-            raise ProtocolError("The Responses stream ended without a completion event.")
+            raise ProtocolError(
+                "The Responses stream ended without a completion event.",
+                phase="stream",
+                reason="missing_completion",
+            )
 
 
 class OpenAICompatClient(LLMClient):
@@ -631,12 +743,29 @@ class OpenAICompatClient(LLMClient):
                             call["args"] += tc.function.arguments
                             yield ToolCallDelta(text=tc.function.arguments)
 
-                # 结束原因。
-                if choice.finish_reason in ("tool_calls", "stop"):
+                # 结束原因；兼容端点可能把长度截断或 legacy function_call 作为终止值。
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason:
+                    reason = str(finish_reason).strip()
+                    if reason not in {
+                        "tool_calls",
+                        "function_call",
+                        "stop",
+                        "length",
+                        "content_filter",
+                    }:
+                        safe_reason = " ".join(reason.split())[:64]
+                        raise ProtocolError(
+                            "The compatible chat stream returned unsupported "
+                            f"finish_reason={safe_reason!r}.",
+                            phase="stream",
+                            reason=safe_reason,
+                        )
+
                     if reasoning_accum:
                         yield ThinkingComplete(thinking=reasoning_accum, signature="")
                         reasoning_accum = ""
-                    if choice.finish_reason == "tool_calls":
+                    if reason in ("tool_calls", "function_call"):
                         # 按 index 排序完成每个 call，保持顺序一致。
                         for _idx, call in sorted(active_calls.items()):
                             try:
@@ -652,10 +781,19 @@ class OpenAICompatClient(LLMClient):
                         # 标记工具调用回合结束；StreamComplete 留给 usage chunk 或循环外兜底，
                         # 这样能保留 usage chunk 中的 token 计数。
                         tool_calls_finished = True
-                    if choice.finish_reason == "stop" and not completed:
+                    if reason == "content_filter":
+                        raise ProtocolError(
+                            "The compatible provider stopped the response due to content_filter.",
+                            phase="stream",
+                            reason="content_filter",
+                        )
+
+                    if reason in ("stop", "length") and not completed:
                         completed = True
-                        # finish_reason=stop 但无 usage chunk 时，发一个空完成事件。
-                        yield StreamComplete(stop_reason="end_turn")
+                        # finish_reason 到达但没有 usage chunk 时，发一个空完成事件。
+                        yield StreamComplete(
+                            stop_reason="max_tokens" if reason == "length" else "end_turn"
+                        )
                     # 兼容 provider（如 DeepSeek）把 usage 与 finish_reason 放在同一 chunk：
                     # 标准OpenAI 分两个 chunk 发，DeepSeek 合并发送。此处统一在 finish_reason
                     # chunk 中提取 usage，避免 stream 结束后无 StreamComplete 事件。
@@ -666,7 +804,13 @@ class OpenAICompatClient(LLMClient):
                         prompt_tokens = usage.prompt_tokens or 0
                         completed = True
                         yield StreamComplete(
-                            stop_reason="tool_calls" if tool_calls_finished else "end_turn",
+                            stop_reason=(
+                                "tool_calls"
+                                if tool_calls_finished
+                                else "max_tokens"
+                                if reason == "length"
+                                else "end_turn"
+                            ),
                             input_tokens=max(prompt_tokens - cache_read, 0),
                             output_tokens=usage.completion_tokens or 0,
                             cache_read=cache_read,
@@ -678,10 +822,15 @@ class OpenAICompatClient(LLMClient):
         # 兜底：finish_reason="tool_calls" 后若无 usage chunk（部分兼容 provider 不发），
         # 补发一个零 token 的 StreamComplete 让 Agent Loop 正常推进到工具执行阶段。
         if not completed and tool_calls_finished:
+            completed = True
             yield StreamComplete(stop_reason="tool_calls")
 
         if not completed:
-            raise ProtocolError("The compatible chat stream ended without a completion event.")
+            raise ProtocolError(
+                "The compatible chat stream ended without a completion event.",
+                phase="stream",
+                reason="missing_completion",
+            )
 
 
 # 按声明协议创建适配器，避免依据端点地址猜测请求格式。
