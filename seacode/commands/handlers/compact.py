@@ -28,14 +28,17 @@ async def handle_compact(ctx: CommandContext) -> None:
         return
     if isinstance(result, CompactNotification):
         # 持久化 compact_boundary，使后续 resume 可重建压缩后的状态。
-        # manual_compact 已重写了 ctx.conversation；下一次 _send_message
-        # 会重新捕获 history_cursor，所以这里无需手动重置。
+        # manual_compact 已重写了 ctx.conversation；本命令同步标记 boundary
+        # 覆盖的历史，后续回合只追加新的 canonical 消息。
         if ctx.session is not None and result.boundary is not None:
             from seacode.memory.session import make_compact_boundary
 
             ctx.session.append_record(
                 make_compact_boundary(result.boundary.summary, result.boundary.keep)
             )
+            mark_all_persisted = getattr(ctx.conversation, "mark_all_persisted", None)
+            if callable(mark_all_persisted):
+                mark_all_persisted()
         ctx.ui.add_system_message(result.message)
     elif isinstance(result, ErrorEvent):
         ctx.ui.add_system_message(f"压缩失败：{result.message}")

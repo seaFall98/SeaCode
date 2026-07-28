@@ -11,7 +11,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any
 
-from seacode.conversation import ConversationManager, Message, ToolResultBlock, ToolUseBlock
+from seacode.conversation import (
+    ConversationManager,
+    Message,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 # 会话 JSONL 与 .meta 的存放目录（相对工作目录）。
 SESSIONS_DIR = ".seacode/sessions"
@@ -104,8 +110,15 @@ class SessionRecord:
                     )
                 )
         elif message.role == "assistant":
-            if message.tool_uses:
-                content_blocks: list[dict[str, Any]] = []
+            if message.tool_uses or message.thinking_blocks:
+                content_blocks: list[dict[str, Any]] = [
+                    {
+                        "type": "thinking",
+                        "thinking": block.thinking,
+                        "signature": block.signature,
+                    }
+                    for block in message.thinking_blocks
+                ]
                 if message.content:
                     content_blocks.append({"type": "text", "text": message.content})
                 for tu in message.tool_uses:
@@ -274,11 +287,19 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
             if isinstance(record.content, list):
                 text = ""
                 tool_uses: list[ToolUseBlock] = []
+                thinking_blocks: list[ThinkingBlock] = []
                 for block in record.content:
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "text":
                         text += block.get("text", "")
+                    elif block.get("type") == "thinking":
+                        thinking_blocks.append(
+                            ThinkingBlock(
+                                thinking=block.get("thinking") or "",
+                                signature=block.get("signature") or "",
+                            )
+                        )
                     elif block.get("type") == "tool_use":
                         tool_uses.append(
                             ToolUseBlock(
@@ -288,7 +309,12 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
                             )
                         )
                 messages.append(
-                    Message(role="assistant", content=text, tool_uses=tool_uses)
+                    Message(
+                        role="assistant",
+                        content=text,
+                        tool_uses=tool_uses,
+                        thinking_blocks=thinking_blocks,
+                    )
                 )
             else:
                 messages.append(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -48,6 +49,20 @@ class Message:
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ConversationSnapshot:
+    """一次回合开始时的消息与持久化状态快照。"""
+
+    messages: tuple[Message, ...]
+    transient_message_ids: frozenset[int]
+    persisted_message_ids: frozenset[int]
+    env_injected: bool
+    ltm_injected: bool
+    baseline_tokens: int
+    anchor_count: int
+    last_input_tokens: int
+
+
 # 锚点之后追加消息的 token 估算使用的字符/token 比率。
 # 与上下文治理模块的恢复附件启发值保持一致，全代码库统一使用同一比率。
 _CHARS_PER_TOKEN: float = 3.5
@@ -83,6 +98,10 @@ class ConversationManager:
     def __init__(self) -> None:
         self._messages: list[Message] = []
         self._pending_user: Message | None = None
+        # 运行时上下文只参与当前请求，不写入会话 JSONL；普通消息默认可持久化。
+        self._transient_message_ids: set[int] = set()
+        # 已成功写入 JSONL 的消息 ID，避免回合边界重复追加历史。
+        self._persisted_message_ids: set[int] = set()
         self.env_injected: bool = False
         # 长期记忆（指令 + MEMORY.md 索引 + 当前日期）是否已注入会话头部。
         # 与 env_injected 平行管理，replace_history 后一并重置以支持压缩后重新注入。
@@ -165,8 +184,67 @@ class ConversationManager:
         self._pending_user = None
 
     # 直接追加一条用户消息，供单轮调度器使用。
-    def add_user_message(self, content: str) -> None:
-        self._messages.append(Message(role="user", content=content))
+    def _append_message(self, message: Message, *, persist: bool) -> Message:
+        self._messages.append(message)
+        if not persist:
+            self._transient_message_ids.add(id(message))
+        return message
+
+    def _insert_message(
+        self, index: int, message: Message, *, persist: bool
+    ) -> Message:
+        self._messages.insert(index, message)
+        if not persist:
+            self._transient_message_ids.add(id(message))
+        return message
+
+    # 返回尚未落盘且不属于运行时注入的 canonical 消息。
+    def messages_to_persist(self) -> tuple[Message, ...]:
+        return tuple(
+            message
+            for message in self._messages
+            if id(message) not in self._transient_message_ids
+            and id(message) not in self._persisted_message_ids
+        )
+
+    # 标记消息已写入当前 Session；未传参时标记当前完整历史。
+    def mark_persisted(self, messages: Iterable[Message] | None = None) -> None:
+        selected = self._messages if messages is None else messages
+        self._persisted_message_ids.update(id(message) for message in selected)
+
+    # 标记当前历史全部由已有 JSONL 或 compact boundary 覆盖。
+    def mark_all_persisted(self) -> None:
+        self.mark_persisted()
+
+    # 记录当前状态，供 Provider 失败时恢复精确的历史边界。
+    def snapshot(self) -> ConversationSnapshot:
+        return ConversationSnapshot(
+            messages=tuple(self._messages),
+            transient_message_ids=frozenset(self._transient_message_ids),
+            persisted_message_ids=frozenset(self._persisted_message_ids),
+            env_injected=self.env_injected,
+            ltm_injected=self.ltm_injected,
+            baseline_tokens=self.baseline_tokens,
+            anchor_count=self.anchor_count,
+            last_input_tokens=self.last_input_tokens,
+        )
+
+    # 用回合快照恢复内存历史；已落盘消息不会因失败而重新出现在当前请求。
+    def restore_snapshot(self, snapshot: ConversationSnapshot) -> None:
+        self._messages = list(snapshot.messages)
+        self._transient_message_ids = set(snapshot.transient_message_ids)
+        self._persisted_message_ids = set(snapshot.persisted_message_ids)
+        self._pending_user = None
+        self.env_injected = snapshot.env_injected
+        self.ltm_injected = snapshot.ltm_injected
+        self.baseline_tokens = snapshot.baseline_tokens
+        self.anchor_count = snapshot.anchor_count
+        self.last_input_tokens = snapshot.last_input_tokens
+
+    def add_user_message(self, content: str, *, persist: bool = True) -> Message:
+        return self._append_message(
+            Message(role="user", content=content), persist=persist
+        )
 
     # 追加一条助手消息，可携带工具调用与思考块。
     def add_assistant_message(
@@ -174,33 +252,44 @@ class ConversationManager:
         content: str,
         tool_uses: list[ToolUseBlock] | None = None,
         thinking_blocks: list[ThinkingBlock] | None = None,
-    ) -> None:
-        self._messages.append(
+        *,
+        persist: bool = True,
+    ) -> Message:
+        return self._append_message(
             Message(
                 role="assistant",
                 content=content,
                 tool_uses=tool_uses or [],
                 thinking_blocks=thinking_blocks or [],
-            )
+            ),
+            persist=persist,
         )
 
     # 追加一条携带工具结果的用户消息，回灌给模型。
-    def add_tool_results_message(self, tool_results: list[ToolResultBlock]) -> None:
-        self._messages.append(Message(role="user", content="", tool_results=tool_results))
+    def add_tool_results_message(
+        self, tool_results: list[ToolResultBlock], *, persist: bool = True
+    ) -> Message:
+        return self._append_message(
+            Message(role="user", content="", tool_results=tool_results),
+            persist=persist,
+        )
 
     # 追加一条 system-reminder 包裹的 user 消息，用于轮次级提醒（Plan Mode/Hook/Mailbox）。
-    def add_system_reminder(self, content: str) -> None:
-        self._messages.append(
+    def add_system_reminder(self, content: str) -> Message:
+        return self._append_message(
             Message(
                 role="user",
                 content=f"<system-reminder>\n{content}\n</system-reminder>",
-            )
+            ),
+            persist=False,
         )
 
     # 在历史头部插入会话级环境上下文；env_injected 标记确保只注入一次。
     def inject_environment(self, context: str) -> None:
         if not self.env_injected:
-            self._messages.insert(0, Message(role="user", content=context))
+            self._insert_message(
+                0, Message(role="user", content=context), persist=False
+            )
             self.env_injected = True
 
     # 在环境上下文之后插入长期记忆（项目指令 + MEMORY.md 索引 + 当前日期）。
@@ -239,14 +328,27 @@ class ConversationManager:
         )
         # env 已注入时插在 env 之后（pos=1），否则插在头部（pos=0）。
         pos = 1 if self.env_injected else 0
-        self._messages.insert(pos, Message(role="user", content=wrapped))
+        self._insert_message(pos, Message(role="user", content=wrapped), persist=False)
         self.ltm_injected = True
 
     # 替换整个历史并重置 env_injected 与用量锚点，支持第 07 步压缩后重新注入环境上下文。
     # 旧的锚点描述的是压缩前的对话记录，这里清零使 current_tokens() 退化为字符估算，
     # 直到下次 API 响应基于压缩后的历史重新锚定。
     def replace_history(self, new_messages: list[Message]) -> None:
-        self._messages = new_messages
+        old_transient = self._transient_message_ids
+        old_persisted = self._persisted_message_ids
+        self._messages = list(new_messages)
+        self._transient_message_ids = {
+            id(message)
+            for message in self._messages
+            if id(message) in old_transient
+        }
+        self._persisted_message_ids = {
+            id(message)
+            for message in self._messages
+            if id(message) in old_persisted
+        }
+        self._pending_user = None
         self.env_injected = False
         self.ltm_injected = False
         self.baseline_tokens = 0
@@ -260,4 +362,18 @@ class ConversationManager:
     # 丢弃末尾消息，用于调度器在失败时回滚不完整回合。
     def drop_last(self) -> None:
         if self._messages:
-            self._messages.pop()
+            message = self._messages.pop()
+            self._transient_message_ids.discard(id(message))
+            self._persisted_message_ids.discard(id(message))
+
+    # 兼容旧 JSONL 中已经落盘的运行时上下文，避免恢复后再次注入重复头部。
+    def mark_runtime_context_from_history(self) -> None:
+        self.env_injected = any(
+            message.content.startswith("Current working directory:")
+            for message in self._messages
+        )
+        self.ltm_injected = any(
+            "As you answer the user's questions, you can use the following context:"
+            in message.content
+            for message in self._messages
+        )

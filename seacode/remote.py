@@ -517,7 +517,7 @@ class RemoteServer:
             self.agent.set_permission_mode(mode)
 
     def get_token_count(self) -> tuple[int, int]:
-        used = getattr(self.conversation, "estimated_tokens", 0)
+        used = self.conversation.current_tokens() if self.conversation else 0
         limit = self.providers[0].get_context_window() if self.providers else 0
         return used, limit
 

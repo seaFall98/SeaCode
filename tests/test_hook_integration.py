@@ -453,13 +453,13 @@ def test_seacode_app_default_hook_engine_is_none() -> None:
     assert app._hook_engine is None
 
 
-# 验证 SeaCodeApp._run_turn 把 _hook_engine 传给 Agent 构造参数。
-# _run_turn 强依赖 TUI 控件无法直接运行，改用源码检查确认注入链完整。
-def test_seacode_app_run_turn_passes_hook_engine_to_agent() -> None:
+# 验证 SeaCodeApp 在长期 Agent 初始化路径把 _hook_engine 传给 Agent 构造参数。
+# Agent 已从每轮 _run_turn 提前到 Provider/session runtime，改检查新的初始化边界。
+def test_seacode_app_initializes_agent_with_hook_engine() -> None:
     import inspect
 
     from seacode.app import SeaCodeApp
 
-    source = inspect.getsource(SeaCodeApp._run_turn)
+    source = inspect.getsource(SeaCodeApp._initialize_agent)
     # 构造 Agent 时传入 hook_engine=self._hook_engine。
     assert "hook_engine=self._hook_engine" in source
