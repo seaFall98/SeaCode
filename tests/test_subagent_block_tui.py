@@ -181,7 +181,6 @@ async def test_subagent_block_set_result_expanded_shows_preview() -> None:
         from seacode.app import SubAgentBlock
 
         block = app.query_one(SubAgentBlock)
-        block._expanded = False
         block._loading = False
         block.set_result(
             output="result preview text here", is_error=False, elapsed=2.0
@@ -538,6 +537,7 @@ async def test_app_process_notifications_injects_notification() -> None:
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
     async with app.run_test() as pilot:
         await _settle(pilot)
+        assert app.task_manager is not None
         # 手动插入一个已完成的后台任务到 notify_queue。
         bg = BackgroundTask(
             id="abc12345",
@@ -547,7 +547,7 @@ async def test_app_process_notifications_injects_notification() -> None:
             status="completed",
             result="done",
         )
-        app.task_manager._tasks["abc12345"] = bg  # type: ignore[assignment]
+        app.task_manager._tasks["abc12345"] = bg
         app.task_manager._notify_queue.put_nowait("abc12345")
         # 记录注入前的消息数。
         before = len(app._conversation.messages)

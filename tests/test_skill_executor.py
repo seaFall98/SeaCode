@@ -288,7 +288,9 @@ async def test_execute_fork_substitutes_arguments() -> None:
     executor = SkillExecutor(agent)
     with patch("seacode.agent.Agent", side_effect=_FakeForkAgent):
         await executor.execute_fork(skill, "fix typo")
-    fork_conv = _FakeForkAgent.last.run_conversation
+    fork_agent = _FakeForkAgent.last
+    assert fork_agent is not None
+    fork_conv = fork_agent.run_conversation
     last_msg = fork_conv.get_messages()[-1]
     assert "fix typo" in last_msg.content
     assert "$ARGUMENTS" not in last_msg.content
@@ -312,7 +314,9 @@ async def test_execute_fork_subagent_constructor_kwargs() -> None:
     executor = SkillExecutor(agent)
     with patch("seacode.agent.Agent", side_effect=_FakeForkAgent):
         await executor.execute_fork(skill, "args")
-    kwargs = _FakeForkAgent.last.kwargs
+    fork_agent = _FakeForkAgent.last
+    assert fork_agent is not None
+    kwargs = fork_agent.kwargs
     assert kwargs["client"] is main_client
     assert kwargs["registry"] is main_registry
     assert kwargs["protocol"] == "openai"
@@ -321,7 +325,7 @@ async def test_execute_fork_subagent_constructor_kwargs() -> None:
     assert kwargs["context_window"] == 128_000
     assert kwargs["permission_checker"] is None
     # 真实 Agent 构造时不传 skill_catalog，默认值为空字符串。
-    assert _FakeForkAgent.last.skill_catalog == ""
+    assert fork_agent.skill_catalog == ""
 
 
 # 验证 execute_fork 收集 StreamText 事件并拼接。

@@ -287,22 +287,17 @@ async def test_worktree_failure_degrades_gracefully(
 
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
 
-    # 在 _assemble_worktree_system 中注入失败：替换 WorktreeManager 构造抛异常。
-    original_assemble = app._assemble_worktree_system
-
     def _failing_assemble(work_dir: str) -> None:
+        del work_dir
         try:
             raise RuntimeError("simulated worktree init failure")
         except Exception:
             app.worktree_manager = None
 
-    app._assemble_worktree_system = _failing_assemble  # type: ignore[assignment]
+    monkeypatch.setattr(app, "_assemble_worktree_system", _failing_assemble)
 
     async with app.run_test() as pilot:
         await _settle(pilot)
         # worktree_manager 降级为 None，但主流程应仍可进入 Ready。
         assert app.worktree_manager is None
         assert "Ready" in str(app.query_one("#turn-status", Static).render())
-
-    # 恢复原始方法避免影响其他测试。
-    app._assemble_worktree_system = original_assemble  # type: ignore[assignment]

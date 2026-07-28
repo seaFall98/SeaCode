@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime
 from unittest.mock import AsyncMock
 
+import pytest
+
 from seacode.commands.handlers.worktree import create_worktree_command
 from seacode.commands.registry import Command, CommandContext
 from seacode.permissions import PermissionMode
@@ -138,9 +140,13 @@ async def test_create_failure_shows_error() -> None:
 
 # 验证 /worktree list 列出 active worktrees 并标记当前。
 # mock list_worktrees 返回两个 worktree，current_session 返回其中一个，断言输出含 "(current)"。
-async def test_list_marks_current_worktree() -> None:
+async def test_list_marks_current_worktree(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WorktreeManager("/repo")
-    manager.list_worktrees = lambda: [_make_worktree("feat-a"), _make_worktree("feat-b")]  # type: ignore[assignment]
+    monkeypatch.setattr(
+        manager,
+        "list_worktrees",
+        lambda: [_make_worktree("feat-a"), _make_worktree("feat-b")],
+    )
     manager.current_session = _make_session("feat-a")
     cmd, ctx, ui = _make_command_and_ctx(manager, "list")
 
@@ -154,9 +160,9 @@ async def test_list_marks_current_worktree() -> None:
 
 # 验证 /worktree list 无 active worktree 时提示。
 # mock list_worktrees 返回空列表，断言 ui.messages 含 "无 active worktree"。
-async def test_list_empty_shows_message() -> None:
+async def test_list_empty_shows_message(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WorktreeManager("/repo")
-    manager.list_worktrees = lambda: []  # type: ignore[assignment]
+    monkeypatch.setattr(manager, "list_worktrees", lambda: [])
     cmd, ctx, ui = _make_command_and_ctx(manager, "list")
 
     await cmd.handler(ctx)

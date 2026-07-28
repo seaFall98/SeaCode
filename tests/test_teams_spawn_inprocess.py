@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -57,7 +58,7 @@ def test_create_idle_notification() -> None:
 
 # 验证 _inject_pending_messages 在邮箱有未读时注入 system-reminder，无未读时不注入。
 # 写两条消息后调用 _inject_pending_messages 验证 add_system_reminder 调用；空邮箱时不调用。
-def test_inject_pending_messages(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_inject_pending_messages(tmp_path: Path) -> None:
     mailbox = Mailbox(tmp_path / "mb")
     conv = MagicMock()
     # 空邮箱：不调用 add_system_reminder。
@@ -136,7 +137,7 @@ async def test_spawn_inprocess_no_mailbox_single_run(monkeypatch: pytest.MonkeyP
 # 使用真实 TeamManager 注册成员，断言完成后 is_active 为 False 且邮箱有 idle 消息。
 @pytest.mark.asyncio
 async def test_spawn_inprocess_completion_marks_registered_member_idle(
-    tmp_path, monkeypatch: pytest.MonkeyPatch  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     manager = TeamManager()
@@ -164,7 +165,9 @@ async def test_spawn_inprocess_completion_marks_registered_member_idle(
 
     team = manager.get_team("demo")
     assert team is not None
-    assert team.get_member("alice").is_active is False
+    member = team.get_member("alice")
+    assert member is not None
+    assert member.is_active is False
     messages = manager.get_mailbox("demo").read("lead-1")
     assert any("[idle]" in message.content for message in messages)
 

@@ -184,7 +184,9 @@ async def test_set_member_idle_writes_notification(
     # 成员 is_active 应为 False。
     team = mgr.get_team("demo")
     assert team is not None
-    assert team.get_member("alice").is_active is False
+    stored_member = team.get_member("alice")
+    assert stored_member is not None
+    assert stored_member.is_active is False
 
 
 # 验证 register_inprocess_handle / register_pane_id / get_pane_id 存取。
@@ -227,7 +229,9 @@ async def test_register_inprocess_handle_attaches_progress(
 
     team = mgr.get_team("demo")
     assert team is not None
-    assert team.get_member("alice").progress is fake_progress
+    stored_member = team.get_member("alice")
+    assert stored_member is not None
+    assert stored_member.progress is fake_progress
 
 
 # 验证 delete_team 活跃成员存在时抛 TeamError。
@@ -392,7 +396,9 @@ async def test_on_teammate_completed(
     mgr.on_teammate_completed("demo", "alice")
     team = mgr.get_team("demo")
     assert team is not None
-    assert team.get_member("alice").is_active is False
+    stored_member = team.get_member("alice")
+    assert stored_member is not None
+    assert stored_member.is_active is False
 
 
 # 验证 _cleanup_worktree 在 git 失败时回退 shutil.rmtree。

@@ -45,7 +45,7 @@ def _make_ctx(
 ) -> CommandContext:
     return CommandContext(
         args="",
-        agent=agent,  # type: ignore[arg-type]
+        agent=agent,
         conversation=None,
         session=None,
         session_manager=None,
@@ -80,7 +80,7 @@ def _seed_node(
         start_time=start_time if start_time is not None else time.time(),
         end_time=end_time,
     )
-    trm._nodes[agent_id] = node  # type: ignore[assignment]
+    trm._nodes[agent_id] = node
     return node
 
 

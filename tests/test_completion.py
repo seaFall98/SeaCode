@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
+from textual import events
 from textual.app import App, ComposeResult
 from textual.pilot import Pilot
 
@@ -37,7 +39,8 @@ async def popup_pilot():
 
 # 取出已挂载的弹窗实例，断言非空后返回以便调用方法。
 def _popup(pilot: Pilot) -> CompletionPopup:
-    popup = pilot.app.popup
+    app = cast(_PopupApp, pilot.app)
+    popup = app.popup
     assert popup is not None
     return popup
 
@@ -163,10 +166,10 @@ async def test_is_visible_defaults_false(popup_pilot: Pilot) -> None:
 # show_pairs 后模拟点击第二行，断言捕获到 Selected(value="b") 且弹窗隐藏。
 async def test_on_click_emits_selected_message(popup_pilot: Pilot) -> None:
     popup = _popup(popup_pilot)
-    app = popup_pilot.app
+    app = cast(_PopupApp, popup_pilot.app)
     popup.show_pairs([("a", "a"), ("b", "b")])
     # on_click 仅读取 event.y，用 SimpleNamespace 模拟点击事件避免构造完整 Click。
-    popup.on_click(SimpleNamespace(y=1))
+    popup.on_click(cast(events.Click, SimpleNamespace(y=1)))
     await popup_pilot.pause()
     assert app.selected == ["b"]
     assert popup.is_visible is False

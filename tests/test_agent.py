@@ -96,9 +96,9 @@ class _StrictTool(Tool):
 # 按回合返回预设事件序列或抛出异常的假客户端，不连接真实 Provider。
 class _FakeClient(LLMClient):
     def __init__(
-        self, outcomes: list[list[StreamEvent] | Exception]
+        self, outcomes: Sequence[Sequence[StreamEvent] | Exception]
     ) -> None:
-        self._outcomes = outcomes
+        self._outcomes: list[Sequence[StreamEvent] | Exception] = list(outcomes)
         self.requests: list[tuple[Message, ...]] = []
         self.tools_passed: list[list[dict[str, Any]] | None] = []
         self.systems_passed: list[str] = []
@@ -971,7 +971,7 @@ class _MockWriteFile(Tool):
     category = ToolCategory.WRITE
 
     async def execute(self, params: BaseModel) -> ToolResult:
-        return ToolResult(content=f"wrote {params.file_path}")
+        return ToolResult(content=f"wrote {getattr(params, 'file_path', '')}")
 
 
 # 权限测试专用的 Bash 工具 Mock，参数模型含 command 以通过校验。
@@ -987,7 +987,7 @@ class _MockBash(Tool):
     category = ToolCategory.SYSTEM
 
     async def execute(self, params: BaseModel) -> ToolResult:
-        return ToolResult(content=f"ran {params.command}")
+        return ToolResult(content=f"ran {getattr(params, 'command', '')}")
 
 
 # 构造含 detector / sandbox / rule_engine 的 PermissionChecker，供权限测试复用。

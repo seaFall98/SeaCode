@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from textual.widgets import Static
 
-from seacode.app import SeaCodeApp
+from seacode.app import ChatInput, SeaCodeApp
 from seacode.client import (
     LLMClient,
     StreamComplete,
@@ -19,6 +19,9 @@ from seacode.config import ProviderConfig
 from seacode.teammate_tree import TeammateTree
 from seacode.teams.manager import TeamManager
 from seacode.teams.progress import TeammateProgress
+from seacode.tools.send_message import SendMessageTool
+from seacode.tools.team_create import TeamCreateTool
+from seacode.tools.team_delete import TeamDeleteTool
 
 # ---------------------------------------------------------------------------
 # 测试辅助 fake 类
@@ -159,7 +162,7 @@ async def test_run_turn_injects_team_manager_and_notification_fn() -> None:
 
     async with app.run_test() as pilot:
         await _settle(pilot)
-        input_widget = app.query_one("#chat-input")
+        input_widget = app.query_one(ChatInput)
         input_widget.load_text("Hi")
         await pilot.press("enter")
         await _settle(pilot)
@@ -186,7 +189,7 @@ async def test_run_turn_updates_team_tools_parent_agent() -> None:
 
     async with app.run_test() as pilot:
         await _settle(pilot)
-        input_widget = app.query_one("#chat-input")
+        input_widget = app.query_one(ChatInput)
         input_widget.load_text("Hi")
         await pilot.press("enter")
         await _settle(pilot)
@@ -200,6 +203,9 @@ async def test_run_turn_updates_team_tools_parent_agent() -> None:
         assert team_create is not None
         assert team_delete is not None
         assert send_message is not None
+        assert isinstance(team_create, TeamCreateTool)
+        assert isinstance(team_delete, TeamDeleteTool)
+        assert isinstance(send_message, SendMessageTool)
         assert team_create._parent_agent is agent
         assert team_delete._parent_agent is agent
         # SendMessageTool 不再有 _parent_agent；占位实例的 from_agent_id 为空字符串。
@@ -214,7 +220,9 @@ async def test_run_turn_updates_team_tools_parent_agent() -> None:
 # 验证 _refresh_teammate_tree 检测到非空 progress 时显示 widget。
 # mock team_manager.get_all_teammate_progress 返回非空列表，调用 _refresh 逻辑。
 @pytest.mark.asyncio
-async def test_refresh_teammate_tree_shows_widget_when_teammates_exist() -> None:
+async def test_refresh_teammate_tree_shows_widget_when_teammates_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _FakeClient([[StreamComplete()]])
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
 
@@ -222,34 +230,44 @@ async def test_refresh_teammate_tree_shows_widget_when_teammates_exist() -> None
         await _settle(pilot)
         # mock get_all_teammate_progress 返回非空列表。
         progress = TeammateProgress(name="alice", team_name="demo", status="running")
-        app.team_manager.get_all_teammate_progress = lambda: [progress]
+        manager = app.team_manager
+        tree = app.teammate_tree
+        assert manager is not None
+        assert tree is not None
+        monkeypatch.setattr(manager, "get_all_teammate_progress", lambda: [progress])
         # 手动触发一次刷新逻辑（不等待 1 秒 sleep）。
-        app.teammate_tree.teammates = app.team_manager.get_all_teammate_progress()
-        app.teammate_tree.leader_tokens = 100
-        app.teammate_tree.display = bool(app.teammate_tree.teammates)
+        tree.teammates = manager.get_all_teammate_progress()
+        tree.leader_tokens = 100
+        tree.display = bool(tree.teammates)
         await _settle(pilot)
 
-        assert app.teammate_tree.display is True
-        assert len(app.teammate_tree.teammates) == 1
-        assert app.teammate_tree.teammates[0].name == "alice"
+        assert tree.display is True
+        assert len(tree.teammates) == 1
+        assert tree.teammates[0].name == "alice"
 
 
 # 验证 _refresh_teammate_tree 检测到空 progress 时隐藏 widget。
 # mock team_manager.get_all_teammate_progress 返回空列表，widget 应隐藏。
 @pytest.mark.asyncio
-async def test_refresh_teammate_tree_hides_widget_when_no_teammates() -> None:
+async def test_refresh_teammate_tree_hides_widget_when_no_teammates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = _FakeClient([[StreamComplete()]])
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
 
     async with app.run_test() as pilot:
         await _settle(pilot)
-        app.team_manager.get_all_teammate_progress = lambda: []
-        app.teammate_tree.teammates = app.team_manager.get_all_teammate_progress()
-        app.teammate_tree.display = bool(app.teammate_tree.teammates)
+        manager = app.team_manager
+        tree = app.teammate_tree
+        assert manager is not None
+        assert tree is not None
+        monkeypatch.setattr(manager, "get_all_teammate_progress", lambda: [])
+        tree.teammates = manager.get_all_teammate_progress()
+        tree.display = bool(tree.teammates)
         await _settle(pilot)
 
-        assert app.teammate_tree.display is False
-        assert len(app.teammate_tree.teammates) == 0
+        assert tree.display is False
+        assert len(tree.teammates) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +307,7 @@ async def test_app_works_without_team_config() -> None:
 
     async with app.run_test() as pilot:
         await _settle(pilot)
-        input_widget = app.query_one("#chat-input")
+        input_widget = app.query_one(ChatInput)
         input_widget.load_text("Hi")
         await pilot.press("enter")
         await _settle(pilot)

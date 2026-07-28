@@ -74,7 +74,7 @@ def _seed_task(
         start_time=start_time if start_time is not None else time.time(),
         end_time=end_time,
     )
-    tm._tasks[task_id] = bg  # type: ignore[assignment]
+    tm._tasks[task_id] = bg
     return bg
 
 

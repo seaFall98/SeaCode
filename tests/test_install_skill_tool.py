@@ -176,7 +176,7 @@ async def test_install_skill_loader_missing_user_dir_returns_error() -> None:
             self.reload_calls += 1
 
     tool = InstallSkill()
-    tool.set_loader(_LoaderWithoutUserDir())  # type: ignore[arg-type]
+    tool.set_loader(_LoaderWithoutUserDir())
 
     fake_install = AsyncMock()
     with _patch_install_skill(fake_install):

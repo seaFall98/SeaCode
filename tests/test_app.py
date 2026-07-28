@@ -45,8 +45,13 @@ from seacode.tools.base import Tool, ToolCategory, ToolResult
 # 提供可按回合返回事件或抛出错误的本地假客户端。
 class _FakeClient(LLMClient):
     # 保存每个测试回合的预设结果。
-    def __init__(self, outcomes: list[list[StreamEvent] | Exception | _PartialFailure]) -> None:
-        self._outcomes = outcomes
+    def __init__(
+        self,
+        outcomes: Sequence[Sequence[StreamEvent] | Exception | _PartialFailure],
+    ) -> None:
+        self._outcomes: list[
+            Sequence[StreamEvent] | Exception | _PartialFailure
+        ] = list(outcomes)
         self.requests: list[tuple[Message, ...]] = []
 
     # 记录请求历史并交付预设事件，不连接真实 Provider。
@@ -618,7 +623,7 @@ class _MockPermWriteFile(Tool):
     category = ToolCategory.WRITE
 
     async def execute(self, params: BaseModel) -> ToolResult:
-        return ToolResult(content=f"wrote {params.file_path}")
+        return ToolResult(content=f"wrote {getattr(params, 'file_path', '')}")
 
 
 # 构造单次 WriteFile 工具调用流 + 文本回复流，供权限对话框测试复用。
