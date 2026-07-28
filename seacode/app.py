@@ -2232,7 +2232,7 @@ class SeaCodeApp(App[None]):
     # batch12：取消后台任务通知轮询协程，避免退出后仍尝试访问已关闭的对话历史。
     # batch13：取消 stale worktree 清理 task 与 restore_session task，避免退出后残留。
     # batch14：取消 TeammateTree 周期刷新 task，避免退出后仍访问已销毁的 widget。
-    def on_unmount(self) -> None:
+    async def on_unmount(self) -> None:
         if self._notification_polling_task is not None:
             self._notification_polling_task.cancel()
             self._notification_polling_task = None
@@ -2251,6 +2251,13 @@ class SeaCodeApp(App[None]):
             except RuntimeError:
                 # 事件循环已关闭时静默跳过；shutdown Hook 仍可在循环关闭前执行。
                 pass
+        if self._mcp_manager is not None:
+            manager = self._mcp_manager
+            self._mcp_manager = None
+            try:
+                await manager.shutdown()
+            except Exception:
+                log.debug("Error shutting down MCP manager", exc_info=True)
         if self._session is not None:
             self._session.close()
 

@@ -53,6 +53,16 @@ class _Agent:
         return None
 
 
+# 验证远程服务也能在退出时释放 MCP manager，避免只修复 TUI 生命周期。
+# 使用最小假 manager 锁定 shutdown 调用和引用清理，不启动真实 WebSocket 服务。
+class _ShutdownMCPManager:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
 # 验证根路径返回 SeaCode 页面，非 WebSocket 的其它路径返回 404。
 # 直接调用 HTTP 回调，避免绑定真实端口造成测试并发冲突。
 def test_http_routes_return_page_and_not_found() -> None:
@@ -76,6 +86,20 @@ def test_remote_page_contains_brand_and_command_scrolling() -> None:
     assert "SeaCode Remote" in INDEX_HTML
     assert "scrollIntoView" in INDEX_HTML
     assert "permission_response" in INDEX_HTML
+
+
+# 验证远程服务关闭 MCP manager 后清空引用，下一次生命周期不会复用旧连接。
+# 直接调用关闭边界，避免测试依赖真实 MCP 子进程或监听端口。
+@pytest.mark.asyncio
+async def test_remote_shutdown_closes_mcp_manager() -> None:
+    server = RemoteServer([])
+    manager = _ShutdownMCPManager()
+    server.mcp_manager = manager  # type: ignore[assignment]
+
+    await server._shutdown_mcp()
+
+    assert manager.shutdown_calls == 1
+    assert server.mcp_manager is None
 
 
 # 验证真实监听端口同时提供 HTTP 页面、404 与 WebSocket 握手。

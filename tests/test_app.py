@@ -123,12 +123,16 @@ class _SessionMCPManager:
         )
         self.is_initialized = False
         self.register_calls = 0
+        self.shutdown_calls = 0
 
     async def register_all_tools(self, registry: Any) -> Any:
         del registry
         self.register_calls += 1
         self.is_initialized = True
         return self._result
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
 
 
 # 模拟完成计划、请求审批与后续执行的两段模型响应。
@@ -868,6 +872,7 @@ async def test_consecutive_turns_reuse_mcp_initialization() -> None:
         await _wait_done(app, pilot)
 
     assert manager.register_calls == 1
+    assert manager.shutdown_calls == 1
     assert len(client.requests) == 2
     instruction_count = sum(
         message.content.count("Use the project docs first.")

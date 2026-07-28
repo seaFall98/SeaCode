@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -88,6 +89,22 @@ def _make_failing_transport_factory(error: Exception) -> Any:
     return _cm
 
 
+# 记录 stdio transport 的进入与退出任务，验证退出必须回到创建它的 owner task。
+# 使用真实 AsyncExitStack 调用路径，避免只测试 close 不抛异常而漏掉子进程清理问题。
+class _TaskTrackingTransport:
+    def __init__(self) -> None:
+        self.entered_task: asyncio.Task[Any] | None = None
+        self.exited_task: asyncio.Task[Any] | None = None
+
+    async def __aenter__(self) -> tuple[Any, Any]:
+        self.entered_task = asyncio.current_task()
+        return (None, None)
+
+    async def __aexit__(self, *args: Any) -> None:
+        del args
+        self.exited_task = asyncio.current_task()
+
+
 # ---------------------------------------------------------------------------
 # is_stdio / is_http 配置判断
 # ---------------------------------------------------------------------------
@@ -127,6 +144,7 @@ async def test_stdio_connect_sets_alive_and_instructions() -> None:
 
     assert client.is_alive is True
     assert client.instructions == "Filesystem MCP server"
+    await client.close()
 
 
 # 验证 HTTP connect 成功后 is_alive=True。
@@ -156,6 +174,7 @@ async def test_http_connect_sets_alive() -> None:
         await client.connect()
 
     assert client.is_alive is True
+    await client.close()
 
 
 # 验证已存活的 client 重复 connect 不重复握手。
@@ -215,6 +234,7 @@ async def test_list_tools_returns_session_tools() -> None:
         await client.connect()
 
         result = await client.list_tools()
+        await client.close()
 
     assert len(result) == 1
     assert result[0].name == "read"
@@ -240,6 +260,7 @@ async def test_call_tool_forwards_to_session() -> None:
         await client.connect()
 
         result = await client.call_tool("search", {"query": "test"})
+        await client.close()
 
     assert result.isError is False
     assert isinstance(result.content[0], mcp_types.TextContent)
@@ -278,6 +299,29 @@ async def test_close_safe_when_not_connected() -> None:
     client = MCPClient(_stdio_config())
     await client.close()
     assert client.is_alive is False
+
+
+# 验证跨任务关闭时仍由创建 transport 的 owner task 执行退出。
+# 该不变式防止 AnyIO cancel scope 在事件循环关闭阶段才被动清理。
+@pytest.mark.asyncio
+async def test_close_exits_transport_in_owner_task() -> None:
+    client = MCPClient(_stdio_config())
+    transport = _TaskTrackingTransport()
+    session = _FakeSession()
+
+    with (
+        patch("seacode.mcp.client.stdio_client", return_value=transport),
+        patch(
+            "seacode.mcp.client.ClientSession",
+            side_effect=_make_session_factory(session),
+        ),
+    ):
+        await client.connect()
+        owner_task = transport.entered_task
+        await asyncio.create_task(client.close())
+
+    assert owner_task is not None
+    assert transport.exited_task is owner_task
 
 
 # ---------------------------------------------------------------------------

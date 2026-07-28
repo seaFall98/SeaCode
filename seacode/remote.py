@@ -94,16 +94,19 @@ class RemoteServer:
     async def run(self) -> None:
         """初始化运行时并开始提供 HTTP 与 WebSocket 服务。"""
         self._init_agent()
-        await self._init_mcp()
-        print(f"\n  SeaCode Remote: http://localhost:{self.port}\n")
-        async with websockets.serve(
-            self._ws_handler,
-            self.addr,
-            self.port,
-            process_request=self._handle_http_request,
-            max_size=4 * 1024 * 1024,
-        ):
-            await asyncio.Future()
+        try:
+            await self._init_mcp()
+            print(f"\n  SeaCode Remote: http://localhost:{self.port}\n")
+            async with websockets.serve(
+                self._ws_handler,
+                self.addr,
+                self.port,
+                process_request=self._handle_http_request,
+                max_size=4 * 1024 * 1024,
+            ):
+                await asyncio.Future()
+        finally:
+            await self._shutdown_mcp()
 
     def _handle_http_request(
         self, connection: ServerConnection, request: Request
@@ -247,6 +250,13 @@ class RemoteServer:
             "their tools and resources:\n\n"
             + "\n\n".join(sections)
         )
+
+    async def _shutdown_mcp(self) -> None:
+        manager = self.mcp_manager
+        if manager is None:
+            return
+        self.mcp_manager = None
+        await manager.shutdown()
 
     async def _handle_user_message(self, content: str) -> None:
         if self._streaming:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import AsyncExitStack
@@ -33,6 +34,10 @@ class MCPClient:
         self._alive = False
         # 保存 InitializeResult，用于提取 instructions 等服务器元信息。
         self._init_result: types.InitializeResult | None = None
+        self._lifecycle_task: asyncio.Task[None] | None = None
+        self._connected_event: asyncio.Event | None = None
+        self._close_event: asyncio.Event | None = None
+        self._connect_error: BaseException | None = None
 
     # 返回连接是否存活；wrapper 据此决定是否触发重连。
     @property
@@ -51,10 +56,50 @@ class MCPClient:
         if self._alive:
             return
 
-        self._stack = AsyncExitStack()
-        await self._stack.__aenter__()
+        while True:
+            lifecycle_task = self._lifecycle_task
+            if lifecycle_task is None:
+                self._connected_event = asyncio.Event()
+                self._close_event = asyncio.Event()
+                self._connect_error = None
+                self._init_result = None
+                self._lifecycle_task = asyncio.create_task(
+                    self._run_lifecycle(),
+                    name=f"mcp-lifecycle-{self.name}",
+                )
+                continue
 
+            # 重连时先等待上一个 owner task 释放资源栈。
+            if self._close_event is not None and self._close_event.is_set():
+                try:
+                    await lifecycle_task
+                except asyncio.CancelledError:
+                    pass
+                self._lifecycle_task = None
+                continue
+
+            connected_event = self._connected_event
+            assert connected_event is not None
+            await connected_event.wait()
+            error = self._connect_error
+            if error is not None:
+                try:
+                    await lifecycle_task
+                except asyncio.CancelledError:
+                    pass
+                if isinstance(error, asyncio.CancelledError):
+                    raise error
+                if isinstance(error, Exception):
+                    raise error
+                raise RuntimeError("MCP lifecycle task failed") from error
+            return
+
+    async def _run_lifecycle(self) -> None:
+        """让同一个任务持有并退出 transport，满足 AnyIO cancel scope 约束。"""
+        self._stack = AsyncExitStack()
         try:
+            await self._stack.__aenter__()
+
             if self.config.is_stdio:
                 read, write = await self._connect_stdio()
             else:
@@ -68,10 +113,21 @@ class MCPClient:
             self._session = session
             self._alive = True
             logger.info("MCP server '%s' connected", self.name)
-        except Exception:
-            # 握手失败时释放已压栈资源，避免句柄泄露。
-            await self._cleanup_stack()
+            assert self._connected_event is not None
+            self._connected_event.set()
+            assert self._close_event is not None
+            await self._close_event.wait()
+        except asyncio.CancelledError as error:
+            self._connect_error = error
             raise
+        except Exception as error:
+            self._connect_error = error
+        finally:
+            if self._connected_event is not None:
+                self._connected_event.set()
+            self._alive = False
+            self._session = None
+            await self._cleanup_stack()
 
     # stdio 传输：启动子进程并通过 stdin/stdout 通信，stderr 重定向 devnull 防缓冲阻塞。
     async def _connect_stdio(self) -> tuple[Any, Any]:
@@ -126,11 +182,34 @@ class MCPClient:
         assert self._session is not None
         return await self._session.call_tool(name, arguments)
 
-    # 关闭连接：先置存活标记为 False，再释放资源栈。
+    # 关闭连接：通知 owner task 退出，再等待它释放资源栈。
     async def close(self) -> None:
-        self._alive = False
-        self._session = None
-        await self._cleanup_stack()
+        lifecycle_task = self._lifecycle_task
+        if lifecycle_task is None:
+            self._alive = False
+            self._session = None
+            await self._cleanup_stack()
+            return
+
+        if self._close_event is not None:
+            self._close_event.set()
+        if (
+            self._connected_event is not None
+            and not self._connected_event.is_set()
+            and not lifecycle_task.done()
+        ):
+            lifecycle_task.cancel()
+
+        if lifecycle_task is not asyncio.current_task():
+            try:
+                await lifecycle_task
+            except asyncio.CancelledError:
+                pass
+
+        self._lifecycle_task = None
+        self._connected_event = None
+        self._close_event = None
+        self._connect_error = None
 
     # 释放 AsyncExitStack；容忍 cancel scope 清理期常见的 RuntimeError。
     async def _cleanup_stack(self) -> None:
