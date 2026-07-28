@@ -20,6 +20,7 @@ from seacode.agent import (
     ToolResultEvent,
     ToolUseEvent,
 )
+from seacode.commands.registry import Command, CommandContext, CommandType
 from seacode.mcp.manager import MCPManager
 from seacode.remote import RemoteServer
 from seacode.web_content import INDEX_HTML
@@ -209,6 +210,35 @@ async def test_remote_terminal_ui_command_reports_not_supported() -> None:
 
     assert browser.sent[-1]["type"] == "command_done"
     assert "not fully supported" in browser.sent[-2]["data"]["message"]
+
+
+# 验证远程分发器不会因 argument hint 拦截无参数命令。
+# 测试与 TUI 共用同一 Command 契约，确保两条入口都能进入 handler。
+@pytest.mark.asyncio
+async def test_remote_command_with_argument_hint_allows_empty_args() -> None:
+    server = RemoteServer([])
+    browser = _Browser()
+    server._connections.add(browser)  # type: ignore[arg-type]
+    called: list[str] = []
+
+    async def handler(ctx: CommandContext) -> None:
+        called.append(ctx.args)
+
+    server.command_registry.register_sync(
+        Command(
+            name="optional",
+            description="optional arguments",
+            type=CommandType.LOCAL,
+            handler=handler,
+            usage="/optional [value]",
+            arg_prompt="value",
+        )
+    )
+
+    await server._handle_command("/optional")
+
+    assert called == [""]
+    assert browser.sent[-1]["type"] == "command_done"
 
 
 # 验证取消信号会结束当前循环并向网页发送结束事件。

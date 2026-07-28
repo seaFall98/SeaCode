@@ -1405,11 +1405,8 @@ class SeaCodeApp(App[None]):
                 f"未知命令：{name}，输入 /help 查看可用命令"
             )
             return True
-        if cmd.arg_prompt and not args.strip():
-            await self._show_system_message(
-                f"参数不足：{cmd.arg_prompt}\n用法：{cmd.usage}"
-            )
-            return True
+        # arg_prompt 是 /help 的参数提示，不代表参数必填；具体的子命令和
+        # 参数校验由 handler 负责，保证无参数的 list/status/help 路径可达。
         ctx = self._build_command_context(args)
         try:
             await cmd.handler(ctx)

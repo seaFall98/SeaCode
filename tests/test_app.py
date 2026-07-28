@@ -1324,6 +1324,37 @@ async def test_dispatch_session_without_args_shows_current_details(
         assert "参数不足" not in text
 
 
+# 验证带 argument hint 的命令无参数时仍会进入 handler。
+# 测试锁定 arg_prompt 仅用于帮助展示，不能被分发器当作必填参数门禁。
+@pytest.mark.asyncio
+async def test_dispatch_command_with_argument_hint_allows_empty_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    called: list[str] = []
+
+    async def handler(ctx: CommandContext) -> None:
+        called.append(ctx.args)
+
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    app._command_registry.register_sync(
+        Command(
+            name="optional",
+            description="optional arguments",
+            type=CommandType.LOCAL,
+            handler=handler,
+            usage="/optional [value]",
+            arg_prompt="value",
+        )
+    )
+
+    async with app.run_test():
+        assert await app._dispatch_command("/optional") is True
+
+    assert called == [""]
+
+
 # 验证 _dispatch_command 对非斜杠输入返回 False 不走命令路径。
 # 测试设计为直接调用 _dispatch_command("hello")，断言返回 False。
 @pytest.mark.asyncio
