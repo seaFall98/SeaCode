@@ -12,6 +12,7 @@ from seacode.commands.registry import (
     CommandRegistry,
     CommandType,
 )
+from seacode.permissions import PermissionMode
 
 
 # 空实现 handler，仅用于构造 Command 实例，不执行任何业务逻辑。
@@ -19,7 +20,7 @@ async def _noop_handler(ctx: CommandContext) -> None:
     del ctx
 
 
-# 不继承 UIController 但实现其全部五个方法的鸭子类型，验证 Protocol 不强制继承。
+# 不继承 UIController 但实现其全部六个方法的鸭子类型，验证 Protocol 不强制继承。
 class _DuckUI:
     def add_system_message(self, text: str) -> None:
         del text
@@ -29,6 +30,9 @@ class _DuckUI:
 
     def set_plan_mode(self, enabled: bool) -> None:
         del enabled
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        del mode
 
     def get_token_count(self) -> tuple[int, int]:
         return (0, 0)

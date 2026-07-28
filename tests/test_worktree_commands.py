@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 from seacode.commands.handlers.worktree import create_worktree_command
 from seacode.commands.registry import Command, CommandContext
+from seacode.permissions import PermissionMode
 from seacode.worktree.manager import WorktreeError, WorktreeManager
 from seacode.worktree.models import Worktree, WorktreeSession
 
@@ -25,6 +26,9 @@ class _FakeUI:
 
     def set_plan_mode(self, enabled: bool) -> None:
         pass
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        del mode
 
     def get_token_count(self) -> tuple[int, int]:
         return 0, 0

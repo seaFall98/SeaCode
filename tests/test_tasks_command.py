@@ -12,6 +12,7 @@ from seacode.commands.handlers.tasks import (
     create_tasks_handler,
 )
 from seacode.commands.registry import CommandContext
+from seacode.permissions import PermissionMode
 
 
 # 实现 UIController 协议的假对象：记录 add_system_message 调用供断言。
@@ -27,6 +28,9 @@ class _FakeUI:
 
     def set_plan_mode(self, enabled: bool) -> None:
         del enabled
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        del mode
 
     def get_token_count(self) -> tuple[int, int]:
         return (0, 0)

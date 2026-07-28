@@ -16,6 +16,7 @@ from seacode.commands.handlers.skill_register import (
     register_skill_commands,
 )
 from seacode.commands.registry import Command, CommandContext, CommandRegistry, CommandType
+from seacode.permissions import PermissionMode
 from seacode.skills.parser import SkillDef
 
 
@@ -33,6 +34,9 @@ class _FakeUI:
 
     def set_plan_mode(self, enabled: bool) -> None:
         pass
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        del mode
 
     def get_token_count(self) -> tuple[int, int]:
         return (0, 100000)

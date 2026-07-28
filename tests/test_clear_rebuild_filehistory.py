@@ -9,6 +9,7 @@ import pytest
 from seacode.commands.handlers.clear import handle_clear
 from seacode.commands.registry import CommandContext
 from seacode.filehistory.history import FileHistory
+from seacode.permissions import PermissionMode
 
 # ---------------------------------------------------------------------------
 # 测试辅助 fake 类
@@ -23,6 +24,18 @@ class _FakeUI:
 
     def add_system_message(self, text: str) -> None:
         self.system_messages.append(text)
+
+    def send_user_message(self, text: str) -> None:
+        del text
+
+    def set_plan_mode(self, enabled: bool) -> None:
+        del enabled
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        del mode
+
+    def get_token_count(self) -> tuple[int, int]:
+        return (0, 0)
 
     def refresh_status(self) -> None:
         self.refresh_calls += 1

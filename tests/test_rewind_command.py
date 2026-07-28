@@ -8,6 +8,7 @@ from typing import Any
 from seacode.commands.handlers.rewind import REWIND_COMMAND
 from seacode.commands.registry import CommandContext
 from seacode.filehistory.history import Backup, Snapshot
+from seacode.permissions import PermissionMode
 
 
 # 假 UI：收集 add_system_message 调用的文本。
@@ -23,6 +24,9 @@ class _FakeUI:
 
     def set_plan_mode(self, enabled: bool) -> None:
         pass
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        del mode
 
     def get_token_count(self) -> tuple[int, int]:
         return 0, 0
