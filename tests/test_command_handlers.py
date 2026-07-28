@@ -8,6 +8,9 @@ from typing import Any
 
 import pytest
 
+from seacode import __version__
+from seacode.agent import Agent
+from seacode.client import OpenAICompatClient
 from seacode.commands.handlers import register_all_commands
 from seacode.commands.handlers.clear import handle_clear
 from seacode.commands.handlers.compact import handle_compact
@@ -21,7 +24,13 @@ from seacode.commands.handlers.sandbox import handle_sandbox
 from seacode.commands.handlers.session import handle_session
 from seacode.commands.handlers.status import handle_status
 from seacode.commands.registry import CommandContext, CommandRegistry
+from seacode.config import ProviderConfig
+from seacode.memory import ENTRYPOINT_NAME, MemoryManager
 from seacode.permissions import PermissionMode
+from seacode.tools import ToolRegistry
+from seacode.tools.bash import Bash
+from seacode.tools.glob import Glob
+from seacode.tools.grep import Grep
 
 
 # 实现 UIController 协议的假对象：记录各方法调用以便断言 handler 行为。
@@ -151,10 +160,9 @@ class _FakeSandbox:
         return self._available
 
 
-# 假 Agent：携带 handler 实际访问的属性与 manual_compact 行为记录。
+# 假 Agent：携带其它 handler 实际访问的属性与 manual_compact 行为记录。
 class _FakeAgent:
     def __init__(self, **kwargs: Any) -> None:
-        self.model = kwargs.get("model", "test-model")
         self.plan_mode = kwargs.get("plan_mode", False)
         self.permission_checker = kwargs.get("permission_checker")
         # 权限模式与 checker.mode 保持同步；handler 通过 set_permission_mode 切换。
@@ -283,29 +291,6 @@ class _FakeResumeResult:
     ) -> None:
         self.session = session
         self.messages = messages
-
-
-# 假记忆管理器：记录 clear 调用，可预设展示文本与文件路径。
-class _FakeMemoryManager:
-    def __init__(
-        self,
-        display_text: str = "记忆内容",
-        memories: list[str] | None = None,
-        file_paths: list[str] | None = None,
-    ) -> None:
-        self.memories = memories if memories is not None else ["m1"]
-        self._display_text = display_text
-        self._file_paths = file_paths or ["/path/MEMORY.md"]
-        self.clear_calls = 0
-
-    def get_display_text(self) -> str:
-        return self._display_text
-
-    def clear_memories(self) -> None:
-        self.clear_calls += 1
-
-    def get_memory_file_paths(self) -> list[str]:
-        return self._file_paths
 
 
 # 假 MCP 服务器：携带 name/tool_count/status 供 /mcp 展示。
@@ -439,18 +424,54 @@ async def test_help_unknown_command() -> None:
 # ---------- /status ----------
 
 
-# 验证 /status 聚合显示模式、会话、Token、工具、记忆、工作目录与版本。
-# 构造带工具与记忆的 mock，调 handle_status，断言输出含各关键字段。
-async def test_status_displays_aggregated_info() -> None:
-    tool_registry = _FakeToolRegistry(["tool1", "tool2", "tool3"], disabled={"tool2"})
-    agent = _FakeAgent(
-        model="claude-test",
-        plan_mode=True,
-        registry=tool_registry,
+# 使用真实 Provider client、Agent、ToolRegistry 和 MemoryManager 装配命令上下文。
+def _make_real_status_agent(work_dir: Path, model: str) -> Agent:
+    provider = ProviderConfig(
+        name="status-test",
+        protocol="openai-compat",
+        model=model,
+        base_url="https://example.invalid",
+        api_key="test-key",
+    )
+    client = OpenAICompatClient(provider, client=object())
+    registry = ToolRegistry()
+    for tool in (Bash(), Glob(), Grep()):
+        registry.register(tool)
+    registry.disable("Grep")
+    return Agent(
+        client=client,
+        registry=registry,
+        protocol=provider.protocol,
+        work_dir=str(work_dir),
         context_window=8_000,
     )
+
+
+# 验证 /status 聚合显示模式、会话、Token、工具、记忆、工作目录与版本。
+# 使用真实核心对象与临时记忆文件，断言输出含各关键字段。
+async def test_status_displays_aggregated_info(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    work_dir = tmp_path / "worktree"
+    agent = _make_real_status_agent(work_dir, "claude-test")
+    agent.permission_mode = PermissionMode.PLAN
     session = _FakeSession("sess-abc12345")
-    memory_manager = _FakeMemoryManager(memories=["m1", "m2", "m3"])
+    memory_manager = MemoryManager(str(project_dir))
+    for directory in (memory_manager.user_mem_dir, memory_manager.project_mem_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    (memory_manager.user_mem_dir / "user.md").write_text("user memory", encoding="utf-8")
+    (memory_manager.project_mem_dir / "project.md").write_text(
+        "project memory", encoding="utf-8"
+    )
+    (memory_manager.project_mem_dir / "another.md").write_text(
+        "another memory", encoding="utf-8"
+    )
     ui = _FakeUI(token_count=(5000, 100000))
     ctx = _make_ctx(
         args="",
@@ -466,20 +487,16 @@ async def test_status_displays_aggregated_info() -> None:
     assert "会话 ID：sess-abc12345" in text
     assert "Token：5000 / 8000（62%）" in text
     assert "工具数：2" in text
-    assert "记忆数：3" in text
-    assert "工作目录：" in text
-    assert "版本：0.1.0" in text
+    assert f"记忆数：{len(memory_manager.get_memories())}" in text
+    assert f"工作目录：{work_dir}" in text
+    assert f"版本：{__version__}" in text
 
 
 # 验证 /status 输出权限模式字段。
-# 预设 agent.permission_mode，断言输出含 "权限模式：" 与 mode value。
-async def test_status_displays_permission_mode() -> None:
-    tool_registry = _FakeToolRegistry(["tool1"])
-    agent = _FakeAgent(
-        model="claude-test",
-        registry=tool_registry,
-        permission_checker=_FakePermissionChecker(mode=PermissionMode.ACCEPT_EDITS),
-    )
+# 使用真实 Agent 设置权限模式，断言输出含 "权限模式：" 与 mode value。
+async def test_status_displays_permission_mode(tmp_path: Path) -> None:
+    agent = _make_real_status_agent(tmp_path / "worktree", "claude-test")
+    agent.permission_mode = PermissionMode.ACCEPT_EDITS
     ui = _FakeUI(token_count=(0, 100000))
     ctx = _make_ctx(args="", agent=agent, ui=ui)
     await handle_status(ctx)
@@ -850,36 +867,63 @@ async def test_session_delete_rejects_active_session() -> None:
 
 
 # 验证 /memory list 显示记忆内容。
-# mock get_display_text 返回文本，调 handle_memory(args="list")，断言输出为该文本。
-async def test_memory_list_displays_text() -> None:
-    mm = _FakeMemoryManager(display_text="记忆索引内容")
+# 使用真实 MemoryManager 与临时叶子文件，断言输出包含真实记忆摘要。
+async def test_memory_list_displays_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    mm = MemoryManager(str(tmp_path / "project"))
+    mm.project_mem_dir.mkdir(parents=True, exist_ok=True)
+    (mm.project_mem_dir / "topic.md").write_text("topic memory", encoding="utf-8")
     ui = _FakeUI()
     ctx = _make_ctx(args="list", memory_manager=mm, ui=ui)
     await handle_memory(ctx)
-    assert ui.system_messages[0] == "记忆索引内容"
+    assert "topic" in ui.system_messages[0]
 
 
 # 验证 /memory clear 清空记忆。
-# 调 handle_memory(args="clear")，断言 clear_memories 被调用且提示"已清空"。
-async def test_memory_clear_invokes_clear() -> None:
-    mm = _FakeMemoryManager()
+# 使用真实双路径目录，断言叶子文件删除且两个 MEMORY.md 保留为空。
+async def test_memory_clear_invokes_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    mm = MemoryManager(str(tmp_path / "project"))
+    for directory in (mm.user_mem_dir, mm.project_mem_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / ENTRYPOINT_NAME).write_text("old index", encoding="utf-8")
+        (directory / "leaf.md").write_text("leaf memory", encoding="utf-8")
     ui = _FakeUI()
     ctx = _make_ctx(args="clear", memory_manager=mm, ui=ui)
     await handle_memory(ctx)
-    assert mm.clear_calls == 1
+    for directory in (mm.user_mem_dir, mm.project_mem_dir):
+        assert (directory / ENTRYPOINT_NAME).exists()
+        assert (directory / ENTRYPOINT_NAME).read_text(encoding="utf-8") == ""
+        assert not (directory / "leaf.md").exists()
     assert ui.system_messages[0] == "已清空"
 
 
 # 验证 /memory edit 显示记忆文件路径。
-# mock get_memory_file_paths 返回路径列表，断言输出含各路径。
-async def test_memory_edit_shows_paths() -> None:
-    mm = _FakeMemoryManager(file_paths=["/proj/.seacode/MEMORY.md", "/home/.seacode/MEMORY.md"])
+# 使用真实 MemoryManager 的公开路径属性，断言输出含各路径。
+async def test_memory_edit_shows_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    mm = MemoryManager(str(tmp_path / "project"))
     ui = _FakeUI()
     ctx = _make_ctx(args="edit", memory_manager=mm, ui=ui)
     await handle_memory(ctx)
     text = ui.system_messages[0]
-    assert "/proj/.seacode/MEMORY.md" in text
-    assert "/home/.seacode/MEMORY.md" in text
+    assert str(mm.project_path) in text
+    assert str(mm.user_path) in text
 
 
 # 验证 /memory 在记忆系统未初始化时给出提示。

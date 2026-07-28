@@ -484,6 +484,11 @@ class Agent:
         # Plan 模式下同一 Agent Loop 复用的计划文件路径。
         self._plan_path_cache: Path | None = None
 
+    # 返回当前 Agent 使用的模型名称，供状态与诊断界面读取。
+    @property
+    def model(self) -> str:
+        return self.client.model or "未知"
+
     # 切换到新会话时重置所有会话级状态，保留 Provider 与工具装配。
     def reset_for_session(
         self,
