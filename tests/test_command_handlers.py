@@ -350,6 +350,7 @@ class _FakeCallbacks:
 def _make_ctx(
     args: str = "",
     agent: Any = None,
+    mcp_manager: Any = None,
     session: Any = None,
     session_manager: Any = None,
     memory_manager: Any = None,
@@ -365,6 +366,7 @@ def _make_ctx(
         memory_manager=memory_manager,
         ui=ui if ui is not None else _FakeUI(),
         config=config if config is not None else {},
+        mcp_manager=mcp_manager,
     )
 
 
@@ -1081,6 +1083,25 @@ async def test_mcp_not_configured() -> None:
     ctx = _make_ctx(args="", agent=agent, ui=ui)
     await handle_mcp(ctx)
     assert "未配置 MCP 服务器" in ui.system_messages[0]
+
+
+# 验证 /mcp 在首条用户消息前也能读取应用级配置。
+# 使用真实 MCPManager，不依赖假 manager 的额外方法，防止命令与管理器接口漂移。
+async def test_mcp_reads_context_manager_without_active_agent() -> None:
+    from seacode.config import MCPServerConfig
+    from seacode.mcp.manager import MCPManager
+
+    manager = MCPManager()
+    manager.load_configs(
+        [MCPServerConfig(name="codegraph", command="codegraph")]
+    )
+    ui = _FakeUI()
+    ctx = _make_ctx(agent=None, mcp_manager=manager, ui=ui)
+
+    await handle_mcp(ctx)
+
+    assert "codegraph" in ui.system_messages[0]
+    assert "已配置，尚未连接" in ui.system_messages[0]
 
 
 # 验证 /mcp 在服务器列表为空时给出提示。

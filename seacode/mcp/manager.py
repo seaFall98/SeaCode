@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ServerInfo:
-    """单个 MCP 服务器的连接信息，包含名称与 instructions。"""
+    """单个 MCP 服务器的连接信息、工具数量和当前状态。"""
 
     name: str
     instructions: str = ""
+    tool_count: int = 0
+    status: str = "connected"
 
 
 @dataclass
@@ -54,6 +56,23 @@ class MCPManager:
         for cfg in configs:
             self._configs[cfg.name] = cfg
 
+    # 返回配置中每台服务器的可展示状态，未连接时也能被 /mcp 查询。
+    def list_servers(self) -> list[ServerInfo]:
+        if self._connect_result is None:
+            return [
+                ServerInfo(name=name, status="configured")
+                for name in self._configs
+            ]
+
+        connected = {server.name: server for server in self._connect_result.servers}
+        return [
+            connected.get(
+                name,
+                ServerInfo(name=name, status="error"),
+            )
+            for name in self._configs
+        ]
+
     # 逐个连接已加载的 MCP 服务器，返回工具列表、服务器信息与错误。
     # 单 Server 失败收集到 errors 不抛异常，继续尝试下一个。
     async def connect_all(self) -> ConnectResult:
@@ -64,11 +83,14 @@ class MCPManager:
                 await client.connect()
                 self._clients[name] = client
 
-                # 从 InitializeResult 提取 instructions，供系统提示注入。
-                info = ServerInfo(name=name, instructions=client.instructions)
-                result.servers.append(info)
-
                 tools = await client.list_tools()
+                # 从 InitializeResult 提取 instructions，并记录服务器工具数量。
+                info = ServerInfo(
+                    name=name,
+                    instructions=client.instructions,
+                    tool_count=len(tools),
+                )
+                result.servers.append(info)
                 for tool_def in tools:
                     wrapper = MCPToolWrapper(name, tool_def, client)
                     result.tools.append(wrapper)

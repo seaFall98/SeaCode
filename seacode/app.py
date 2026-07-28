@@ -1304,6 +1304,7 @@ class SeaCodeApp(App[None]):
             memory_manager=self._memory_manager,
             ui=self,  # SeaCodeApp 实现 UIController Protocol
             permission_checker=self._permission_checker,
+            mcp_manager=self._mcp_manager,
             config={
                 "registry": self._command_registry,
                 "set_session": self._set_session,

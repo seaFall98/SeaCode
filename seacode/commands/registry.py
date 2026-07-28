@@ -45,6 +45,7 @@ class CommandContext:
     ui: UIController
     config: Any
     permission_checker: Any = None
+    mcp_manager: Any = None
 
 
 # 命令定义：name 为主键，aliases 为别名列表，hidden 控制是否在 /help 中列出。

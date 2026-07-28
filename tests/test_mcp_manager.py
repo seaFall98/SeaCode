@@ -172,6 +172,29 @@ async def test_register_all_tools_registers_to_registry() -> None:
     assert len(result.tools) == 2
     assert registry.get("mcp_fs_read") is not None
     assert registry.get("mcp_fs_write") is not None
+    servers = manager.list_servers()
+    assert [(s.name, s.tool_count, s.status) for s in servers] == [
+        ("fs", 2, "connected")
+    ]
+
+
+# 验证连接失败的配置仍能通过公开状态接口呈现错误状态。
+# 使用真实 manager 完成注册流程，确保 /mcp 不依赖测试替身才能工作。
+@pytest.mark.asyncio
+async def test_list_servers_reports_connection_failure() -> None:
+    manager = MCPManager()
+    manager.load_configs([_stdio_config("broken")])
+    fake_broken = _FakeClient(connect_error=ConnectionError("refused"))
+    registry = ToolRegistry()
+
+    with patch("seacode.mcp.manager.MCPClient") as mock_client_cls:
+        mock_client_cls.return_value = fake_broken
+        await manager.register_all_tools(registry)
+
+    servers = manager.list_servers()
+    assert [(s.name, s.tool_count, s.status) for s in servers] == [
+        ("broken", 0, "error")
+    ]
 
 
 # 验证同一会话内重复注册会复用首次结果，不会再次创建客户端。
@@ -300,8 +323,24 @@ async def test_shutdown_tolerates_close_failure() -> None:
 # ---------------------------------------------------------------------------
 
 
-# 验证 ServerInfo 默认 instructions 为空串。
+# 验证 ServerInfo 默认 instructions、工具数和连接状态稳定。
 def test_server_info_defaults() -> None:
     info = ServerInfo(name="fs")
     assert info.name == "fs"
     assert info.instructions == ""
+    assert info.tool_count == 0
+    assert info.status == "connected"
+
+
+# 验证 MCPManager 在首次连接前仍能返回已配置服务器状态。
+# 使用真实 manager 读取配置，避免只依赖带有 list_servers 的测试替身。
+def test_list_servers_reports_configured_before_connection() -> None:
+    manager = MCPManager()
+    manager.load_configs([_stdio_config("codegraph")])
+
+    servers = manager.list_servers()
+
+    assert len(servers) == 1
+    assert servers[0].name == "codegraph"
+    assert servers[0].tool_count == 0
+    assert servers[0].status == "configured"

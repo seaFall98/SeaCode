@@ -15,7 +15,7 @@ import pytest
 from seacode.__main__ import _run_prompt, main
 from seacode.agent import LoopComplete
 from seacode.client import LLMClient, StreamComplete, StreamEvent, TextDelta
-from seacode.config import AppConfig, ProviderConfig
+from seacode.config import AppConfig, MCPServerConfig, ProviderConfig
 from seacode.conversation import Message
 
 
@@ -282,6 +282,13 @@ def test_main_passes_effective_permission_mode_to_tui(
     config = AppConfig(
         providers=(_provider(),),
         permission_mode=config_mode,
+        mcp_servers=(
+            MCPServerConfig(
+                name="codegraph",
+                command="codegraph",
+                args=("serve", "--mcp"),
+            ),
+        ),
         enable_fork=True,
         enable_verification_agent=True,
     )
@@ -293,6 +300,7 @@ def test_main_passes_effective_permission_mode_to_tui(
     main()
 
     assert created[0].kwargs["permission_mode"].value == expected_mode
+    assert created[0].kwargs["mcp_servers"] == config.mcp_servers
     assert created[0].kwargs["enable_fork"] is True
     assert created[0].kwargs["enable_verification_agent"] is True
 

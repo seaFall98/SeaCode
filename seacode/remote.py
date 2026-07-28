@@ -470,6 +470,7 @@ class RemoteServer:
             memory_manager=self.memory_manager,
             ui=self,
             permission_checker=self._permission_checker,
+            mcp_manager=self.mcp_manager,
             config={
                 "registry": self.command_registry,
                 "set_session": self._set_session,

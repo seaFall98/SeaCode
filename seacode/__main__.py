@@ -545,6 +545,7 @@ def main() -> None:
         providers=config.providers,
         max_steps=_read_max_steps(),
         permission_mode=permission_mode,
+        mcp_servers=config.mcp_servers,
         hook_engine=hook_engine,
         enable_fork=config.enable_fork,
         enable_verification_agent=config.enable_verification_agent,
