@@ -299,6 +299,52 @@ def test_records_to_messages_roundtrip_preserves_tool_pairing() -> None:
     assert restored[3].content == "done"
 
 
+# 验证孤立的 tool_result 不会使用非相邻 assistant 的工具顺序。
+# 先结束未完成的工具迭代，再追加孤立结果，避免损坏历史被错误重排。
+def test_records_to_messages_does_not_reuse_stale_tool_order() -> None:
+    timestamp = datetime.now(UTC)
+    records = [
+        SessionRecord(
+            type=RecordType.ASSISTANT,
+            timestamp=timestamp,
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "ReadFile",
+                    "input": {"path": "one.txt"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "tool-2",
+                    "name": "ReadFile",
+                    "input": {"path": "two.txt"},
+                },
+            ],
+        ),
+        SessionRecord(type=RecordType.USER, content="new turn", timestamp=timestamp),
+        SessionRecord(
+            type=RecordType.TOOL_RESULT,
+            timestamp=timestamp,
+            tool_use_id="tool-2",
+            content="orphan result 2",
+        ),
+        SessionRecord(
+            type=RecordType.TOOL_RESULT,
+            timestamp=timestamp,
+            tool_use_id="tool-1",
+            content="orphan result 1",
+        ),
+    ]
+
+    restored = records_to_messages(records)
+
+    assert [result.tool_use_id for result in restored[-1].tool_results] == [
+        "tool-2",
+        "tool-1",
+    ]
+
+
 # =========================================================================
 # C. Compact boundary 内联重建
 # =========================================================================

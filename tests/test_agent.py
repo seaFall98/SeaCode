@@ -438,6 +438,55 @@ async def test_multiple_tool_calls_execute_in_order() -> None:
     assert result_events[1].output == "result-b"
 
 
+# 验证 Provider 回灌的 tool_result 始终按 assistant tool_call 顺序排列。
+# 即使执行器因并发/拒绝路径返回逆序结果，下一次模型请求也必须保持配对顺序。
+@pytest.mark.asyncio
+async def test_tool_results_are_reordered_to_response_call_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_a = _MockTool(name="ToolA", result=ToolResult(content="result-a"))
+    tool_b = _MockTool(name="ToolB", result=ToolResult(content="result-b"))
+    registry = ToolRegistry()
+    registry.register(tool_a)
+    registry.register(tool_b)
+    client = _FakeClient(
+        [
+            [
+                ToolCallStart(tool_name="ToolA", tool_id="c1"),
+                ToolCallComplete(tool_id="c1", tool_name="ToolA", arguments={}),
+                ToolCallStart(tool_name="ToolB", tool_id="c2"),
+                ToolCallComplete(tool_id="c2", tool_name="ToolB", arguments={}),
+                StreamComplete(input_tokens=1, output_tokens=1),
+            ],
+            _text_stream("All done"),
+        ]
+    )
+    original_collect = StreamingExecutor.collect_results
+
+    async def collect_in_reverse(
+        executor: StreamingExecutor,
+    ) -> list[_ToolExecResult]:
+        results = await original_collect(executor)
+        return list(reversed(results))
+
+    monkeypatch.setattr(StreamingExecutor, "collect_results", collect_in_reverse)
+    agent = Agent(client=client, registry=registry, protocol="openai-compat")
+    conversation = ConversationManager()
+    conversation.add_user_message("Run both")
+
+    await _collect(agent.run(conversation))
+
+    tool_message = next(message for message in client.requests[1] if message.tool_results)
+    assert [result.tool_use_id for result in tool_message.tool_results] == ["c1", "c2"]
+    persisted_tool_message = next(
+        message for message in conversation.messages if message.tool_results
+    )
+    assert [result.tool_use_id for result in persisted_tool_message.tool_results] == [
+        "c1",
+        "c2",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 参数校验失败
 # ---------------------------------------------------------------------------
@@ -508,6 +557,7 @@ async def test_second_request_failure_propagates_and_keeps_committed_turn() -> N
     client._outcomes = [
         _tool_call_stream("c1", "MockTool", {"input": "x"}),
         RuntimeError("model provider failed"),
+        RuntimeError("model provider failed"),
     ]
     conversation.add_user_message("Run tool then fail")
 
@@ -523,6 +573,27 @@ async def test_second_request_failure_propagates_and_keeps_committed_turn() -> N
     assert conversation.messages[2].role == "assistant"
     assert conversation.messages[2].tool_uses[0].tool_name == "MockTool"
     assert conversation.messages[3].role == "user"
+
+
+# 验证工具结果已回灌后 Provider 的一次瞬时失败会重试同一请求。
+# 工具只能执行一次，重试成功后应直接进入最终回复而不重复产生 tool_result。
+@pytest.mark.asyncio
+async def test_post_tool_provider_failure_retries_without_rerunning_tools() -> None:
+    tool = _MockTool(name="MockTool", result=ToolResult(content="ok"))
+    agent, conversation, client = _setup(tool)
+    client._outcomes = [
+        _tool_call_stream("c1", "MockTool", {"input": "x"}),
+        RuntimeError("temporary provider failure"),
+        _text_stream("Recovered"),
+    ]
+    conversation.add_user_message("Run tool then retry")
+
+    events = await _collect(agent.run(conversation))
+
+    assert isinstance(events[-1], LoopComplete)
+    assert conversation.messages[-1].content == "Recovered"
+    assert len(client.requests) == 3
+    assert len([event for event in events if isinstance(event, ToolResultEvent)]) == 1
     assert conversation.messages[3].tool_results[0].content == "ok"
 
 

@@ -2009,9 +2009,8 @@ class SeaCodeApp(App[None]):
                         for _, blk in collapsible:
                             blk.display = False
                         await ai_row.mount(summary)
-                    # 增量持久化：只追加 canonical 消息，运行时提醒由 ConversationManager
-                    # 标记为 transient，不会因为头部注入或游标偏移而重复写入。
-                    self._flush_session_messages()
+                    # TurnComplete 只表示一次工具迭代完成；assistant/tool 链仍可能
+                    # 继续请求 Provider，延迟到 LoopComplete 才提交，避免失败时落盘半截回合。
                     # 重置工具块字典，开新 ai_row 供下一轮工具调用。
                     tool_blocks.clear()
                     ai_row = Vertical(classes="ai-row")

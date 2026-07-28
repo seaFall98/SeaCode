@@ -15,6 +15,8 @@ from seacode.client import (
     StreamComplete,
     StreamEvent,
     TextDelta,
+    ToolCallComplete,
+    ToolCallStart,
 )
 from seacode.config import ProviderConfig
 from seacode.conversation import (
@@ -138,6 +140,42 @@ def test_session_roundtrip_preserves_thinking_signature_and_tools(tmp_path: Path
     result.session.close()
 
 
+# 验证恢复旧 JSONL 时按 assistant tool_use 顺序重排逆序 tool_result。
+# 历史文件保留原始记录供审计，但 Provider 请求必须收到稳定的配对顺序。
+def test_session_resume_orders_tool_results_by_assistant_calls(tmp_path: Path) -> None:
+    manager = SessionManager(str(tmp_path))
+    session = manager.create()
+    session_id = session.session_id
+    session.append(
+        Message(
+            role="assistant",
+            content="",
+            tool_uses=[
+                ToolUseBlock("call-1", "ReadFile", {"file_path": "one.txt"}),
+                ToolUseBlock("call-2", "ReadFile", {"file_path": "two.txt"}),
+            ],
+        )
+    )
+    session.append(
+        Message(
+            role="user",
+            tool_results=[
+                ToolResultBlock("call-2", "two"),
+                ToolResultBlock("call-1", "one"),
+            ],
+        )
+    )
+    session.close()
+
+    result = manager.resume(session_id)
+    assert result is not None
+    assert [item.tool_use_id for item in result.messages[1].tool_results] == [
+        "call-1",
+        "call-2",
+    ]
+    result.session.close()
+
+
 # 验证 Provider 请求失败前用户消息已经落盘，且当前进程后续回合不被失败请求污染。
 # 第一次请求故意失败，随后恢复；关闭后直接 resume 应仍能读到失败前的用户意图。
 @pytest.mark.asyncio
@@ -255,3 +293,49 @@ async def test_resume_session_continues_previous_conversation(
         Message(role="assistant", content="yesterday answer"),
         Message(role="user", content="Continue today"),
     ]
+
+
+# 验证工具循环在 Provider 失败时不会把未完成的 assistant/tool 链提交到 session。
+# 用户意图已在请求前落盘，恢复后应只看到该 user，而不是无法继续的半截工具回合。
+@pytest.mark.asyncio
+async def test_failed_tool_loop_does_not_persist_unfinished_assistant_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    first_file = tmp_path / "first.txt"
+    second_file = tmp_path / "second.txt"
+    first_file.write_text("first\n", encoding="utf-8")
+    second_file.write_text("second\n", encoding="utf-8")
+    client = _ScriptedClient(
+        [
+            [
+                ToolCallStart(tool_name="ReadFile", tool_id="call-1"),
+                ToolCallComplete(
+                    tool_id="call-1",
+                    tool_name="ReadFile",
+                    arguments={"file_path": str(first_file)},
+                ),
+                ToolCallStart(tool_name="ReadFile", tool_id="call-2"),
+                ToolCallComplete(
+                    tool_id="call-2",
+                    tool_name="ReadFile",
+                    arguments={"file_path": str(second_file)},
+                ),
+                StreamComplete(input_tokens=1, output_tokens=1),
+            ],
+            NetworkError("provider failure after tools"),
+        ]
+    )
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        session_id = app._session.session_id if app._session is not None else ""
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Read both files")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+
+    result = SessionManager(str(tmp_path)).resume(session_id)
+    assert result is not None
+    assert result.messages == [Message(role="user", content="Read both files")]
+    result.session.close()

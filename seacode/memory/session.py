@@ -222,6 +222,23 @@ def parse_compact_boundary(record: SessionRecord) -> tuple[str, list[Message]]:
 # ---------------------------------------------------------------------------
 
 
+def _order_tool_result_blocks(
+    results: list[ToolResultBlock], expected_tool_ids: list[str]
+) -> list[ToolResultBlock]:
+    """按相邻 assistant tool_use 的声明顺序恢复 tool_result。"""
+    order = {tool_id: index for index, tool_id in enumerate(expected_tool_ids)}
+    return [
+        result
+        for _, result in sorted(
+            enumerate(results),
+            key=lambda item: (
+                order.get(item[1].tool_use_id, len(order)),
+                item[0],
+            ),
+        )
+    ]
+
+
 def records_to_messages(records: list[SessionRecord]) -> list[Message]:
     """把 SessionRecord 列表还原为 ConversationManager 可消费的 Message 列表。
 
@@ -230,6 +247,7 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
     """
     messages: list[Message] = []
     pending_tool_results: list[ToolResultBlock] = []
+    pending_tool_ids: list[str] = []
 
     for record in records:
         if record.type == RecordType.TOOL_RESULT:
@@ -248,9 +266,19 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
 
         if pending_tool_results:
             messages.append(
-                Message(role="user", content="", tool_results=pending_tool_results)
+                Message(
+                    role="user",
+                    content="",
+                    tool_results=_order_tool_result_blocks(
+                        pending_tool_results, pending_tool_ids
+                    ),
+                )
             )
             pending_tool_results = []
+            pending_tool_ids = []
+
+        if record.type != RecordType.ASSISTANT:
+            pending_tool_ids = []
 
         if record.type == RecordType.SYSTEM_PROMPT:
             continue
@@ -308,22 +336,29 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
                                 arguments=block.get("input", {}),
                             )
                         )
-                messages.append(
-                    Message(
-                        role="assistant",
-                        content=text,
-                        tool_uses=tool_uses,
-                        thinking_blocks=thinking_blocks,
-                    )
+                assistant_message = Message(
+                    role="assistant",
+                    content=text,
+                    tool_uses=tool_uses,
+                    thinking_blocks=thinking_blocks,
                 )
+                messages.append(assistant_message)
+                pending_tool_ids = [tool.tool_use_id for tool in tool_uses]
             else:
                 messages.append(
                     Message(role="assistant", content=record.content or "")
                 )
+                pending_tool_ids = []
 
     if pending_tool_results:
         messages.append(
-            Message(role="user", content="", tool_results=pending_tool_results)
+            Message(
+                role="user",
+                content="",
+                tool_results=_order_tool_result_blocks(
+                    pending_tool_results, pending_tool_ids
+                ),
+            )
         )
 
     return messages

@@ -327,6 +327,22 @@ class StreamingExecutor:
         return out
 
 
+# 按 assistant 发出的 tool_call 顺序排列回灌结果，避免并发、拒绝与延迟路径
+# 拼接出的 tool_result 顺序被兼容 Chat Completions provider 拒绝。
+def _order_tool_results(
+    tool_results: list[ToolResultBlock],
+    tool_calls: list[ToolCallComplete],
+) -> list[ToolResultBlock]:
+    order = {call.tool_id: index for index, call in enumerate(tool_calls)}
+    return [
+        result
+        for _, result in sorted(
+            enumerate(tool_results),
+            key=lambda item: (order.get(item[1].tool_use_id, len(order)), item[0]),
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Agent 主循环
 # ---------------------------------------------------------------------------
@@ -686,6 +702,33 @@ class Agent:
 
         return result
 
+    # 工具结果回灌后的 Provider 请求若在首个流事件前失败，最多重试一次。
+    # 此时工具已经执行完成，重试只重发同一消息链，不会重复执行副作用工具。
+    async def _stream_with_post_tool_retry(
+        self,
+        messages: list[Any],
+        system: str,
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamEvent]:
+        can_retry = bool(messages and messages[-1].tool_results)
+        retried = False
+
+        while True:
+            emitted = False
+            try:
+                async for event in self.client.stream(
+                    messages, system=system, tools=tools
+                ):
+                    emitted = True
+                    yield event
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not can_retry or retried or emitted:
+                    raise
+                retried = True
+
     # 执行 Agent 主循环：注入环境 → 长期记忆注入 → MCP 连接
     # → 每轮 prompt → 模型流 → 工具执行 → 回灌。
     async def run(
@@ -866,7 +909,9 @@ class Agent:
             rejected_results: list[ToolResultBlock] = []
 
             messages = conversation.get_messages()
-            llm_stream = self.client.stream(messages, system=system, tools=tools)
+            llm_stream = self._stream_with_post_tool_retry(
+                messages, system=system, tools=tools
+            )
 
             # 流式消费：文本/思考增量转发，工具调用完整后立即提交执行。
             async for event in collector.consume(llm_stream):
@@ -1123,6 +1168,8 @@ class Agent:
                     )
                     for he in self._drain_hook_events():
                         yield he
+
+            tool_results = _order_tool_results(tool_results, response.tool_calls)
 
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
@@ -1487,7 +1534,9 @@ class Agent:
             # 每轮重新获取工具 Schema（mark_discovered 后新工具立即纳入）。
             tools = self.registry.get_all_schemas(self.protocol)
             messages = conv.get_messages()
-            llm_stream = self.client.stream(messages, system=system_prompt, tools=tools)
+            llm_stream = self._stream_with_post_tool_retry(
+                messages, system=system_prompt, tools=tools
+            )
 
             collector = StreamCollector()
             executor = StreamingExecutor()
@@ -1594,6 +1643,8 @@ class Agent:
                         is_error=br.result.is_error,
                     )
                 )
+
+            tool_results = _order_tool_results(tool_results, response.tool_calls)
 
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
