@@ -141,7 +141,7 @@ async def handle_session(ctx: CommandContext) -> None:
     )
 
 
-# 命令定义：LOCAL 类型，子命令参数提示。
+# 命令定义：LOCAL 类型；无参数时显示当前会话详情，子命令由 handler 校验。
 SESSION_COMMAND = Command(
     name="session",
     description="会话管理",
@@ -149,5 +149,5 @@ SESSION_COMMAND = Command(
     handler=handle_session,
     aliases=[],
     usage="/session [list | resume <id> | new | delete <id>]",
-    arg_prompt="子命令",
+    arg_prompt="",
 )

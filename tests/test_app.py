@@ -1306,6 +1306,24 @@ async def test_dispatch_slash_only_lists_all_commands(
         assert "/clear" in text
 
 
+# 验证 /session 无参数时进入 handler 并显示当前会话详情。
+# 测试设计为走真实 _dispatch_command 门禁，防止 arg_prompt 把可选参数误判为必填。
+@pytest.mark.asyncio
+async def test_dispatch_session_without_args_shows_current_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        result = await app._dispatch_command("/session")
+        assert result is True
+        ok = await _wait_for_system_message(app, pilot, "当前会话：")
+        assert ok
+        text = "\n".join(str(m.render()) for m in app.query(".system-message"))
+        assert "参数不足" not in text
+
+
 # 验证 _dispatch_command 对非斜杠输入返回 False 不走命令路径。
 # 测试设计为直接调用 _dispatch_command("hello")，断言返回 False。
 @pytest.mark.asyncio
