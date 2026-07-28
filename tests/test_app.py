@@ -35,6 +35,7 @@ from seacode.commands.registry import Command, CommandContext, CommandType
 from seacode.config import ProviderConfig
 from seacode.context import build_recovery_attachment
 from seacode.conversation import Message
+from seacode.mcp.manager import ConnectResult, MCPManager, ServerInfo
 from seacode.permission_dialog import InlinePermissionWidget
 from seacode.permissions import PermissionMode, RuleEngine
 from seacode.plan_dialog import InlinePlanWidget, PlanChoice
@@ -113,26 +114,26 @@ class _MemorySelectorClient(LLMClient):
         yield StreamComplete()
 
 
-# 记录跨回合初始化次数的 MCP 管理器，不连接真实外部服务。
-class _SessionMCPManager:
+# 受 MCPManager 契约约束的跨回合测试 manager，不连接真实外部服务。
+class _SessionMCPManager(MCPManager):
     def __init__(self) -> None:
-        from seacode.mcp.manager import ConnectResult, ServerInfo
+        super().__init__()
 
         self._result = ConnectResult(
             servers=[ServerInfo(name="docs", instructions="Use the project docs first.")]
         )
-        self.is_initialized = False
         self.register_calls = 0
         self.shutdown_calls = 0
 
-    async def register_all_tools(self, registry: Any) -> Any:
+    async def register_all_tools(self, registry: Any) -> ConnectResult:
         del registry
         self.register_calls += 1
-        self.is_initialized = True
+        self._connect_result = self._result
         return self._result
 
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
+        await super().shutdown()
 
 
 # 模拟完成计划、请求审批与后续执行的两段模型响应。
@@ -859,7 +860,7 @@ async def test_consecutive_turns_reuse_mcp_initialization() -> None:
     )
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
     manager = _SessionMCPManager()
-    app._mcp_manager = manager  # type: ignore[assignment]
+    app._mcp_manager = manager
 
     async with app.run_test() as pilot:
         input_widget = app.query_one(ChatInput)

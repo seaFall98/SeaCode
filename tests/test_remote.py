@@ -20,6 +20,7 @@ from seacode.agent import (
     ToolResultEvent,
     ToolUseEvent,
 )
+from seacode.mcp.manager import MCPManager
 from seacode.remote import RemoteServer
 from seacode.web_content import INDEX_HTML
 
@@ -54,13 +55,15 @@ class _Agent:
 
 
 # 验证远程服务也能在退出时释放 MCP manager，避免只修复 TUI 生命周期。
-# 使用最小假 manager 锁定 shutdown 调用和引用清理，不启动真实 WebSocket 服务。
-class _ShutdownMCPManager:
+# 使用受 MCPManager 契约约束的测试 manager 锁定关闭调用和引用清理。
+class _ShutdownMCPManager(MCPManager):
     def __init__(self) -> None:
+        super().__init__()
         self.shutdown_calls = 0
 
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
+        await super().shutdown()
 
 
 # 验证根路径返回 SeaCode 页面，非 WebSocket 的其它路径返回 404。
@@ -94,7 +97,7 @@ def test_remote_page_contains_brand_and_command_scrolling() -> None:
 async def test_remote_shutdown_closes_mcp_manager() -> None:
     server = RemoteServer([])
     manager = _ShutdownMCPManager()
-    server.mcp_manager = manager  # type: ignore[assignment]
+    server.mcp_manager = manager
 
     await server._shutdown_mcp()
 

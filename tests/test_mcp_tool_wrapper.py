@@ -6,6 +6,8 @@ import pytest
 from mcp import types as mcp_types
 from pydantic import BaseModel
 
+from seacode.config import MCPServerConfig
+from seacode.mcp.client import MCPClient
 from seacode.mcp.tool_wrapper import (
     MCPToolWrapper,
     _build_params_model,
@@ -27,21 +29,20 @@ def _make_tool_def(
     )
 
 
-# 构造一个假的 MCPClient，支持 is_alive 控制与 call_tool mock。
-# is_alive 用 _alive 内部属性，与真实 MCPClient 一致；tool_wrapper 通过 _alive=False 触发重连。
-class _FakeClient:
+# 受 MCPClient 契约约束的测试 client，只替代连接和调用的外部传输行为。
+class _FakeClient(MCPClient):
     def __init__(
         self,
         call_result: mcp_types.CallToolResult | None = None,
         call_error: Exception | None = None,
         connect_error: Exception | None = None,
     ) -> None:
+        super().__init__(MCPServerConfig(name="fake", command="fake-mcp"))
         self._alive = True
         self._call_result = call_result
         self._call_error = call_error
         self._connect_error = connect_error
         self.connect_calls = 0
-        self.name = "fake"
 
     @property
     def is_alive(self) -> bool:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from mcp import types as mcp_types
 
 from seacode.config import MCPServerConfig
+from seacode.mcp.client import MCPClient
 from seacode.mcp.manager import MCPManager, ServerInfo
 from seacode.tools import ToolRegistry
 
@@ -33,20 +34,30 @@ def _tool_def(name: str = "search") -> mcp_types.Tool:
     )
 
 
-# 构造一个假的 MCPClient，模拟连接、列举与调用行为。
-class _FakeClient:
+# 受 MCPClient 契约约束的测试 client，只替代底层连接传输。
+class _FakeClient(MCPClient):
     def __init__(
         self,
         tools: list[mcp_types.Tool] | None = None,
         instructions: str = "",
         connect_error: Exception | None = None,
+        close_error: Exception | None = None,
     ) -> None:
-        self.name = ""
+        super().__init__(_stdio_config("fake"))
         self._tools = tools or []
         self._instructions = instructions
         self._connect_error = connect_error
-        self.is_alive = True
+        self._close_error = close_error
+        self._alive = True
         self.closed = False
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    @is_alive.setter
+    def is_alive(self, value: bool) -> None:
+        self._alive = value
 
     @property
     def instructions(self) -> str:
@@ -63,6 +74,8 @@ class _FakeClient:
     async def close(self) -> None:
         self.closed = True
         self.is_alive = False
+        if self._close_error is not None:
+            raise self._close_error
 
 
 # ---------------------------------------------------------------------------
@@ -308,8 +321,7 @@ async def test_shutdown_tolerates_close_failure() -> None:
     manager = MCPManager()
     manager.load_configs([_stdio_config("fs")])
 
-    fake_fs = _FakeClient()
-    fake_fs.close = AsyncMock(side_effect=RuntimeError("close failed"))  # type: ignore[method-assign]
+    fake_fs = _FakeClient(close_error=RuntimeError("close failed"))
     with patch("seacode.mcp.manager.MCPClient") as mock_client_cls:
         mock_client_cls.return_value = fake_fs
         await manager.connect_all()

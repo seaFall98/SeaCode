@@ -36,6 +36,7 @@ from seacode.client import (
     ToolCallStart,
 )
 from seacode.conversation import ConversationManager, Message
+from seacode.mcp.manager import ConnectResult, MCPManager, ServerInfo
 from seacode.permissions import (
     DangerousCommandDetector,
     PathSandbox,
@@ -1280,15 +1281,15 @@ async def test_no_permission_checker_preserves_backward_compat() -> None:
 # ---------------------------------------------------------------------------
 
 
-# 带可控 register_all_tools 的假 MCPManager，返回预设 ConnectResult。
-class _FakeMCPManager:
+# 受 MCPManager 契约约束的测试 manager，返回预设 ConnectResult。
+class _FakeMCPManager(MCPManager):
     def __init__(
         self,
         tools: list[Tool] | None = None,
-        servers: list[Any] | None = None,
+        servers: list[ServerInfo] | None = None,
         errors: list[str] | None = None,
     ) -> None:
-        from seacode.mcp.manager import ConnectResult, ServerInfo
+        super().__init__()
 
         self._result = ConnectResult(
             tools=tools or [],
@@ -1297,10 +1298,11 @@ class _FakeMCPManager:
         )
         self.register_calls = 0
 
-    async def register_all_tools(self, registry: ToolRegistry) -> Any:
+    async def register_all_tools(self, registry: ToolRegistry) -> ConnectResult:
         self.register_calls += 1
         for tool in self._result.tools:
             registry.register(tool)
+        self._connect_result = self._result
         return self._result
 
 
@@ -1475,8 +1477,6 @@ async def test_system_prompt_excludes_tool_search_section_without_mcp() -> None:
 # 验证 MCP 服务器 instructions 注入对话历史供模型参考。
 @pytest.mark.asyncio
 async def test_mcp_server_instructions_injected_to_conversation() -> None:
-    from seacode.mcp.manager import ServerInfo
-
     registry = ToolRegistry()
     manager = _FakeMCPManager(
         servers=[ServerInfo(name="fs", instructions="Use UTF-8 paths only")]
