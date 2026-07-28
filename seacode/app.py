@@ -49,12 +49,14 @@ from .agents import (
 from .askuser_dialog import InlineAskUserWidget
 from .client import (
     AuthenticationError,
+    ContextWindowError,
     LLMClient,
     LLMError,
     NetworkError,
     RateLimitError,
     TextDelta,
     create_client,
+    create_diagnostic_id,
 )
 from .commands import (
     CommandContext,
@@ -1829,6 +1831,7 @@ class SeaCodeApp(App[None]):
         # batch12：tool_blocks 同时容纳 ToolCallBlock 与 SubAgentBlock；
         # SubAgentBlock 用于 "Agent" 工具调用，ToolCallBlock 用于其它工具。
         tool_blocks: dict[str, ToolCallBlock | SubAgentBlock] = {}
+        tool_activity = False
         total_input = 0
         total_output = 0
 
@@ -1893,6 +1896,7 @@ class SeaCodeApp(App[None]):
                     # thinking 内容不在 TUI 显示，只滚动到底部让 spinner 保持可见。
                     self.call_after_refresh(chat.scroll_end, animate=False)
                 elif isinstance(event, ToolUseEvent):
+                    tool_activity = True
                     # 工具调用前把已累积的流式文本转为 Markdown 持久化到当前 ai_row，
                     # 避免 live_answer 残留旧文本导致后续回合答案串接或丢失。
                     if answer:
@@ -2066,13 +2070,26 @@ class SeaCodeApp(App[None]):
             raise
         except LLMError as error:
             self._rollback_turn(turn_snapshot)
-            await self._append_error(self._error_message(error))
-            self._set_status("Ready")
-        except Exception:
-            self._rollback_turn(turn_snapshot)
             await self._append_error(
-                "The request could not be completed. Check the model configuration."
+                self._error_message(error, has_tool_activity=tool_activity)
             )
+            self._set_status("Ready")
+        except Exception as error:
+            diagnostic_id = create_diagnostic_id()
+            log.error(
+                "SeaCode turn failed diagnostic_id=%s exception_type=%s tool_activity=%s",
+                diagnostic_id,
+                type(error).__name__,
+                tool_activity,
+            )
+            self._rollback_turn(turn_snapshot)
+            message = (
+                "SeaCode encountered an internal runtime error. "
+                "Retry the request."
+            )
+            if tool_activity:
+                message += " Some tools may already have changed the workspace; inspect it first."
+            await self._append_error(f"{message} Diagnostic ID: {diagnostic_id}.")
             self._set_status("Ready")
         finally:
             # 停止 spinner 动画并移除 label，无论回合成功/失败/取消。
@@ -2137,14 +2154,26 @@ class SeaCodeApp(App[None]):
         await self._append_static(Text(text), "message system-message")
 
     # 将有限错误类别映射成可行动但不泄露细节的文本。
-    def _error_message(self, error: LLMError) -> str:
+    def _error_message(
+        self, error: LLMError, *, has_tool_activity: bool = False
+    ) -> str:
         if isinstance(error, AuthenticationError):
-            return "Authentication failed. Check the selected local model configuration."
-        if isinstance(error, RateLimitError):
-            return "The provider is rate limiting this request. Try again shortly."
-        if isinstance(error, NetworkError):
-            return "The provider could not be reached. Check the endpoint and network."
-        return "The provider returned an unusable response. You can send another message."
+            message = "Authentication failed. Check the selected local model configuration."
+        elif isinstance(error, RateLimitError):
+            message = "The provider is rate limiting this request. Try again shortly."
+        elif isinstance(error, NetworkError):
+            message = "The provider could not be reached. Check the endpoint and network."
+        elif isinstance(error, ContextWindowError):
+            message = "The request exceeds the provider context window. Compact or shorten it."
+        elif error.category == "request":
+            message = "The provider rejected the request parameters. Check the selected model."
+        elif error.category == "protocol":
+            message = "The provider returned an unusable response. You can send another message."
+        else:
+            message = "SeaCode could not complete the request. You can send another message."
+        if has_tool_activity:
+            message += " Some tools may already have changed the workspace; inspect it first."
+        return f"{message} Diagnostic ID: {error.diagnostic_id}."
 
     # 在唯一状态栏位置更新当前回合状态、耗时和用量。
     def _set_status(self, text: str) -> None:

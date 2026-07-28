@@ -9,13 +9,22 @@ import pytest
 from seacode.client import (
     ANTHROPIC_MODEL_FETCH_TIMEOUT,
     AnthropicClient,
+    AuthenticationError,
+    ContextWindowError,
     LLMClient,
+    NetworkError,
     OpenAIClient,
     OpenAICompatClient,
+    ProtocolError,
+    RateLimitError,
+    RequestError,
     StreamComplete,
     TextDelta,
     ThinkingComplete,
     ThinkingDelta,
+    ToolCallComplete,
+    ToolCallDelta,
+    ToolCallStart,
     _supports_adaptive_thinking,
     create_client,
     resolve_context_window,
@@ -39,6 +48,13 @@ class _AsyncEvents:
             yield event
 
 
+# 表示带 HTTP 状态码的外部 SDK 异常，验证生产错误归一化边界。
+class _ProviderError(Exception):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 # 记录 Responses 请求并返回预设流。
 class _FakeResponses:
     def __init__(self, events: list[Any]) -> None:
@@ -59,20 +75,29 @@ class _FakeOpenAIResponsesClient:
 
 # 记录兼容 Chat Completions 请求并返回预设流。
 class _FakeChatCompletions:
-    def __init__(self, events: list[Any]) -> None:
+    def __init__(
+        self, events: list[Any], error: Exception | None = None
+    ) -> None:
         self.events = events
+        self.error = error
         self.request: dict[str, Any] | None = None
 
     # 保存调用参数以验证兼容协议边界。
     async def create(self, **request: Any) -> _AsyncEvents:
         self.request = request
+        if self.error is not None:
+            raise self.error
         return _AsyncEvents(self.events)
 
 
 # 暴露 Chat Completions 命名空间的最小测试客户端。
 class _FakeOpenAICompatClient:
-    def __init__(self, events: list[Any]) -> None:
-        self.chat = SimpleNamespace(completions=_FakeChatCompletions(events))
+    def __init__(
+        self, events: list[Any], error: Exception | None = None
+    ) -> None:
+        self.chat = SimpleNamespace(
+            completions=_FakeChatCompletions(events, error=error)
+        )
 
 
 # 模拟 Anthropic 上下文管理流与最终用量。
@@ -198,6 +223,175 @@ async def test_openai_compat_client_uses_chat_completions_protocol() -> None:
     assert request is not None
     assert request["messages"][0] == {"role": "system", "content": "System prompt"}
     assert request["messages"][1] == {"role": "user", "content": "Hello"}
+
+
+# 验证兼容端点以 length 结束时仍然产生完成事件。
+# 预设没有 usage 的截断 chunk，断言 stop_reason 进入 Agent 的 max-token 恢复路径。
+@pytest.mark.asyncio
+async def test_openai_compat_length_finish_reason_is_max_tokens() -> None:
+    chunk = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    content="partial", reasoning_content=None, tool_calls=None
+                ),
+                finish_reason="length",
+            )
+        ],
+        usage=None,
+    )
+    fake = _FakeOpenAICompatClient([chunk])
+    client = OpenAICompatClient(_provider("openai-compat"), client=fake)
+
+    events = await _events(client)
+
+    assert events == [TextDelta("partial"), StreamComplete(stop_reason="max_tokens")]
+
+
+# 验证兼容端点以多个 tool_calls 结束且没有 usage chunk 时仍只完成一次调用。
+# 两个索引独立累积参数，断言每个 tool call 各完成一次并发出 tool_calls 完成事件。
+@pytest.mark.asyncio
+async def test_openai_compat_tool_calls_without_usage_complete_once() -> None:
+    first_chunk = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    content=None,
+                    reasoning_content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=0,
+                            id="call-1",
+                            function=SimpleNamespace(name="ReadFile", arguments='{"path":'),
+                        ),
+                        SimpleNamespace(
+                            index=1,
+                            id="call-2",
+                            function=SimpleNamespace(
+                                name="WriteFile", arguments='{"path":'
+                            ),
+                        ),
+                    ],
+                ),
+                finish_reason=None,
+            )
+        ],
+        usage=None,
+    )
+    second_chunk = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    content=None,
+                    reasoning_content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=0,
+                            id=None,
+                            function=SimpleNamespace(name=None, arguments='"a"}'),
+                        ),
+                        SimpleNamespace(
+                            index=1,
+                            id=None,
+                            function=SimpleNamespace(name=None, arguments='"b"}'),
+                        ),
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+    )
+    client = OpenAICompatClient(
+        _provider("openai-compat"),
+        client=_FakeOpenAICompatClient([first_chunk, second_chunk]),
+    )
+
+    events = await _events(client)
+
+    assert len([event for event in events if isinstance(event, ToolCallStart)]) == 2
+    assert len([event for event in events if isinstance(event, ToolCallDelta)]) == 4
+    completed = [event for event in events if isinstance(event, ToolCallComplete)]
+    assert [(event.tool_id, event.tool_name) for event in completed] == [
+        ("call-1", "ReadFile"),
+        ("call-2", "WriteFile"),
+    ]
+    assert events[-1] == StreamComplete(stop_reason="tool_calls")
+
+
+# 验证兼容端点没有 finish reason 或 usage completion 时不会静默成功。
+# 只返回空 choices 的流，断言错误带 stream 阶段和 missing_completion 原因。
+@pytest.mark.asyncio
+async def test_openai_compat_missing_completion_is_structured_protocol_error() -> None:
+    empty_chunk = SimpleNamespace(choices=[], usage=None)
+    client = OpenAICompatClient(
+        _provider("openai-compat"),
+        client=_FakeOpenAICompatClient([empty_chunk]),
+    )
+
+    with pytest.raises(ProtocolError) as caught:
+        await _events(client)
+
+    assert caught.value.phase == "stream"
+    assert caught.value.reason == "missing_completion"
+
+
+# 验证兼容端点返回未知结束原因时给出可定位的协议错误。
+# 预设一个未支持的 finish_reason，断言错误保留结束原因而非伪装成空流成功。
+@pytest.mark.asyncio
+async def test_openai_compat_unknown_finish_reason_is_diagnostic_protocol_error() -> None:
+    chunk = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    content="partial", reasoning_content=None, tool_calls=None
+                ),
+                finish_reason="vendor_stop",
+            )
+        ],
+        usage=None,
+    )
+    fake = _FakeOpenAICompatClient([chunk])
+    client = OpenAICompatClient(_provider("openai-compat"), client=fake)
+
+    with pytest.raises(ProtocolError, match="vendor_stop") as caught:
+        await _events(client)
+    assert caught.value.phase == "stream"
+    assert caught.value.reason == "vendor_stop"
+
+
+# 验证兼容 Provider 的外部错误统一映射为可行动类别与诊断标识。
+# 通过真实 OpenAICompatClient.stream 调用链注入带状态码的 SDK 异常，断言不泄漏原始详情。
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "detail", "expected", "retryable"),
+    [
+        (401, "secret api key", AuthenticationError, False),
+        (400, "invalid body secret", RequestError, False),
+        (400, "maximum context length exceeded", ContextWindowError, False),
+        (429, "rate limited", RateLimitError, True),
+        (408, "connection timeout", NetworkError, True),
+        (500, "provider failed", ProtocolError, True),
+    ],
+)
+async def test_openai_compat_provider_errors_are_classified(
+    status_code: int,
+    detail: str,
+    expected: type[Exception],
+    retryable: bool,
+) -> None:
+    fake = _FakeOpenAICompatClient(
+        [], error=_ProviderError(detail, status_code=status_code)
+    )
+    client = OpenAICompatClient(_provider("openai-compat"), client=fake)
+
+    with pytest.raises(expected) as caught:
+        await _events(client)
+
+    error = caught.value
+    assert getattr(error, "retryable") is retryable
+    assert getattr(error, "diagnostic_id").startswith("SC-")
+    assert detail not in str(error)
 
 
 # 验证 Anthropic 配置只调用 Messages，并在启用时传递 thinking 参数。

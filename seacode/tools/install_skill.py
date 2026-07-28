@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -12,22 +12,27 @@ from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 
 class _InstallSkillParams(BaseModel):
-    """InstallSkill 工具参数：仅 url 一个必填字段。"""
+    """InstallSkill 工具参数：URL 加受控的项目/用户安装范围。"""
 
     url: str = Field(..., description="Skill 包 URL")
+    scope: Literal["project", "user"] = Field(
+        default="project",
+        description="安装范围：project 写入当前项目，user 写入用户全局目录",
+    )
 
 
 class InstallSkill(Tool):
-    """从 URL 安装第三方 Skill 包到用户全局目录的系统工具。
+    """从 URL 安装第三方 Skill 包到项目或用户目录的系统工具。
 
     通过 set_loader/set_on_installed 注入依赖；execute 调用 parse_skill_url
-    解析 → install_skill 拉取 → loader.reload 刷新 → on_installed 回调通知
-    TUI 重新注册命令。
+    解析 → 按 scope 选择受控安装根目录 → install_skill 拉取 → loader.reload 刷新
+    → on_installed 回调通知 TUI 重新注册命令。
     """
 
     name: str = "InstallSkill"
     description: str = (
-        "从 URL 下载并安装第三方 Skill 包到用户全局目录（~/.seacode/skills/）。"
+        "从 URL 下载并安装第三方 Skill 包。默认安装到当前项目的 .seacode/skills/；"
+        "如果用户明确要求所有项目共用，使用 scope=user 安装到 ~/.seacode/skills/。"
         "支持三种 URL 格式：skills.sh 短链（https://www.skills.sh/<owner>/<repo>/<name>）、"
         "GitHub tree 路径（https://github.com/<owner>/<repo>/tree/<ref>/<path>）、"
         "以及指向 SKILL.md 的原始 URL。"
@@ -65,15 +70,16 @@ class InstallSkill(Tool):
                 content=f"URL 解析失败：{e}", is_error=True
             )
 
-        # 安装到用户级 ~/.seacode/skills/ 目录；子目录名由 parsed.name 决定。
-        user_dir = getattr(self._loader, "_user_dir", None)
-        if user_dir is None:
+        scope = params.scope  # type: ignore[attr-defined]
+        try:
+            install_root = self._loader.get_install_root(scope)
+        except (AttributeError, ValueError) as e:
             return ToolResult(
-                content="InstallSkill 未初始化：loader 缺少 _user_dir",
+                content=f"InstallSkill 未初始化：缺少有效安装范围契约（{e}）",
                 is_error=True,
             )
         try:
-            report = await install_skill(parsed, install_root=user_dir)
+            report = await install_skill(parsed, install_root=install_root)
         except Exception as e:
             return ToolResult(
                 content=f"安装失败：{e}", is_error=True
@@ -88,6 +94,9 @@ class InstallSkill(Tool):
                 # 回调失败不阻塞安装成功路径。
                 pass
         return ToolResult(
-            content=f"已安装 Skill：{report.skill_name} 到 {report.target_dir}",
+            content=(
+                f"已安装 Skill：{report.skill_name}（范围：{scope}）"
+                f" 到 {report.target_dir}"
+            ),
             is_error=False,
         )

@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from .client import (
     LLMClient,
+    LLMError,
     StreamComplete,
     StreamEvent,
     TextDelta,
@@ -239,10 +240,12 @@ class StreamCollector:
 
     # 消费流事件：文本与思考增量立即转发，工具调用与完成事件累积后转发。
     async def consume(
-        self, stream: AsyncIterator[StreamEvent]
+        self, stream: AsyncIterator[StreamEvent | RetryEvent]
     ) -> AsyncIterator[AgentEvent]:
         async for event in stream:
-            if isinstance(event, TextDelta):
+            if isinstance(event, RetryEvent):
+                yield event
+            elif isinstance(event, TextDelta):
                 self.response.text += event.text
                 yield StreamText(text=event.text)
             elif isinstance(event, ThinkingDelta):
@@ -714,7 +717,7 @@ class Agent:
         messages: list[Any],
         system: str,
         tools: list[dict[str, Any]],
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncIterator[StreamEvent | RetryEvent]:
         can_retry = bool(messages and messages[-1].tool_results)
         retried = False
 
@@ -729,10 +732,11 @@ class Agent:
                 return
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                if not can_retry or retried or emitted:
+            except LLMError as error:
+                if not can_retry or retried or emitted or not error.retryable:
                     raise
                 retried = True
+                yield RetryEvent(reason=f"{error.category} provider retry")
 
     # 执行 Agent 主循环：注入环境 → 长期记忆注入 → MCP 连接
     # → 每轮 prompt → 模型流 → 工具执行 → 回灌。
