@@ -9,6 +9,7 @@ import pytest
 from seacode.client import (
     ANTHROPIC_MODEL_FETCH_TIMEOUT,
     AnthropicClient,
+    LLMClient,
     OpenAIClient,
     OpenAICompatClient,
     StreamComplete,
@@ -121,6 +122,21 @@ def _provider(protocol: str) -> ProviderConfig:
         api_key="test-key",
         thinking=protocol == "anthropic",
     )
+
+
+# 验证三个协议客户端都公开 ProviderConfig 中的模型名称。
+# 使用真实客户端适配器但替换外部 SDK，断言状态层可依赖统一模型契约。
+@pytest.mark.parametrize("protocol", ["anthropic", "openai", "openai-compat"])
+def test_clients_expose_configured_model(protocol: str) -> None:
+    config = _provider(protocol)
+    client: LLMClient
+    if protocol == "anthropic":
+        client = AnthropicClient(config, client=object())
+    elif protocol == "openai":
+        client = OpenAIClient(config, client=object())
+    else:
+        client = OpenAICompatClient(config, client=object())
+    assert client.model == "test-model"
 
 
 # 收集异步客户端事件，便于检查统一事件序列。

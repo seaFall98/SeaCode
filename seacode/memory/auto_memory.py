@@ -490,7 +490,7 @@ class MemoryManager:
             except OSError:
                 pass
 
-    # 清除两个目录中所有 .md 文件（包括 MEMORY.md）。
+    # 删除两个目录中的叶子记忆文件，并保留清空后的 MEMORY.md 索引。
     def clear(self) -> None:
         _clear_dir(self._user_mem_dir)
         _clear_dir(self._mem_dir)
@@ -553,7 +553,7 @@ def _extract_field(block: str, field: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-# 删除目录中所有 .md 文件（包括 MEMORY.md）。
+# 删除目录中的叶子记忆文件，并清空已有的 MEMORY.md 索引。
 def _clear_dir(dir_path: str) -> None:
     if not dir_path:
         return
@@ -563,6 +563,12 @@ def _clear_dir(dir_path: str) -> None:
     try:
         for entry in d.iterdir():
             if entry.is_dir() or not entry.name.endswith(".md"):
+                continue
+            if entry.name == ENTRYPOINT_NAME:
+                try:
+                    entry.write_text("", encoding="utf-8")
+                except OSError:
+                    pass
                 continue
             try:
                 entry.unlink()

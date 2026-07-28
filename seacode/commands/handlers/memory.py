@@ -23,7 +23,7 @@ async def handle_memory(ctx: CommandContext) -> None:
         if ctx.memory_manager is None:
             ctx.ui.add_system_message("记忆系统未初始化")
             return
-        ctx.memory_manager.clear_memories()
+        ctx.memory_manager.clear()
         ctx.ui.add_system_message("已清空")
         return
 
@@ -31,7 +31,7 @@ async def handle_memory(ctx: CommandContext) -> None:
         if ctx.memory_manager is None:
             ctx.ui.add_system_message("记忆系统未初始化")
             return
-        paths = ctx.memory_manager.get_memory_file_paths()
+        paths = (ctx.memory_manager.user_path, ctx.memory_manager.project_path)
         lines = ["记忆文件路径（手动编辑后重启生效）："]
         for p in paths:
             lines.append(f"  {p}")

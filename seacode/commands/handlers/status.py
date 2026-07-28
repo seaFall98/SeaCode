@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+from seacode import __version__
 from seacode.commands.registry import Command, CommandContext, CommandType
 
 
@@ -14,7 +15,7 @@ async def handle_status(ctx: CommandContext) -> None:
     session = ctx.session
     memory_manager = ctx.memory_manager
 
-    model = getattr(agent, "model", "未知")
+    model = agent.model if agent is not None else "未知"
     plan_mode = getattr(agent, "plan_mode", False)
     # 权限模式：default / acceptEdits / bypassPermissions / plan；agent 为 None 时 unknown。
     if agent is not None:
@@ -38,11 +39,9 @@ async def handle_status(ctx: CommandContext) -> None:
         )
     memory_count = 0
     if memory_manager is not None:
-        memories = getattr(memory_manager, "memories", None)
-        if memories is not None:
-            memory_count = len(memories)
-    work_dir = os.getcwd()
-    version = "0.1.0"
+        memory_count = len(memory_manager.get_memories())
+    work_dir = agent.work_dir if agent is not None else os.getcwd()
+    version = __version__
 
     lines = [
         "SeaCode 当前状态",

@@ -111,6 +111,11 @@ type StreamEvent = (
 class LLMClient(ABC):
     """为上层提供统一的三家协议流式接口。"""
 
+    # 返回当前连接使用的模型名称；自定义 client 未提供模型时返回空串。
+    @property
+    def model(self) -> str:
+        return ""
+
     # 声明为同步方法返回 AsyncIterator；子类以 async generator 实现，调用方式不变。
     @abstractmethod
     def stream(
@@ -223,6 +228,11 @@ class AnthropicClient(LLMClient):
             api_key=_api_key(config),
             base_url=config.base_url,
         )
+
+    # 返回 Anthropic Provider 配置中的模型名称。
+    @property
+    def model(self) -> str:
+        return self._config.model
 
     # 更新后续请求的最大输出 token 数。
     def set_max_output_tokens(self, n: int) -> None:
@@ -394,6 +404,11 @@ class OpenAIClient(LLMClient):
             base_url=config.base_url,
         )
 
+    # 返回 OpenAI Responses Provider 配置中的模型名称。
+    @property
+    def model(self) -> str:
+        return self._config.model
+
     # 更新后续请求的最大输出 token 数；0 表示不设置上限。
     def set_max_output_tokens(self, n: int) -> None:
         self._max_output_tokens = n
@@ -507,6 +522,11 @@ class OpenAICompatClient(LLMClient):
             api_key=_api_key(config),
             base_url=config.base_url,
         )
+
+    # 返回 OpenAI-compatible Provider 配置中的模型名称。
+    @property
+    def model(self) -> str:
+        return self._config.model
 
     # 更新后续请求的最大输出 token 数。
     def set_max_output_tokens(self, n: int) -> None:
