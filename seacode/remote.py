@@ -416,10 +416,8 @@ class RemoteServer:
             )
             await self._command_done()
             return
-        if not args and command.arg_prompt:
-            await self._broadcast({"type": "system", "data": {"message": command.arg_prompt}})
-            await self._command_done()
-            return
+        # arg_prompt 仅用于命令帮助展示，不是必填参数门禁；handler 负责
+        # 自己的子命令和参数校验，保持 remote 与 TUI 的分发契约一致。
         if command.type == CommandType.LOCAL:
             try:
                 await command.handler(self._build_command_context(args))
@@ -517,7 +515,7 @@ class RemoteServer:
             self.agent.set_permission_mode(mode)
 
     def get_token_count(self) -> tuple[int, int]:
-        used = getattr(self.conversation, "estimated_tokens", 0)
+        used = self.conversation.current_tokens() if self.conversation else 0
         limit = self.providers[0].get_context_window() if self.providers else 0
         return used, limit
 

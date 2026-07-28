@@ -11,7 +11,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any
 
-from seacode.conversation import ConversationManager, Message, ToolResultBlock, ToolUseBlock
+from seacode.conversation import (
+    ConversationManager,
+    Message,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 # 会话 JSONL 与 .meta 的存放目录（相对工作目录）。
 SESSIONS_DIR = ".seacode/sessions"
@@ -104,8 +110,15 @@ class SessionRecord:
                     )
                 )
         elif message.role == "assistant":
-            if message.tool_uses:
-                content_blocks: list[dict[str, Any]] = []
+            if message.tool_uses or message.thinking_blocks:
+                content_blocks: list[dict[str, Any]] = [
+                    {
+                        "type": "thinking",
+                        "thinking": block.thinking,
+                        "signature": block.signature,
+                    }
+                    for block in message.thinking_blocks
+                ]
                 if message.content:
                     content_blocks.append({"type": "text", "text": message.content})
                 for tu in message.tool_uses:
@@ -209,6 +222,23 @@ def parse_compact_boundary(record: SessionRecord) -> tuple[str, list[Message]]:
 # ---------------------------------------------------------------------------
 
 
+def _order_tool_result_blocks(
+    results: list[ToolResultBlock], expected_tool_ids: list[str]
+) -> list[ToolResultBlock]:
+    """按相邻 assistant tool_use 的声明顺序恢复 tool_result。"""
+    order = {tool_id: index for index, tool_id in enumerate(expected_tool_ids)}
+    return [
+        result
+        for _, result in sorted(
+            enumerate(results),
+            key=lambda item: (
+                order.get(item[1].tool_use_id, len(order)),
+                item[0],
+            ),
+        )
+    ]
+
+
 def records_to_messages(records: list[SessionRecord]) -> list[Message]:
     """把 SessionRecord 列表还原为 ConversationManager 可消费的 Message 列表。
 
@@ -217,6 +247,7 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
     """
     messages: list[Message] = []
     pending_tool_results: list[ToolResultBlock] = []
+    pending_tool_ids: list[str] = []
 
     for record in records:
         if record.type == RecordType.TOOL_RESULT:
@@ -235,9 +266,19 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
 
         if pending_tool_results:
             messages.append(
-                Message(role="user", content="", tool_results=pending_tool_results)
+                Message(
+                    role="user",
+                    content="",
+                    tool_results=_order_tool_result_blocks(
+                        pending_tool_results, pending_tool_ids
+                    ),
+                )
             )
             pending_tool_results = []
+            pending_tool_ids = []
+
+        if record.type != RecordType.ASSISTANT:
+            pending_tool_ids = []
 
         if record.type == RecordType.SYSTEM_PROMPT:
             continue
@@ -274,11 +315,19 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
             if isinstance(record.content, list):
                 text = ""
                 tool_uses: list[ToolUseBlock] = []
+                thinking_blocks: list[ThinkingBlock] = []
                 for block in record.content:
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "text":
                         text += block.get("text", "")
+                    elif block.get("type") == "thinking":
+                        thinking_blocks.append(
+                            ThinkingBlock(
+                                thinking=block.get("thinking") or "",
+                                signature=block.get("signature") or "",
+                            )
+                        )
                     elif block.get("type") == "tool_use":
                         tool_uses.append(
                             ToolUseBlock(
@@ -287,17 +336,29 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
                                 arguments=block.get("input", {}),
                             )
                         )
-                messages.append(
-                    Message(role="assistant", content=text, tool_uses=tool_uses)
+                assistant_message = Message(
+                    role="assistant",
+                    content=text,
+                    tool_uses=tool_uses,
+                    thinking_blocks=thinking_blocks,
                 )
+                messages.append(assistant_message)
+                pending_tool_ids = [tool.tool_use_id for tool in tool_uses]
             else:
                 messages.append(
                     Message(role="assistant", content=record.content or "")
                 )
+                pending_tool_ids = []
 
     if pending_tool_results:
         messages.append(
-            Message(role="user", content="", tool_results=pending_tool_results)
+            Message(
+                role="user",
+                content="",
+                tool_results=_order_tool_result_blocks(
+                    pending_tool_results, pending_tool_ids
+                ),
+            )
         )
 
     return messages

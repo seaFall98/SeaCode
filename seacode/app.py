@@ -75,7 +75,7 @@ from .commands.handlers.trace import create_trace_command
 from .commands.handlers.worktree import create_worktree_command
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig, WorktreeConfig
 from .context import CompactCircuitBreaker, RecoveryState, create_replacement_state
-from .conversation import ConversationManager, Message
+from .conversation import ConversationManager, ConversationSnapshot, Message
 from .filehistory.history import FileHistory
 from .hooks import HookContext, HookEngine
 from .mcp import MCPManager
@@ -950,6 +950,20 @@ class SeaCodeApp(App[None]):
             self._show_startup_error(error)
             return
 
+        provider_switch = (
+            self._selected_provider is not None
+            and self._selected_provider != provider
+        )
+        if provider_switch:
+            if self._session is not None:
+                self._session.close()
+            self._agent = None
+            self._conversation = ConversationManager()
+            self._recovery_state = RecoveryState()
+            self._compact_breaker = CompactCircuitBreaker()
+            self._replacement_state = create_replacement_state()
+            self._active_skills = {}
+
         self._selected_provider = provider
         self._assemble_permission_system()
         self._tool_registry.register(
@@ -1023,9 +1037,11 @@ class SeaCodeApp(App[None]):
         self._assemble_worktree_system(work_dir)
         # batch14：装配团队协调系统。TeamManager 依赖 worktree_manager 与 trace_manager，
         # 任一为 None 时仍可工作（路径降级）。TeamCreate/TeamDelete/SendMessage 工具注册到
-        # Lead 工具集；Lead Agent 的 _team_manager 与 notification_fn 在 _run_turn 中注入。
+        # Lead 工具集；长生命周期 Lead Agent 在此处绑定这些依赖。
         # 周期刷新 task 每秒拉取 teammates progress 并刷新 TeammateTree。失败不阻断启动。
         self._assemble_teams_system()
+        # 主 Agent 在 Provider 选择后创建一次；同一会话的后续回合复用它。
+        self._initialize_agent(work_dir)
         # 启动后台任务通知轮询；on_unmount 时取消。
         if self.task_manager is not None and self._notification_polling_task is None:
             try:
@@ -1046,6 +1062,114 @@ class SeaCodeApp(App[None]):
         input_widget = self.query_one(ChatInput)
         input_widget.disabled = False
         input_widget.focus()
+
+    # 创建当前 Provider 的主 Agent，并一次性绑定应用级工具、Skill、团队和权限引用。
+    def _initialize_agent(self, work_dir: str) -> Agent:
+        if self._client is None or self._selected_provider is None:
+            raise RuntimeError("Provider is not initialized")
+
+        agent = Agent(
+            client=self._client,
+            registry=self._tool_registry,
+            protocol=self._selected_provider.protocol,
+            work_dir=work_dir,
+            max_iterations=self._max_steps,
+            permission_checker=self._permission_checker,
+            mcp_manager=self._mcp_manager,
+            context_window=self._selected_provider.get_context_window(),
+            instructions_content=self._instructions_content,
+            memory_manager=self._memory_manager,
+            hook_engine=self._hook_engine,
+        )
+        self._agent = agent
+        self._configure_agent(agent)
+        return agent
+
+    # 将当前应用装配的会话依赖绑定到长期 Agent；不重置 Agent 的会话状态。
+    def _configure_agent(self, agent: Agent) -> None:
+        agent.recovery_state = self._recovery_state
+        agent.compact_breaker = self._compact_breaker
+        agent.replacement_state = self._replacement_state
+        agent.active_skills = self._active_skills
+        if (
+            self._permission_checker is not None
+            and self._permission_checker.plan_file_path
+        ):
+            agent._plan_path_cache = Path(self._permission_checker.plan_file_path)
+        if self.file_history is not None:
+            agent.file_history = self.file_history
+        if self._session is not None:
+            agent.session_id = self._session.session_id
+
+        self._skill_executor._agent = agent
+        self._load_skill_tool.set_agent(agent)
+        agent.set_skill_loader(self._skill_loader)
+        agent.set_skill_catalog(self._build_skill_catalog_text())
+        if self.agent_loader is not None:
+            agent.set_agent_catalog(
+                self._build_agent_catalog_text(),
+                self.agent_loader.list_agents(),
+            )
+        agent.set_full_registry(self._tool_registry)
+        if self._agent_tool is not None:
+            self._agent_tool.parent_agent = agent
+
+        if self.team_manager is not None:
+            agent._team_manager = self.team_manager
+            agent.notification_fn = (
+                lambda: self.team_manager.drain_lead_mailbox()
+                if self.team_manager is not None
+                else []
+            )
+            for tool in self._tool_registry.list_tools():
+                if hasattr(tool, "_parent_agent"):
+                    tool._parent_agent = agent
+
+    # 将当前会话切换为新的 Session 与消息历史，并重置会话级 Agent 状态。
+    def _switch_session(self, session: Session, messages: list[Message]) -> None:
+        if self._session is not None and self._session is not session:
+            self._session.close()
+        self._session = session
+
+        conversation = ConversationManager()
+        conversation.replace_history(list(messages))
+        conversation.mark_all_persisted()
+        conversation.mark_runtime_context_from_history()
+        self._conversation = conversation
+
+        self._recovery_state = RecoveryState()
+        self._compact_breaker = CompactCircuitBreaker()
+        self._replacement_state = create_replacement_state()
+        self._active_skills = {}
+        self._plan_exit_requested = False
+        self._plan_approval_active = False
+        self._has_exited_plan_mode = False
+        if self._permission_checker is not None:
+            self._permission_checker.plan_file_path = ""
+
+        work_dir = self._agent.work_dir if self._agent is not None else os.getcwd()
+        try:
+            self.file_history = FileHistory(work_dir, session.session_id)
+            for tool in self._tool_registry.list_tools():
+                if hasattr(tool, "file_history"):
+                    try:
+                        tool.file_history = self.file_history
+                    except Exception:
+                        continue
+        except Exception:
+            self.file_history = None
+
+        if self._agent is not None:
+            self._agent.reset_for_session(
+                session_id=session.session_id,
+                work_dir=work_dir,
+                file_history=self.file_history,
+                recovery_state=self._recovery_state,
+                compact_breaker=self._compact_breaker,
+                replacement_state=self._replacement_state,
+                active_skills=self._active_skills,
+            )
+            self._configure_agent(self._agent)
 
     # batch13：装配 WorktreeManager、FileHistory、工具与命令注册、后台清理 task。
     # 任一步失败静默降级，不阻断 Provider 选择主流程；worktree_manager 为 None 时
@@ -1281,11 +1405,8 @@ class SeaCodeApp(App[None]):
                 f"未知命令：{name}，输入 /help 查看可用命令"
             )
             return True
-        if cmd.arg_prompt and not args.strip():
-            await self._show_system_message(
-                f"参数不足：{cmd.arg_prompt}\n用法：{cmd.usage}"
-            )
-            return True
+        # arg_prompt 是 /help 的参数提示，不代表参数必填；具体的子命令和
+        # 参数校验由 handler 负责，保证无参数的 list/status/help 路径可达。
         ctx = self._build_command_context(args)
         try:
             await cmd.handler(ctx)
@@ -1309,6 +1430,7 @@ class SeaCodeApp(App[None]):
                 "registry": self._command_registry,
                 "set_session": self._set_session,
                 "set_conversation": self._set_conversation,
+                "switch_session": self._switch_session,
                 "clear_chat": self._clear_chat,
                 "render_restored": lambda msgs: asyncio.create_task(
                     self._render_restored_messages(msgs)
@@ -1388,7 +1510,7 @@ class SeaCodeApp(App[None]):
 
     # UIController: 返回当前 token 用量与上限，供 /status 与 /compact 使用。
     def get_token_count(self) -> tuple[int, int]:
-        used = getattr(self._conversation, "estimated_tokens", 0)
+        used = self._conversation.current_tokens()
         limit = 0
         if self._selected_provider is not None:
             limit = self._selected_provider.get_context_window()
@@ -1407,9 +1529,8 @@ class SeaCodeApp(App[None]):
     def _set_conversation(self, conversation: ConversationManager) -> None:
         self._conversation = conversation
 
-    # 会话状态回调：清空对话区与对话历史，供 /clear 与 /session new 使用。
+    # 会话状态回调：清空对话区；历史由统一 session transition 负责替换。
     def _clear_chat(self) -> None:
-        self._conversation = ConversationManager()
         try:
             chat = self.query_one("#chat-area", VerticalScroll)
             for child in list(chat.children):
@@ -1684,14 +1805,15 @@ class SeaCodeApp(App[None]):
         input_widget = self.query_one(ChatInput)
         input_widget.disabled = True
 
-        # 记录回合起点，失败时回滚到此长度，避免不完整回合污染历史。
-        turn_start_len = len(self._conversation.messages)
-        self._conversation.add_user_message(text)
+        # 保存精确历史快照；失败时不能按长度截断，因为 Agent 会在头部插入运行时上下文。
+        turn_snapshot = self._conversation.snapshot()
+        if text:
+            self._conversation.add_user_message(text)
 
-        user_message = Text()
-        user_message.append("❯ ", style="bold #71b8bc")
-        user_message.append(text, style="bold #f2f5f5")
-        await self._append_static(user_message, "message user-message")
+            user_message = Text()
+            user_message.append("❯ ", style="bold #71b8bc")
+            user_message.append(text, style="bold #f2f5f5")
+            await self._append_static(user_message, "message user-message")
 
         chat = self.query_one("#chat-area", VerticalScroll)
         ai_row = Vertical(classes="ai-row")
@@ -1711,7 +1833,9 @@ class SeaCodeApp(App[None]):
         total_output = 0
 
         try:
-            # batch13：在创建 Agent 前 await restore_session 结果。
+            # 用户消息先于 Provider 请求落盘；失败时仍可在下一次启动恢复用户意图。
+            self._flush_session_messages()
+            # batch13：在首个回合 await restore_session 结果。
             # 若恢复了中断的 worktree session，把 Agent 的 work_dir 切换到 worktree 路径，
             # 让工具调用直接在隔离工作区执行；未恢复时使用当前工作目录。
             restored_work_dir: str | None = None
@@ -1724,84 +1848,23 @@ class SeaCodeApp(App[None]):
                     # restore_session 失败不阻断主循环；按当前工作目录继续。
                     pass
                 self._restore_session_task = None
-            agent = Agent(
-                client=client,
-                registry=self._tool_registry,
-                protocol=provider.protocol,
-                work_dir=os.getcwd(),
-                max_iterations=self._max_steps,
-                permission_checker=self._permission_checker,
-                mcp_manager=self._mcp_manager,
-                context_window=provider.get_context_window(),
-                instructions_content=self._instructions_content,
-                memory_manager=self._memory_manager,
-                # batch11：注入 HookEngine；Agent.run 在 8 个注入点触发对应生命周期事件。
-                hook_engine=self._hook_engine,
-            )
-            # Agent 每回合重建，恢复快照和压缩状态必须复用当前应用会话对象。
-            agent.recovery_state = self._recovery_state
-            agent.compact_breaker = self._compact_breaker
-            agent.replacement_state = self._replacement_state
-            agent.active_skills = self._active_skills
-            if (
-                self._permission_checker is not None
-                and self._permission_checker.plan_file_path
-            ):
-                agent._plan_path_cache = Path(self._permission_checker.plan_file_path)
-            # 保存当前回合 Agent 引用，供命令路径（/status /compact /plan 等）访问。
-            self._agent = agent
-            # batch13：注入 FileHistory 与恢复的 worktree work_dir。
-            # file_history 为 None 时 Agent.run 跳过 make_snapshot（向后兼容）。
-            if self.file_history is not None:
-                agent.file_history = self.file_history
+            agent = self._agent
+            if agent is None:
+                agent = self._initialize_agent(os.getcwd())
+            # batch13：恢复的 worktree 只改变本次长期 Agent 的工作目录；
+            # FileHistory 和会话句柄仍由当前 SeaCode session 管理。
             if restored_work_dir is not None:
                 agent.work_dir = restored_work_dir
-            # batch10：刷新 Skill 系统对当前回合 Agent 的引用。
-            # executor 持有 agent 供 inline/fork 执行；load_skill 调 agent.activate_skill。
-            # skill_catalog 注入环境上下文，让模型知道可用 Skill。
-            self._skill_executor._agent = agent
-            self._load_skill_tool.set_agent(agent)
-            agent.set_skill_loader(self._skill_loader)
-            agent.set_skill_catalog(self._build_skill_catalog_text())
-            # batch12：注入子 Agent 目录摘要与完整工具注册表引用。
-            # set_agent_catalog 让 agent.run 把 ## Available Sub-Agent Types 段落注入环境上下文；
-            # set_full_registry 让 AgentTool 在 fork/定义式路径克隆或过滤父 Agent 工具集。
-            # AgentTool.parent_agent 也在此刷新为当前回合 Agent（execute 时仍由 agent 传入覆盖）。
-            if self.agent_loader is not None:
-                agent.set_agent_catalog(
-                    self._build_agent_catalog_text(),
-                    self.agent_loader.list_agents(),
-                )
-            agent.set_full_registry(self._tool_registry)
-            if self._agent_tool is not None:
-                self._agent_tool.parent_agent = agent
-            # batch14：注入 TeamManager 与 notification_fn 到当前回合 Lead Agent。
-            # notification_fn 按团队保存的 Lead 标识消费未读消息，
-            # 每轮拼成 <team-notification> XML 注入对话历史。
-            # team_manager 为 None 时（装配失败或未启用）静默跳过，向后兼容 batch01-13。
-            if self.team_manager is not None:
-                agent._team_manager = self.team_manager
-                agent.notification_fn = (
-                    lambda: self.team_manager.drain_lead_mailbox()
-                    if self.team_manager is not None
-                    else []
-                )
-                # 同步刷新 TeamCreate/TeamDelete/SendMessage 工具的 parent_agent 引用。
-                # 每回合重建 Agent，故需刷新引用避免访问过期 Agent 的 agent_id。
-                for tool in self._tool_registry.list_tools():
-                    if hasattr(tool, "_parent_agent"):
-                        tool._parent_agent = agent
-            # 同步当前会话 ID 给 Agent，仅用于压缩摘要里的 transcript_path 提示。
-            if self._session is not None:
-                agent.session_id = self._session.session_id
             if text:
+                if (
+                    agent.memory_recall_task is not None
+                    and not agent.memory_recall_task.done()
+                ):
+                    agent.memory_recall_task.cancel()
                 agent.memory_recall_task = asyncio.create_task(
                     self._prefetch_relevant_memories(text)
                 )
                 agent._memory_recall_consumed = False
-            # 持久化游标：记录已写入 JSONL 的历史末尾位置。
-            # TurnComplete 增量追加新消息；CompactNotification 先写 boundary 再推进游标。
-            history_cursor = len(self._conversation.messages)
             # 在聊天区底部 mount 持续旋转的 spinner，thinking 期间显示 ⠋ verb… (Ns)。
             self._spinner_idx = 0
             self._spinner_label = Static(
@@ -1912,10 +1975,9 @@ class SeaCodeApp(App[None]):
                     await self._show_system_message(f"⚙ {event.message}")
                     chat.scroll_end(animate=False)
                     # 持久化 compact_boundary：将摘要 + 原样保留的尾部内联成一条记录，
-                    # resume 时只需这一条即可重建压缩后状态。然后推进游标到重建后的
-                    # 历史末尾，避免 TurnComplete/LoopComplete 把已压缩前缀重复写入。
+                    # resume 时只需这一条即可重建压缩后状态；持久化边界会把当前
+                    # compact 结果标记为已落盘。
                     self._persist_compact_boundary(event)
-                    history_cursor = len(self._conversation.messages)
                 elif isinstance(event, HookEvent):
                     # batch11：Hook 执行结果在对话区呈现状态行，与 CompactNotification 同层级。
                     status = "OK" if event.success else "FAIL"
@@ -1944,12 +2006,8 @@ class SeaCodeApp(App[None]):
                         for _, blk in collapsible:
                             blk.display = False
                         await ai_row.mount(summary)
-                    # 增量持久化：把本回合新增的消息（user + assistant
-                    # + tool_results）追加到 JSONL。
-                    if self._session is not None:
-                        for msg in self._conversation.messages[history_cursor:]:
-                            self._session.append(msg)
-                        history_cursor = len(self._conversation.messages)
+                    # TurnComplete 只表示一次工具迭代完成；assistant/tool 链仍可能
+                    # 继续请求 Provider，延迟到 LoopComplete 才提交，避免失败时落盘半截回合。
                     # 重置工具块字典，开新 ai_row 供下一轮工具调用。
                     tool_blocks.clear()
                     ai_row = Vertical(classes="ai-row")
@@ -1969,9 +2027,7 @@ class SeaCodeApp(App[None]):
                     # 收尾持久化：把最后一轮 assistant 回复追加到 JSONL，
                     # 并更新 meta.total_tokens 与 summary（后台异步生成）。
                     if self._session is not None:
-                        for msg in self._conversation.messages[history_cursor:]:
-                            self._session.append(msg)
-                        history_cursor = len(self._conversation.messages)
+                        self._flush_session_messages()
                         self._session.meta.total_tokens = (
                             agent.total_input_tokens + agent.total_output_tokens
                         )
@@ -2005,14 +2061,15 @@ class SeaCodeApp(App[None]):
                     )
                 )
             await self._show_system_message("Operation cancelled")
+            self._rollback_turn(turn_snapshot)
             self._set_status("Ready")
             raise
         except LLMError as error:
-            self._rollback_turn(turn_start_len)
+            self._rollback_turn(turn_snapshot)
             await self._append_error(self._error_message(error))
             self._set_status("Ready")
         except Exception:
-            self._rollback_turn(turn_start_len)
+            self._rollback_turn(turn_snapshot)
             await self._append_error(
                 "The request could not be completed. Check the model configuration."
             )
@@ -2061,10 +2118,9 @@ class SeaCodeApp(App[None]):
                 except Exception:
                     pass
 
-    # 回滚本回合新增的所有消息，避免不完整历史污染后续请求。
-    def _rollback_turn(self, turn_start_len: int) -> None:
-        while len(self._conversation.messages) > turn_start_len:
-            self._conversation.drop_last()
+    # 回滚本回合的内存历史，避免头部运行时注入导致旧消息被误删。
+    def _rollback_turn(self, snapshot: ConversationSnapshot) -> None:
+        self._conversation.restore_snapshot(snapshot)
 
     # 在对话区追加一条安全的静态文本消息。
     async def _append_static(self, content: Text, css_class: str) -> None:
@@ -2132,6 +2188,16 @@ class SeaCodeApp(App[None]):
             keep=notification.boundary.keep,
         )
         self._session.append_record(record)
+        self._conversation.mark_all_persisted()
+
+    # 把当前历史中尚未落盘的 canonical 消息按顺序追加到 JSONL。
+    def _flush_session_messages(self) -> None:
+        if self._session is None:
+            return
+        messages = self._conversation.messages_to_persist()
+        for message in messages:
+            self._session.append(message)
+        self._conversation.mark_persisted(messages)
 
     # 后台异步生成会话摘要并写入 .meta；失败静默不影响主循环。
     # 摘要取最近 10 条消息裸 LLM 调用一句话总结，用于 session_dialog 列表展示。
@@ -2194,14 +2260,8 @@ class SeaCodeApp(App[None]):
             await self._show_system_message("会话恢复失败：文件已损坏或被删除")
             return
 
-        # 关闭旧 session 句柄，替换为恢复的句柄；重置对话历史并渲染已恢复的消息。
-        if self._session is not None:
-            self._session.close()
-        self._session = result.session
-        new_conv = ConversationManager()
-        for msg in result.messages:
-            new_conv.history.append(msg)
-        self._conversation = new_conv
+        # 统一切换 Session、历史和长期 Agent，保证 Ctrl+R 与 /session resume 语义一致。
+        self._switch_session(result.session, result.messages)
         await self._render_restored_messages(result.messages)
         await self._show_system_message(
             f"已恢复会话 {result.session.session_id}（{len(result.messages)} 条消息）"

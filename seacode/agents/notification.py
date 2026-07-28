@@ -47,4 +47,8 @@ def inject_task_notifications(
 ) -> None:
     for task in tasks:
         notification = format_task_notification(task)
-        conversation.add_user_message(notification)
+        if hasattr(conversation, "messages_to_persist"):
+            conversation.add_user_message(notification, persist=False)
+        else:
+            # 保持最小假对话对象和旧扩展实现的兼容性。
+            conversation.add_user_message(notification)

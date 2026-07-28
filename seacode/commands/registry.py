@@ -49,6 +49,7 @@ class CommandContext:
 
 
 # 命令定义：name 为主键，aliases 为别名列表，hidden 控制是否在 /help 中列出。
+# arg_prompt 仅是帮助中的参数提示；参数是否必填由 handler 自己校验。
 @dataclass
 class Command:
     name: str

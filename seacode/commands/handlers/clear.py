@@ -10,18 +10,20 @@ from seacode.conversation import ConversationManager
 # 重建 ConversationManager → 重置 loop_count/skills/tokens →
 # clear_chat → refresh_status → 提示。
 async def handle_clear(ctx: CommandContext) -> None:
-    # 关闭旧 session，释放资源。
-    if ctx.session:
-        ctx.session.close()
-
     new_session_id = ""
     if ctx.session_manager is not None:
         new_session = ctx.session_manager.create()
-        ctx.config["set_session"](new_session)
+        switch_session = ctx.config.get("switch_session")
+        if callable(switch_session):
+            switch_session(new_session, [])
+        else:
+            if ctx.session:
+                ctx.session.close()
+            ctx.config["set_session"](new_session)
         new_session_id = getattr(new_session, "session_id", "")
 
         # 用新 session ID 重建 file history，让新会话的 /rewind 列表只显示新快照。
-        if ctx.agent:
+        if ctx.agent and not callable(switch_session):
             from seacode.filehistory.history import FileHistory
             work_dir = getattr(ctx.agent, "_work_dir", None) or getattr(ctx.agent, "work_dir", None)
             if work_dir and new_session_id:
@@ -31,8 +33,9 @@ async def handle_clear(ctx: CommandContext) -> None:
                     if hasattr(tool, "file_history"):
                         tool.file_history = file_history
 
-    # 重建 ConversationManager，清空对话历史。
-    ctx.config["set_conversation"](ConversationManager())
+    # 没有统一切换回调时保留旧运行时的显式历史替换。
+    if not callable(ctx.config.get("switch_session")):
+        ctx.config["set_conversation"](ConversationManager())
 
     # 重置 Agent 运行时状态：循环计数、技能、token 统计。
     if ctx.agent:

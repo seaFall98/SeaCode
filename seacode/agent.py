@@ -327,6 +327,22 @@ class StreamingExecutor:
         return out
 
 
+# 按 assistant 发出的 tool_call 顺序排列回灌结果，避免并发、拒绝与延迟路径
+# 拼接出的 tool_result 顺序被兼容 Chat Completions provider 拒绝。
+def _order_tool_results(
+    tool_results: list[ToolResultBlock],
+    tool_calls: list[ToolCallComplete],
+) -> list[ToolResultBlock]:
+    order = {call.tool_id: index for index, call in enumerate(tool_calls)}
+    return [
+        result
+        for _, result in sorted(
+            enumerate(tool_results),
+            key=lambda item: (order.get(item[1].tool_use_id, len(order)), item[0]),
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Agent 主循环
 # ---------------------------------------------------------------------------
@@ -468,6 +484,47 @@ class Agent:
         # Plan 模式下同一 Agent Loop 复用的计划文件路径。
         self._plan_path_cache: Path | None = None
 
+    # 切换到新会话时重置所有会话级状态，保留 Provider 与工具装配。
+    def reset_for_session(
+        self,
+        *,
+        session_id: str,
+        work_dir: str,
+        file_history: Any = None,
+        recovery_state: RecoveryState | None = None,
+        compact_breaker: CompactCircuitBreaker | None = None,
+        replacement_state: ContentReplacementState | None = None,
+        active_skills: dict[str, str] | None = None,
+    ) -> None:
+        if self.memory_recall_task is not None and not self.memory_recall_task.done():
+            self.memory_recall_task.cancel()
+
+        self.work_dir = work_dir
+        self.session_dir = ensure_session_dir(work_dir)
+        self.session_id = session_id
+        self.file_history = file_history
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self._loop_count = 0
+        self.compact_breaker = compact_breaker or CompactCircuitBreaker()
+        self.recovery_state = recovery_state or RecoveryState()
+        self.replacement_state = replacement_state or create_replacement_state()
+        self.active_skills = active_skills if active_skills is not None else {}
+        self.memory_recall_task = None
+        self._memory_recall_consumed = False
+        self._extracting = False
+        self._pending_extraction = False
+        self._current_definition = None
+        self._fork_conversation = None
+        self._current_conversation = None
+        self.last_output = ""
+        self._plan_path_cache = None
+        self._transcript_path = ""
+        self.agent_id = uuid4().hex[:12]
+        # 新会话需要重新把已连接 MCP 的 instructions 注入新对话；Manager
+        # 会复用已建立的连接与工具，不会重复建立外部连接。
+        self._mcp_connected = False
+
     # 切换权限模式；同步更新 permission_checker.mode 保持一致。
     def set_permission_mode(self, mode: PermissionMode) -> None:
         self.permission_mode = mode
@@ -504,7 +561,7 @@ class Agent:
     # 手动触发 Layer 2 压缩：跳过阈值检查与熔断器直接走压缩流程。
     # 成功返回 CompactNotification（携带结构化 boundary 供 /compact 持久化），
     # 失败返回 ErrorEvent；auto_compact 内部已重写 conversation.history，
-    # 调用方下一次 _send_message 会重新捕获 history_cursor，无需手动重置。
+    # 调用方随后通过 ConversationManager 的持久化边界继续追加新消息。
     async def manual_compact(
         self, conversation: ConversationManager
     ) -> CompactNotification | ErrorEvent:
@@ -578,7 +635,8 @@ class Agent:
         msgs = mailbox.consume(self.agent_id)
         for msg in msgs:
             conversation.add_user_message(
-                f"From {msg.from_agent}: {msg.content}"
+                f"From {msg.from_agent}: {msg.content}",
+                persist=False,
             )
 
     # batch14：每轮开头消费 lead 邮箱与注入 notification_fn 返回的提示。
@@ -644,11 +702,39 @@ class Agent:
 
         return result
 
+    # 工具结果回灌后的 Provider 请求若在首个流事件前失败，最多重试一次。
+    # 此时工具已经执行完成，重试只重发同一消息链，不会重复执行副作用工具。
+    async def _stream_with_post_tool_retry(
+        self,
+        messages: list[Any],
+        system: str,
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamEvent]:
+        can_retry = bool(messages and messages[-1].tool_results)
+        retried = False
+
+        while True:
+            emitted = False
+            try:
+                async for event in self.client.stream(
+                    messages, system=system, tools=tools
+                ):
+                    emitted = True
+                    yield event
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not can_retry or retried or emitted:
+                    raise
+                retried = True
+
     # 执行 Agent 主循环：注入环境 → 长期记忆注入 → MCP 连接
     # → 每轮 prompt → 模型流 → 工具执行 → 回灌。
     async def run(
         self, conversation: ConversationManager
     ) -> AsyncIterator[AgentEvent]:
+        self._current_conversation = conversation
         # batch13：用户回合起点留档；以最后一条 user 消息内容为快照文本，
         # 消息数作为 message_index 供 /rewind 列表展示。file_history 为 None
         # 时跳过（向后兼容 batch01-12 行为）。
@@ -823,7 +909,9 @@ class Agent:
             rejected_results: list[ToolResultBlock] = []
 
             messages = conversation.get_messages()
-            llm_stream = self.client.stream(messages, system=system, tools=tools)
+            llm_stream = self._stream_with_post_tool_retry(
+                messages, system=system, tools=tools
+            )
 
             # 流式消费：文本/思考增量转发，工具调用完整后立即提交执行。
             async for event in collector.consume(llm_stream):
@@ -907,23 +995,25 @@ class Agent:
                     max_tokens_escalated = True
                     if response.text:
                         conversation.add_assistant_message(
-                            response.text, thinking_blocks=conv_thinking
+                            response.text, thinking_blocks=conv_thinking, persist=False
                         )
                         conversation.add_user_message(
                             "Output token limit hit. Resume directly from where you stopped. "
                             "Do not apologize or repeat previous content. "
-                            "Pick up mid-thought if needed."
+                            "Pick up mid-thought if needed.",
+                            persist=False,
                         )
                     yield RetryEvent(reason="max_tokens escalation")
                     continue
                 elif output_recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
                     output_recoveries += 1
                     conversation.add_assistant_message(
-                        response.text, thinking_blocks=conv_thinking
+                        response.text, thinking_blocks=conv_thinking, persist=False
                     )
                     conversation.add_user_message(
                         "Output token limit hit. Resume directly from where you stopped. "
-                        "Break remaining work into smaller pieces."
+                        "Break remaining work into smaller pieces.",
+                        persist=False,
                     )
                     yield RetryEvent(
                         reason=f"max_tokens recovery {output_recoveries}"
@@ -1078,6 +1168,8 @@ class Agent:
                     )
                     for he in self._drain_hook_events():
                         yield he
+
+            tool_results = _order_tool_results(tool_results, response.tool_calls)
 
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
@@ -1442,7 +1534,9 @@ class Agent:
             # 每轮重新获取工具 Schema（mark_discovered 后新工具立即纳入）。
             tools = self.registry.get_all_schemas(self.protocol)
             messages = conv.get_messages()
-            llm_stream = self.client.stream(messages, system=system_prompt, tools=tools)
+            llm_stream = self._stream_with_post_tool_retry(
+                messages, system=system_prompt, tools=tools
+            )
 
             collector = StreamCollector()
             executor = StreamingExecutor()
@@ -1549,6 +1643,8 @@ class Agent:
                         is_error=br.result.is_error,
                     )
                 )
+
+            tool_results = _order_tool_results(tool_results, response.tool_calls)
 
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:

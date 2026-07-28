@@ -83,15 +83,18 @@ async def handle_session(ctx: CommandContext) -> None:
         if result is None:
             ctx.ui.add_system_message(f"会话未找到：{session_id}")
             return
-        # 恢复前关闭旧 session，避免文件句柄泄漏。
-        if ctx.session:
-            ctx.session.close()
-        ctx.config["set_session"](result.session)
-        # 重建 ConversationManager 并把恢复的消息灌入历史。
-        conv = ConversationManager()
-        for msg in result.messages:
-            conv.history.append(msg)
-        ctx.config["set_conversation"](conv)
+        switch_session = ctx.config.get("switch_session")
+        if callable(switch_session):
+            switch_session(result.session, result.messages)
+        else:
+            # 保留无 TUI 测试与其它运行时的旧回调协议。
+            if ctx.session:
+                ctx.session.close()
+            ctx.config["set_session"](result.session)
+            conv = ConversationManager()
+            conv.replace_history(result.messages)
+            conv.mark_all_persisted()
+            ctx.config["set_conversation"](conv)
         # 恢复会话时重置 Agent 循环计数，让压缩/终止判定按新会话重新计数。
         if ctx.agent:
             ctx.agent._loop_count = 0
@@ -103,11 +106,15 @@ async def handle_session(ctx: CommandContext) -> None:
 
     if sub == "new":
         # 关闭旧 session 并创建新会话，清空对话历史与渲染区域。
-        if ctx.session:
-            ctx.session.close()
         new_session = sm.create()
-        ctx.config["set_session"](new_session)
-        ctx.config["set_conversation"](ConversationManager())
+        switch_session = ctx.config.get("switch_session")
+        if callable(switch_session):
+            switch_session(new_session, [])
+        else:
+            if ctx.session:
+                ctx.session.close()
+            ctx.config["set_session"](new_session)
+            ctx.config["set_conversation"](ConversationManager())
         # 新会话重置 Agent 循环计数，避免跨会话累计导致提前触发压缩或终止。
         if ctx.agent:
             ctx.agent._loop_count = 0
@@ -134,7 +141,7 @@ async def handle_session(ctx: CommandContext) -> None:
     )
 
 
-# 命令定义：LOCAL 类型，子命令参数提示。
+# 命令定义：LOCAL 类型；无参数时显示当前会话详情，子命令由 handler 校验。
 SESSION_COMMAND = Command(
     name="session",
     description="会话管理",
@@ -142,5 +149,5 @@ SESSION_COMMAND = Command(
     handler=handle_session,
     aliases=[],
     usage="/session [list | resume <id> | new | delete <id>]",
-    arg_prompt="子命令",
+    arg_prompt="",
 )
