@@ -8,7 +8,7 @@ from typing import Any
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.events import Key
+from textual.events import Key, Resize
 from textual.message import Message
 from textual.widgets import Static
 
@@ -45,9 +45,13 @@ def _relative_time(meta: SessionMeta) -> str:
 class InlineResumeWidget(Vertical, can_focus=True):
     """内联会话恢复视图：搜索过滤、上下导航、回车选择、ESC 取消。
 
-    最多展示 10 条会话，超出显示"↓ N more session(s)"提示；
-    选中后通过 Selected 消息向上传递 session_id（None 表示取消）。
+    候选列表按可用高度渲染一个可移动窗口；选中后通过 Selected 消息向上传递
+    session_id（None 表示取消）。
     """
+
+    _DEFAULT_VISIBLE_COUNT = 5
+    _SESSION_ROW_LINES = 3
+    _FIXED_CONTENT_LINES = 9
 
     BINDINGS = [
         Binding("up", "cursor_up", "Up", priority=True),
@@ -75,19 +79,56 @@ class InlineResumeWidget(Vertical, can_focus=True):
         self._filtered = list(sessions)
         self._project = project_name
         self._cursor = 0
+        self._window_start = 0
+        self._visible_count = self._DEFAULT_VISIBLE_COUNT
         self._search = ""
 
     def compose(self) -> ComposeResult:
         yield Static(self._build_content(), id="resume-content")
 
     def on_mount(self) -> None:
+        self._update_visible_count()
         self.focus()
 
-    # 渲染整个视图：标题栏（含搜索框）+ 项目名 + 会话列表（最多 10 条）+ 操作提示。
+    # 根据组件高度计算当前可见候选数，至少保留一条可选项。
+    def _update_visible_count(self) -> None:
+        height = self.region.height
+        if height > 0:
+            available = max(1, height - self._FIXED_CONTENT_LINES)
+            self._visible_count = max(1, available // self._SESSION_ROW_LINES)
+        else:
+            self._visible_count = self._DEFAULT_VISIBLE_COUNT
+        self._sync_window()
+
+    # 终端尺寸变化后重新计算窗口，但不改变当前合法游标。
+    def on_resize(self, event: Resize) -> None:
+        del event
+        self._update_visible_count()
+        self._refresh()
+
+    # 保证当前游标始终位于渲染窗口内，窗口只限制显示范围而不限制候选范围。
+    def _sync_window(self) -> None:
+        total = len(self._filtered)
+        if total == 0:
+            self._cursor = 0
+            self._window_start = 0
+            return
+
+        self._cursor = min(self._cursor, total - 1)
+        visible = max(1, min(self._visible_count, total))
+        max_start = max(0, total - visible)
+        if self._cursor < self._window_start:
+            self._window_start = self._cursor
+        elif self._cursor >= self._window_start + visible:
+            self._window_start = self._cursor - visible + 1
+        self._window_start = min(max(self._window_start, 0), max_start)
+
+    # 渲染整个视图：标题栏（含搜索框）+ 项目名 + 当前会话窗口 + 操作提示。
     def _build_content(self) -> str:
         lines: list[str] = []
         total = len(self._sessions)
         showing = len(self._filtered)
+        self._sync_window()
         lines.append(f"[dim]Resume session ({showing} of {total})[/]\n")
 
         # 搜索框：固定 30 字符宽，含内容时显示输入，否则显示占位符。
@@ -103,10 +144,16 @@ class InlineResumeWidget(Vertical, can_focus=True):
         if self._project:
             lines.append(f"\n  [dim]{self._project}[/]\n")
 
+        start = self._window_start
+        end = min(start + self._visible_count, showing)
+        if start > 0:
+            lines.append(f"  [dim]↑ {start} more session(s)[/]\n")
+
         # 会话列表：当前光标位置加粗高亮，附带相对时间。
-        for i, meta in enumerate(self._filtered[:10]):
+        for index in range(start, end):
+            meta = self._filtered[index]
             title = meta.title or "(empty session)"
-            if i == self._cursor:
+            if index == self._cursor:
                 lines.append(f"[bold cyan]❯[/] [bold]{title}[/]")
             else:
                 lines.append(f"  {title}")
@@ -115,8 +162,8 @@ class InlineResumeWidget(Vertical, can_focus=True):
             lines.append(f"  [dim]{'  ·  '.join(parts)}[/]")
             lines.append("")
 
-        if showing > 10:
-            lines.append(f"  [dim]↓ {showing - 10} more session(s)[/]")
+        if end < showing:
+            lines.append(f"  [dim]↓ {showing - end} more session(s)[/]")
 
         lines.append("[dim]Type to search · Enter to select · Esc to cancel[/]")
         return "\n".join(lines)
@@ -138,16 +185,20 @@ class InlineResumeWidget(Vertical, can_focus=True):
             ]
         # 过滤后重置光标到顶部，避免越界。
         self._cursor = 0
+        self._window_start = 0
+        self._sync_window()
         self._refresh()
 
     def action_cursor_up(self) -> None:
         if self._cursor > 0:
             self._cursor -= 1
+            self._sync_window()
             self._refresh()
 
     def action_cursor_down(self) -> None:
-        if self._cursor < min(len(self._filtered), 10) - 1:
+        if self._cursor < len(self._filtered) - 1:
             self._cursor += 1
+            self._sync_window()
             self._refresh()
 
     # 回车选择当前光标位置的会话；空列表时回传 None 让上层关闭视图。

@@ -73,11 +73,19 @@ async def _settle(pilot: Any) -> None:
     await pilot.pause(0.05)
 
 
-# 验证启动时 WorktreeManager 与 FileHistory 装配完成。
-# 单 Provider 进入 TUI 后 _select_provider 触发 _assemble_worktree_system，
-# 两者均应非 None；后台清理 task 与 restore_session task 也应已调度。
+async def _wait_turn_done(app: SeaCodeApp, pilot: Any) -> None:
+    # 轮询等待首条普通消息创建 session 并完成模型回合。
+    for _ in range(40):
+        if not app._streaming:
+            return
+        await pilot.pause(0.05)
+    raise AssertionError("TUI turn did not finish")
+
+
+# 验证启动时只装配 WorktreeManager，不创建空会话或 FileHistory。
+# 首条普通消息完成后才应创建 session 并绑定 FileHistory，同时后台 task 已调度。
 @pytest.mark.asyncio
-async def test_startup_initializes_worktree_and_filehistory(
+async def test_startup_defers_filehistory_until_first_message(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -88,14 +96,20 @@ async def test_startup_initializes_worktree_and_filehistory(
         await _settle(pilot)
         assert app.worktree_manager is not None
         assert isinstance(app.worktree_manager, WorktreeManager)
-        assert app.file_history is not None
-        assert isinstance(app.file_history, FileHistory)
+        assert app.file_history is None
         # restore_session task 应已调度；文件不存在时返回 None，task 完成。
         assert app._restore_session_task is not None
         # stale_cleanup task 应已调度；无限循环 task 不会完成。
         assert app._stale_cleanup_task is not None
         # 无 session 文件时 current_session 为 None。
         assert app.worktree_manager.current_session is None
+
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Create the first session")
+        await pilot.press("enter")
+        await _wait_turn_done(app, pilot)
+        assert app.file_history is not None
+        assert isinstance(app.file_history, FileHistory)
 
 
 # 验证 EnterWorktree 与 ExitWorktree 工具在启动后已注册到 ToolRegistry。
@@ -140,8 +154,8 @@ async def test_worktree_commands_registered(
         assert app._command_registry.find("rewind") is not None
 
 
-# 验证 write_file/edit_file 工具的 file_history 属性在启动后已注入。
-# _assemble_worktree_system 遍历 list_tools 并对持有 file_history 属性的工具赋值。
+# 验证 write_file/edit_file 工具的 file_history 属性在首条消息后已注入。
+# 启动时没有活跃 session，首条普通消息完成装配后两个工具应共享当前 FileHistory。
 @pytest.mark.asyncio
 async def test_file_history_injected_into_write_tools(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
@@ -152,6 +166,11 @@ async def test_file_history_injected_into_write_tools(
 
     async with app.run_test() as pilot:
         await _settle(pilot)
+        assert app.file_history is None
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("Create the first session")
+        await pilot.press("enter")
+        await _wait_turn_done(app, pilot)
         assert app.file_history is not None
         write_tool = app._tool_registry.get("WriteFile")
         if write_tool is not None and hasattr(write_tool, "file_history"):
