@@ -32,21 +32,25 @@ _MODE_MATRIX: dict[PermissionMode, dict[ToolCategory, DecisionEffect]] = {
         ToolCategory.READ: "allow",
         ToolCategory.WRITE: "ask",
         ToolCategory.SYSTEM: "ask",
+        ToolCategory.COMMAND: "ask",
     },
     PermissionMode.ACCEPT_EDITS: {
         ToolCategory.READ: "allow",
         ToolCategory.WRITE: "allow",
         ToolCategory.SYSTEM: "ask",
+        ToolCategory.COMMAND: "ask",
     },
     PermissionMode.PLAN: {
         ToolCategory.READ: "allow",
         ToolCategory.WRITE: "ask",
         ToolCategory.SYSTEM: "ask",
+        ToolCategory.COMMAND: "ask",
     },
     PermissionMode.BYPASS: {
         ToolCategory.READ: "allow",
         ToolCategory.WRITE: "allow",
         ToolCategory.SYSTEM: "allow",
+        ToolCategory.COMMAND: "allow",
     },
 }
 

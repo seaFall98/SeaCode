@@ -53,6 +53,14 @@ class ProviderConfig:
     # （get_context_window 的第 2 层）。通过 set_fetched_context_window() 写入一次；
     # 0 表示"尚未拉取"。不参与相等比较与哈希，避免缓存更新影响身份判断。
     _fetched_context_window: int = field(default=0, repr=False, compare=False)
+    # 可选的显式模型允许集合；空值表示只允许默认 model。
+    available_models: tuple[str, ...] = ()
+
+    # 返回当前 Provider profile 允许子 Agent 使用的模型集合。
+    def get_available_models(self) -> tuple[str, ...]:
+        if self.available_models:
+            return self.available_models
+        return (self.model,)
 
     # 优先使用 YAML 密钥，空值时才兼容外部协议的环境变量。
     def resolve_api_key(self) -> str:
@@ -385,6 +393,33 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
         if not values[field_name]:
             raise ConfigError(f"Provider #{index + 1} field {field_name} cannot be empty: {path}")
 
+    if "available_models" not in raw:
+        available_models: tuple[str, ...] = ()
+    else:
+        raw_models = raw["available_models"]
+        if not isinstance(raw_models, list) or not raw_models:
+            raise ConfigError(
+                f"Provider #{index + 1} field available_models must be a non-empty list: {path}"
+            )
+        parsed_models: list[str] = []
+        for model_index, raw_model in enumerate(raw_models):
+            if not isinstance(raw_model, str) or not raw_model.strip():
+                raise ConfigError(
+                    f"Provider #{index + 1} available_models item #{model_index + 1} "
+                    f"must be a non-empty string: {path}"
+                )
+            model = raw_model.strip()
+            if model in parsed_models:
+                raise ConfigError(
+                    f"Provider #{index + 1} available_models contains duplicates: {path}"
+                )
+            parsed_models.append(model)
+        if values["model"] not in parsed_models:
+            raise ConfigError(
+                f"Provider #{index + 1} model must be included in available_models: {path}"
+            )
+        available_models = tuple(parsed_models)
+
     protocol = values["protocol"]
     if protocol not in SUPPORTED_PROTOCOLS:
         raise ConfigError(f"Provider #{index + 1} has unsupported protocol: {path}")
@@ -416,6 +451,7 @@ def _parse_provider(raw: Any, path: Path, index: int) -> ProviderConfig:
         model=values["model"],
         base_url=values["base_url"].rstrip("/"),
         api_key=values["api_key"],
+        available_models=available_models,
         thinking=thinking,
         context_window=context_window,
         max_output_tokens=max_output_tokens,

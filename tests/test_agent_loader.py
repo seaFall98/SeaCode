@@ -86,6 +86,21 @@ def test_loader_falls_back_to_builtin(
     assert agent_def.source == "builtin"
 
 
+# 验证内置 Explore 默认继承当前 Provider 模型。
+# 不提供项目级覆盖，断言内置定义不会携带供应商专属模型别名。
+def test_builtin_explore_inherits_provider_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_dir = tmp_path / "home"
+    _patch_home(monkeypatch, home_dir)
+    loader = AgentLoader(tmp_path, enable_verification=False)
+
+    agent_def = loader.get("Explore")
+
+    assert agent_def is not None
+    assert agent_def.model == "inherit"
+
+
 # 验证目录不存在时仅返回内置定义。
 # work_dir 与 home_dir 都不含 .seacode/agents，断言 list_agents 仅含内置 3 个。
 def test_loader_returns_only_builtins_when_dirs_missing(

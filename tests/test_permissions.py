@@ -89,23 +89,27 @@ def _make_checker(
 # ---------------------------------------------------------------------------
 
 
-# 验证四种权限模式在三种工具类别上的默认决策符合既定矩阵。
-# 参数化覆盖 4×3=12 种组合，断言 mode_decide 返回值与矩阵一致。
+# 验证四种权限模式在四种工具类别上的默认决策符合既定矩阵。
+# 参数化覆盖 4×4=16 种组合，断言 mode_decide 返回值与矩阵一致。
 @pytest.mark.parametrize(
     ("mode", "category", "expected"),
     [
         (PermissionMode.DEFAULT, ToolCategory.READ, "allow"),
         (PermissionMode.DEFAULT, ToolCategory.WRITE, "ask"),
         (PermissionMode.DEFAULT, ToolCategory.SYSTEM, "ask"),
+        (PermissionMode.DEFAULT, ToolCategory.COMMAND, "ask"),
         (PermissionMode.ACCEPT_EDITS, ToolCategory.READ, "allow"),
         (PermissionMode.ACCEPT_EDITS, ToolCategory.WRITE, "allow"),
         (PermissionMode.ACCEPT_EDITS, ToolCategory.SYSTEM, "ask"),
+        (PermissionMode.ACCEPT_EDITS, ToolCategory.COMMAND, "ask"),
         (PermissionMode.PLAN, ToolCategory.READ, "allow"),
         (PermissionMode.PLAN, ToolCategory.WRITE, "ask"),
         (PermissionMode.PLAN, ToolCategory.SYSTEM, "ask"),
+        (PermissionMode.PLAN, ToolCategory.COMMAND, "ask"),
         (PermissionMode.BYPASS, ToolCategory.READ, "allow"),
         (PermissionMode.BYPASS, ToolCategory.WRITE, "allow"),
         (PermissionMode.BYPASS, ToolCategory.SYSTEM, "allow"),
+        (PermissionMode.BYPASS, ToolCategory.COMMAND, "allow"),
     ],
 )
 def test_mode_decide_matrix_covers_all_combinations(
