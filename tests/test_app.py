@@ -1378,10 +1378,10 @@ async def test_dispatch_slash_only_lists_all_commands(
         assert "/clear" in text
 
 
-# 验证 /session 无参数时进入 handler 并显示当前会话详情。
-# 测试设计为走真实 _dispatch_command 门禁，防止 arg_prompt 把可选参数误判为必填。
+# 验证启动后 /session 无参数时进入 handler 并报告没有活跃会话。
+# 测试设计为走真实 _dispatch_command 门禁，锁定惰性 session 生命周期。
 @pytest.mark.asyncio
-async def test_dispatch_session_without_args_shows_current_details(
+async def test_dispatch_session_without_args_shows_no_active_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -1390,7 +1390,7 @@ async def test_dispatch_session_without_args_shows_current_details(
     async with app.run_test() as pilot:
         result = await app._dispatch_command("/session")
         assert result is True
-        ok = await _wait_for_system_message(app, pilot, "当前会话：")
+        ok = await _wait_for_system_message(app, pilot, "当前没有活跃会话")
         assert ok
         text = "\n".join(str(m.render()) for m in app.query(".system-message"))
         assert "参数不足" not in text

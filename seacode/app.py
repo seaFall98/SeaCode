@@ -959,6 +959,14 @@ class SeaCodeApp(App[None]):
         if provider_switch:
             if self._session is not None:
                 self._session.close()
+            self._session = None
+            self.file_history = None
+            for tool in self._tool_registry.list_tools():
+                if hasattr(tool, "file_history"):
+                    try:
+                        tool.file_history = None
+                    except Exception:
+                        continue
             self._agent = None
             self._conversation = ConversationManager()
             self._recovery_state = RecoveryState()
@@ -979,7 +987,8 @@ class SeaCodeApp(App[None]):
             )
         )
         # 装配跨会话能力：load_instructions 拼接项目/用户级 SEACODE.md 与 AGENTS.md；
-        # MemoryManager 提供双目录记忆索引；SessionManager 创建新 JSONL 并清理过期会话。
+        # MemoryManager 提供双目录记忆索引；SessionManager 管理并清理过期会话。
+        # 普通对话的 session 在首条有效用户消息前保持惰性，不污染历史列表。
         # 失败均不阻断启动——记忆/会话功能降级为不可用，但 Provider 仍可正常对话。
         work_dir = os.getcwd()
         try:
@@ -987,7 +996,6 @@ class SeaCodeApp(App[None]):
             self._memory_manager = MemoryManager(work_dir)
             self._session_manager = SessionManager(work_dir)
             self._session_manager.cleanup()
-            self._session = self._session_manager.create()
         except Exception:
             self._instructions_content = ""
             self._memory_manager = None
@@ -1172,6 +1180,21 @@ class SeaCodeApp(App[None]):
                 active_skills=self._active_skills,
             )
             self._configure_agent(self._agent)
+
+    # 为首条有效普通消息惰性创建 session；显式恢复/新建仍直接走统一切换入口。
+    def _ensure_active_session(self) -> None:
+        if self._session is not None or self._session_manager is None:
+            return
+
+        session: Session | None = None
+        try:
+            session = self._session_manager.create()
+            self._switch_session(session, [])
+        except Exception:
+            if session is not None:
+                session.close()
+                self._session_manager.delete(session.session_id)
+                self._session = None
 
     # batch13：装配 WorktreeManager、FileHistory、工具与命令注册、后台清理 task。
     # 任一步失败静默降级，不阻断 Provider 选择主流程；worktree_manager 为 None 时
@@ -1802,6 +1825,9 @@ class SeaCodeApp(App[None]):
         provider = self._selected_provider
         if client is None or provider is None:
             return
+
+        if text:
+            self._ensure_active_session()
 
         self._plan_exit_requested = False
         input_widget = self.query_one(ChatInput)

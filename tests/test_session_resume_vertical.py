@@ -59,9 +59,9 @@ class _ScriptedClient(LLMClient):
             yield event
 
 
-def _provider() -> ProviderConfig:
+def _provider(name: str = "batch18-test") -> ProviderConfig:
     return ProviderConfig(
-        name="batch18-test",
+        name=name,
         protocol="openai-compat",
         model="test-model",
         base_url="https://api.example.test",
@@ -84,6 +84,69 @@ def _canonical_request(messages: Sequence[Message]) -> list[Message]:
         if not message.content.startswith("Current working directory")
         and not message.content.startswith("<system-reminder>")
     ]
+
+
+# 验证启动和退出不会隐式创建没有消息的持久化 session。
+# 预写一个已有会话，启动 App 但不提交消息，断言当前 session 为空且文件集合不变。
+@pytest.mark.asyncio
+async def test_startup_without_message_does_not_create_empty_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    manager = SessionManager(str(tmp_path))
+    existing = manager.create()
+    existing_id = existing.session_id
+    existing.append(Message(role="user", content="existing conversation"))
+    existing.close()
+    session_dir = tmp_path / ".seacode" / "sessions"
+    before = {path.name for path in session_dir.iterdir()}
+
+    app = SeaCodeApp([_provider()], client_factory=lambda _: _ScriptedClient([]))
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        assert app._session is None
+        assert {path.name for path in session_dir.iterdir()} == before
+
+    assert {path.name for path in session_dir.iterdir()} == before
+    metas = SessionManager(str(tmp_path)).list()
+    assert [meta.id for meta in metas] == [existing_id]
+
+
+# 验证切换 Provider 后旧 session 已关闭，新的普通消息才创建新 session。
+# 先完成一回合再切换 Provider，断言切换状态为空且下一回合不复用已关闭句柄。
+@pytest.mark.asyncio
+async def test_provider_switch_defers_new_session_until_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    providers = [_provider("first-provider"), _provider("second-provider")]
+    clients = {
+        "first-provider": _ScriptedClient([[StreamComplete()]]),
+        "second-provider": _ScriptedClient([[StreamComplete()]]),
+    }
+    app = SeaCodeApp(
+        providers,
+        client_factory=lambda provider: clients[provider.name],
+    )
+
+    async with app.run_test() as pilot:
+        app._select_provider(providers[0])
+        input_widget = app.query_one(ChatInput)
+        input_widget.load_text("First provider turn")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+        assert app._session is not None
+        first_session_id = app._session.session_id
+
+        app._select_provider(providers[1])
+        assert app._session is None
+        assert app.file_history is None
+
+        input_widget.load_text("Second provider turn")
+        await pilot.press("enter")
+        await _wait_done(app, pilot)
+        assert app._session is not None
+        assert app._session.session_id != first_session_id
 
 
 # 验证运行时上下文不进入稳定会话增量边界。
@@ -192,11 +255,12 @@ async def test_failed_turn_persists_user_message_before_provider_call(
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
 
     async with app.run_test() as pilot:
-        session_id = app._session.session_id if app._session is not None else ""
         input_widget = app.query_one(ChatInput)
         input_widget.load_text("First intent")
         await pilot.press("enter")
         await _wait_done(app, pilot)
+        assert app._session is not None
+        session_id = app._session.session_id
 
         input_widget.load_text("Second intent")
         await pilot.press("enter")
@@ -245,6 +309,38 @@ async def test_ctrl_r_resume_continues_previous_conversation(
         Message(role="assistant", content="Saved answer"),
         Message(role="user", content="Continue from Ctrl+R"),
     ]
+
+
+# 验证真实 TUI 恢复入口可以用方向键浏览超过首个可视窗口的 session。
+# 通过 run_test 挂载 InlineResumeWidget，连续发送下键后断言焦点候选进入后半段。
+@pytest.mark.asyncio
+async def test_ctrl_r_navigates_beyond_first_visible_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    manager = SessionManager(str(tmp_path))
+    for index in range(12):
+        session = manager.create()
+        session.append(Message(role="user", content=f"Saved session {index}"))
+        session.close()
+
+    app = SeaCodeApp([_provider()], client_factory=lambda _: _ScriptedClient([]))
+    async with app.run_test() as pilot:
+        await app.action_open_resume()
+        widget = app.query_one(InlineResumeWidget)
+        await pilot.pause()
+        initial_visible = widget._visible_count
+        await pilot.resize_terminal(80, 12)
+        assert 1 <= widget._visible_count <= initial_visible
+        assert widget._filtered[widget._cursor].title in widget._build_content()
+
+        for _ in range(11):
+            await pilot.press("down")
+
+        assert widget._cursor == 11
+        assert widget._window_start > 0
+        current = widget._filtered[widget._cursor]
+        assert current.title in widget._build_content()
 
 
 # 验证恢复历史后新的 TUI 请求携带昨天的对话，而不是从空历史重新开始。
@@ -329,11 +425,12 @@ async def test_failed_tool_loop_does_not_persist_unfinished_assistant_chain(
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
 
     async with app.run_test() as pilot:
-        session_id = app._session.session_id if app._session is not None else ""
         input_widget = app.query_one(ChatInput)
         input_widget.load_text("Read both files")
         await pilot.press("enter")
         await _wait_done(app, pilot)
+        assert app._session is not None
+        session_id = app._session.session_id
 
     result = SessionManager(str(tmp_path)).resume(session_id)
     assert result is not None
