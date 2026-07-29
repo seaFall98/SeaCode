@@ -117,6 +117,9 @@ async def test_prompt_runtime_starts_team_member_with_worktree_manager(
             self.team_result: Any = None
             agents.append(self)
 
+        def set_full_registry(self, registry: Any) -> None:
+            self._full_registry = registry
+
         async def run(self, conversation: Any) -> AsyncIterator[Any]:
             del conversation
             create = self.registry.get("TeamCreate")
@@ -205,8 +208,12 @@ async def test_prompt_runtime_uses_config_mode_instructions_and_hooks(
             self.kwargs = kwargs
             self.agent_id = "lead"
             self.registry = kwargs["registry"]
+            self._full_registry: Any = None
             self.coordinator_mode = False
             created.append(self)
+
+        def set_full_registry(self, registry: Any) -> None:
+            self._full_registry = registry
 
         async def run(self, conversation: Any) -> AsyncIterator[Any]:
             del conversation
@@ -332,9 +339,13 @@ async def test_prompt_runtime_passes_subagent_feature_flags(
     class _CaptureAgent:
         def __init__(self, **kwargs: Any) -> None:
             self.registry = kwargs["registry"]
+            self._full_registry: Any = None
             self.agent_id = "lead"
             self.coordinator_mode = False
             agents.append(self)
+
+        def set_full_registry(self, registry: Any) -> None:
+            self._full_registry = registry
 
         async def run(self, conversation: Any) -> AsyncIterator[Any]:
             del conversation
@@ -350,6 +361,7 @@ async def test_prompt_runtime_passes_subagent_feature_flags(
 
     assert loaders[0].enable_verification is True
     assert agents[0].registry.get("Agent").enable_fork is True
+    assert agents[0]._full_registry is agents[0].registry
 
 
 # 验证非法 --mode 仍由 argparse 在启动前拒绝。

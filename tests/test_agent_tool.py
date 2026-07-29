@@ -10,7 +10,11 @@ from pydantic import BaseModel
 from seacode.agents.fork import FORK_QUERY_SOURCE, ForkError
 from seacode.agents.parser import AgentDef
 from seacode.tools import ToolRegistry
-from seacode.tools.agent_tool import AgentTool, AgentToolParams
+from seacode.tools.agent_tool import (
+    AgentTool,
+    AgentToolParams,
+    ModelSelectionError,
+)
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 # ---------------------------------------------------------------------------
@@ -149,6 +153,7 @@ def _make_tool(
     parent: _FakeParent | None = None,
     enable_fork: bool = False,
     provider_config: Any = None,
+    model_aliases: dict[str, str] | None = None,
     sub_agent: _FakeSubAgent | None = None,
 ) -> tuple[AgentTool, _FakeSubAgent]:
     loader = loader or _FakeLoader()
@@ -164,6 +169,7 @@ def _make_tool(
         parent_agent=parent,
         enable_fork=enable_fork,
         provider_config=provider_config,
+        model_aliases=model_aliases,
     )
     # 覆写 _create_sub_agent 避免实例化真实 Agent。
     tool._create_sub_agent = lambda **kwargs: fake_sub  # type: ignore[method-assign]
@@ -397,27 +403,28 @@ def test_select_llm_none_model_falls_back_to_parent_client() -> None:
     assert client is parent.client
 
 
-# 验证 _select_llm provider_config=None 时回退父 client。
-# params.model="haiku" 但 provider_config=None，断言返回 parent.client。
-def test_select_llm_no_provider_config_falls_back_to_parent_client() -> None:
+# 验证没有 Provider 配置时不能使用显式模型。
+# params.model="custom-model"，断言本地抛出模型选择错误。
+def test_select_llm_no_provider_config_rejects_explicit_model() -> None:
     tool, _ = _make_tool(provider_config=None)
     parent = tool.parent_agent
-    params = AgentToolParams(subagent_type="Explore", prompt="task", model="haiku")
+    params = AgentToolParams(
+        subagent_type="Explore", prompt="task", model="custom-model"
+    )
     definition = _make_def(model="inherit")
 
-    client = tool._select_llm(params, definition, parent)
+    with pytest.raises(ModelSelectionError, match="当前没有 Provider"):
+        tool._select_llm(params, definition, parent)
 
-    assert client is parent.client
 
-
-# 验证 _select_llm haiku 别名映射到具体模型 id。
-# monkeypatch create_client 记录 model_id，断言映射到 claude-haiku-4-5。
-def test_select_llm_haiku_alias_mapping(
+# 验证 _select_llm 使用当前 Provider 已配置的精确模型 ID。
+# Provider 允许 luna 后，断言 create_client 收到 luna 而不是隐式供应商模型。
+def test_select_llm_configured_model_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool, _ = _make_tool(provider_config=_make_provider_config())
+    tool, _ = _make_tool(provider_config=_make_provider_config("luna"))
     parent = tool.parent_agent
-    params = AgentToolParams(subagent_type="Explore", prompt="task", model="haiku")
+    params = AgentToolParams(subagent_type="Explore", prompt="task", model="luna")
     definition = _make_def(model="inherit")
 
     captured: list[str] = []
@@ -429,62 +436,18 @@ def test_select_llm_haiku_alias_mapping(
     monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
     tool._select_llm(params, definition, parent)
 
-    assert captured == ["claude-haiku-4-5"]
+    assert captured == ["luna"]
 
 
-# 验证 _select_llm sonnet 别名映射到具体模型 id。
-# monkeypatch create_client 记录 model_id，断言映射到 claude-sonnet-4-5。
-def test_select_llm_sonnet_alias_mapping(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tool, _ = _make_tool(provider_config=_make_provider_config())
-    parent = tool.parent_agent
-    params = AgentToolParams(subagent_type="Explore", prompt="task", model="sonnet")
-    definition = _make_def(model="inherit")
-
-    captured: list[str] = []
-
-    def _fake_create_client(cfg: Any) -> Any:
-        captured.append(cfg.model)
-        return object()
-
-    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
-    tool._select_llm(params, definition, parent)
-
-    assert captured == ["claude-sonnet-4-5"]
-
-
-# 验证 _select_llm opus 别名映射到具体模型 id。
-# monkeypatch create_client 记录 model_id，断言映射到 claude-opus-4-1。
-def test_select_llm_opus_alias_mapping(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tool, _ = _make_tool(provider_config=_make_provider_config())
-    parent = tool.parent_agent
-    params = AgentToolParams(subagent_type="Explore", prompt="task", model="opus")
-    definition = _make_def(model="inherit")
-
-    captured: list[str] = []
-
-    def _fake_create_client(cfg: Any) -> Any:
-        captured.append(cfg.model)
-        return object()
-
-    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
-    tool._select_llm(params, definition, parent)
-
-    assert captured == ["claude-opus-4-1"]
-
-
-# 验证 _select_llm 非别名模型名直通。
-# params.model="claude-sonnet-4"，断言 create_client 收到的 model_id 是原值。
-def test_select_llm_non_alias_passthrough(
+# 验证 _select_llm 在模型不属于 Provider allowlist 时拒绝请求。
+# monkeypatch create_client 记录调用，断言非法模型不会创建客户端。
+def test_select_llm_unconfigured_model_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool, _ = _make_tool(provider_config=_make_provider_config())
     parent = tool.parent_agent
     params = AgentToolParams(
-        subagent_type="Explore", prompt="task", model="claude-sonnet-4"
+        subagent_type="Explore", prompt="task", model="claude-haiku-4-5"
     )
     definition = _make_def(model="inherit")
 
@@ -495,39 +458,39 @@ def test_select_llm_non_alias_passthrough(
         return object()
 
     monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
-    tool._select_llm(params, definition, parent)
+    with pytest.raises(ModelSelectionError, match="可用模型"):
+        tool._select_llm(params, definition, parent)
 
-    assert captured == ["claude-sonnet-4"]
+    assert captured == []
 
 
-# 验证 _select_llm create_client 失败回退父 client。
-# monkeypatch create_client 抛异常，断言返回 parent.client。
-def test_select_llm_create_client_failure_falls_back(
+# 验证显式模型的客户端创建失败不会静默回退父 client。
+# monkeypatch create_client 抛异常，断言转换为模型选择错误。
+def test_select_llm_create_client_failure_returns_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool, _ = _make_tool(provider_config=_make_provider_config())
+    tool, _ = _make_tool(provider_config=_make_provider_config("luna"))
     parent = tool.parent_agent
-    params = AgentToolParams(subagent_type="Explore", prompt="task", model="haiku")
+    params = AgentToolParams(subagent_type="Explore", prompt="task", model="luna")
     definition = _make_def(model="inherit")
 
     def _raise(cfg: Any) -> Any:
         raise RuntimeError("create failed")
 
     monkeypatch.setattr("seacode.client.create_client", _raise)
-    client = tool._select_llm(params, definition, parent)
+    with pytest.raises(ModelSelectionError, match="客户端创建失败"):
+        tool._select_llm(params, definition, parent)
 
-    assert client is parent.client
 
-
-# 验证 _select_llm definition.model 非 inherit 时作为次优覆盖。
-# params.model=None，definition.model="haiku"，断言映射到 haiku 对应 id。
+# 验证 Agent 定义显式模型在调用参数缺省时生效。
+# params.model=None，definition.model="luna"，断言 create_client 使用 luna。
 def test_select_llm_definition_model_used_when_params_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool, _ = _make_tool(provider_config=_make_provider_config())
+    tool, _ = _make_tool(provider_config=_make_provider_config("luna"))
     parent = tool.parent_agent
     params = AgentToolParams(subagent_type="Explore", prompt="task", model=None)
-    definition = _make_def(model="haiku")
+    definition = _make_def(model="luna")
 
     captured: list[str] = []
 
@@ -538,7 +501,176 @@ def test_select_llm_definition_model_used_when_params_none(
     monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
     tool._select_llm(params, definition, parent)
 
-    assert captured == ["claude-haiku-4-5"]
+    assert captured == ["luna"]
+
+
+# 验证 Agent 调用显式模型优先于 Agent 定义显式模型。
+# 两个模型均已配置，断言调用参数模型最终传给 create_client。
+def test_select_llm_call_model_precedes_definition_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, _ = _make_tool(provider_config=_make_provider_config("luna", "sonnet"))
+    parent = tool.parent_agent
+    params = AgentToolParams(subagent_type="Explore", prompt="task", model="luna")
+    definition = _make_def(model="sonnet")
+    captured: list[str] = []
+
+    def _fake_create_client(cfg: Any) -> Any:
+        captured.append(cfg.model)
+        return object()
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    tool._select_llm(params, definition, parent)
+
+    assert captured == ["luna"]
+
+
+# 验证调用参数 model=inherit 会强制继承 Provider 默认模型。
+# definition.model 虽为显式模型，断言不会创建新客户端且直接复用父 client。
+def test_select_llm_call_inherit_uses_parent_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, _ = _make_tool(provider_config=_make_provider_config("luna"))
+    parent = tool.parent_agent
+    params = AgentToolParams(subagent_type="Explore", prompt="task", model="inherit")
+    definition = _make_def(model="luna")
+    create_calls: list[str] = []
+
+    def _fake_create_client(cfg: Any) -> Any:
+        create_calls.append(cfg.model)
+        return object()
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+
+    assert tool._select_llm(params, definition, parent) is parent.client
+    assert create_calls == []
+
+
+# 验证显式注入的别名只能映射到当前 Provider 已配置模型。
+# fast 映射到 luna 后，断言实际客户端使用 allowlist 中的 luna。
+def test_select_llm_configured_alias_maps_to_allowed_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, _ = _make_tool(
+        provider_config=_make_provider_config("luna"),
+        model_aliases={"fast": "luna"},
+    )
+    parent = tool.parent_agent
+    params = AgentToolParams(subagent_type="Explore", prompt="task", model="fast")
+    definition = _make_def(model="inherit")
+    captured: list[str] = []
+
+    def _fake_create_client(cfg: Any) -> Any:
+        captured.append(cfg.model)
+        return object()
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    tool._select_llm(params, definition, parent)
+
+    assert captured == ["luna"]
+
+
+# 验证别名目标即使由程序注入，也不能绕过 Provider allowlist。
+# fast 映射到未配置模型时，断言不会创建客户端并返回模型选择错误。
+def test_select_llm_alias_target_must_be_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, _ = _make_tool(
+        provider_config=_make_provider_config(),
+        model_aliases={"fast": "unconfigured-model"},
+    )
+    parent = tool.parent_agent
+    params = AgentToolParams(subagent_type="Explore", prompt="task", model="fast")
+    definition = _make_def(model="inherit")
+    create_calls: list[str] = []
+
+    def _fake_create_client(cfg: Any) -> Any:
+        create_calls.append(cfg.model)
+        return object()
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+    with pytest.raises(ModelSelectionError, match="可用模型"):
+        tool._select_llm(params, definition, parent)
+
+    assert create_calls == []
+
+
+# 验证 AgentTool 公开执行路径会在本地阻断未配置模型。
+# 断言错误结果包含 allowlist，且客户端、trace、后台任务均未被调用。
+@pytest.mark.asyncio
+async def test_execute_rejects_unconfigured_model_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _FakeLoader(agent_def=_make_def(model="inherit"))
+    task_manager = _FakeTaskManager()
+    trace_manager = _FakeTraceManager()
+    tool, _ = _make_tool(
+        loader=loader,
+        task_manager=task_manager,
+        trace_manager=trace_manager,
+        provider_config=_make_provider_config(),
+    )
+    create_calls: list[str] = []
+
+    def _fake_create_client(cfg: Any) -> Any:
+        create_calls.append(cfg.model)
+        return object()
+
+    monkeypatch.setattr("seacode.client.create_client", _fake_create_client)
+
+    result = await tool.execute(
+        AgentToolParams(
+            subagent_type="Explore", prompt="task", model="claude-haiku-4-5"
+        ),
+        conversation=None,
+        parent_agent=tool.parent_agent,
+    )
+
+    assert result.is_error is True
+    assert "claude-haiku-4-5" in result.content
+    assert "default-model" in result.content
+    assert create_calls == []
+    assert trace_manager.create_calls == []
+    assert task_manager.launch_calls == []
+
+
+# 验证 worktree 子 Agent 在创建隔离目录前拒绝未配置模型。
+# 使用带调用计数的最小管理器，断言模型错误时不会创建 worktree 或 trace 节点。
+@pytest.mark.asyncio
+async def test_worktree_rejects_unconfigured_model_before_creation() -> None:
+    class _WorktreeManager:
+        def __init__(self) -> None:
+            self.create_calls = 0
+
+        async def create(self, name: str, base_branch: str = "HEAD") -> Any:
+            del name, base_branch
+            self.create_calls += 1
+            raise AssertionError("invalid model must be rejected first")
+
+    loader = _FakeLoader(agent_def=_make_def(isolation="worktree"))
+    trace_manager = _FakeTraceManager()
+    tool, _ = _make_tool(
+        loader=loader,
+        trace_manager=trace_manager,
+        provider_config=_make_provider_config(),
+    )
+    worktree_manager = _WorktreeManager()
+    tool.worktree_manager = worktree_manager
+
+    result = await tool.execute(
+        AgentToolParams(
+            subagent_type="Explore",
+            prompt="task",
+            model="unconfigured-model",
+        ),
+        conversation=None,
+        parent_agent=tool.parent_agent,
+    )
+
+    assert result.is_error is True
+    assert "unconfigured-model" in result.content
+    assert worktree_manager.create_calls == 0
+    assert trace_manager.create_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -591,8 +723,8 @@ async def test_params_isolation_worktree_branch_returns_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-# 构造最小 ProviderConfig 供 _select_llm 测试使用。
-def _make_provider_config() -> Any:
+# 构造最小 ProviderConfig 供模型选择测试使用。
+def _make_provider_config(*additional_models: str) -> Any:
     from seacode.config import ProviderConfig
 
     return ProviderConfig(
@@ -601,6 +733,7 @@ def _make_provider_config() -> Any:
         model="default-model",
         base_url="https://api.example.test",
         api_key="test-key",
+        available_models=("default-model", *additional_models),
     )
 
 
@@ -625,13 +758,11 @@ def test_agent_tool_params_defaults() -> None:
     assert params.team_name is None
 
 
-# 验证 AgentTool 构造时 model_aliases 默认含 haiku/sonnet/opus 映射。
-# 构造 AgentTool，断言 model_aliases 含三个别名。
+# 验证 AgentTool 默认不注入供应商模型别名。
+# 构造 AgentTool，断言默认别名集合为空。
 def test_agent_tool_default_model_aliases() -> None:
     tool, _ = _make_tool()
-    assert tool.model_aliases["haiku"] == "claude-haiku-4-5"
-    assert tool.model_aliases["sonnet"] == "claude-sonnet-4-5"
-    assert tool.model_aliases["opus"] == "claude-opus-4-1"
+    assert tool.model_aliases == {}
 
 
 # 验证 AgentTool 构造时 query_source 默认 None。
@@ -641,8 +772,8 @@ def test_agent_tool_default_query_source_none() -> None:
     assert tool.query_source is None
 
 
-# 验证 AgentTool 接受自定义 model_aliases 覆盖默认。
-# 构造时传 model_aliases={"haiku": "custom"}，断言覆盖生效。
+# 验证 AgentTool 接受显式注入的 model_aliases。
+# 构造时传入一个别名，断言默认集合不会再混入其它供应商映射。
 def test_agent_tool_custom_model_aliases_override() -> None:
     loader = _FakeLoader()
     parent = _FakeParent()
@@ -654,5 +785,4 @@ def test_agent_tool_custom_model_aliases_override() -> None:
         model_aliases={"haiku": "custom-haiku"},
     )
     assert tool.model_aliases["haiku"] == "custom-haiku"
-    # 默认映射仍保留其它别名。
-    assert tool.model_aliases["sonnet"] == "claude-sonnet-4-5"
+    assert set(tool.model_aliases) == {"haiku"}

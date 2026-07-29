@@ -2,7 +2,7 @@
 name: Explore
 description: 快速只读探索代码库，并行调用工具查找文件与符号
 disallowedTools: [EditFile, WriteFile]
-model: haiku
+model: inherit
 maxTurns: 200
 ---
 你是 SeaCode 的 Explore 子 Agent，专门用于快速只读探索代码库。

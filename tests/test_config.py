@@ -207,6 +207,79 @@ def test_provider_names_must_be_unique(tmp_path: Path) -> None:
         load_config(path)
 
 
+# 验证旧 Provider 配置缺少 available_models 时回退为单模型集合。
+# 使用现有最小配置加载，断言兼容字段为空但运行时有效集合包含默认模型。
+def test_provider_available_models_defaults_to_model(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config(path, name="primary")
+
+    provider = load_config(path).providers[0]
+
+    assert provider.available_models == ()
+    assert provider.get_available_models() == ("test-model",)
+
+
+# 验证 Provider 可以配置同一端点下的多个显式模型。
+# 列表包含默认模型和额外模型，断言解析后保留顺序并去除项值空白。
+def test_provider_parses_available_models(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config(path, name="primary")
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "\n    available_models:\n"
+        + "      - test-model\n"
+        + "      - '  second-model  '\n",
+        encoding="utf-8",
+    )
+
+    provider = load_config(path).providers[0]
+
+    assert provider.available_models == ("test-model", "second-model")
+    assert provider.get_available_models() == ("test-model", "second-model")
+
+
+# 验证 available_models 的结构和默认模型关系在配置边界被拒绝。
+# 参数化覆盖空列表、非列表、非法项、重复项和缺少默认模型等输入。
+@pytest.mark.parametrize(
+    ("block", "expected_message"),
+    [
+        ("available_models: []", "non-empty list"),
+        ("available_models: invalid", "non-empty list"),
+        (
+            "available_models:\n  - test-model\n  - 1",
+            "non-empty string",
+        ),
+        (
+            "available_models:\n  - test-model\n  - '  '",
+            "non-empty string",
+        ),
+        (
+            "available_models:\n  - test-model\n  - test-model",
+            "duplicates",
+        ),
+        (
+            "available_models:\n  - another-model",
+            "included",
+        ),
+    ],
+)
+def test_provider_rejects_invalid_available_models(
+    tmp_path: Path, block: str, expected_message: str
+) -> None:
+    path = tmp_path / "config.yaml"
+    _write_config(path, name="primary")
+    indented_block = "\n".join(
+        f"    {line}" for line in block.splitlines()
+    )
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n" + indented_block + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=expected_message):
+        load_config(path)
+
+
 # ---------------------------------------------------------------------------
 # MCP 服务器配置解析
 # ---------------------------------------------------------------------------

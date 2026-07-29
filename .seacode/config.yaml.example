@@ -3,6 +3,10 @@ providers:
   - name: primary
     protocol: openai-compat
     model: your-model-name
+    # 可选：同一端点允许 Agent 显式选择的模型；缺省时只允许上面的 model。
+    available_models:
+      - your-model-name
+      # - another-model-name
     base_url: https://api.example.com
     api_key: replace-with-your-key
     thinking: false

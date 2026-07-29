@@ -35,13 +35,9 @@ from seacode.worktree.manager import WorktreeError, WorktreeManager
 
 log = logging.getLogger(__name__)
 
-# 别名到具体模型 id 的映射；占位字符串由 app.py 在初始化时按配置注入。
-# 这里保留默认值，让单测可以不依赖外部配置直接构造。
-_DEFAULT_MODEL_ALIASES: dict[str, str] = {
-    "haiku": "claude-haiku-4-5",
-    "sonnet": "claude-sonnet-4-5",
-    "opus": "claude-opus-4-1",
-}
+class ModelSelectionError(Exception):
+    """子 Agent 请求了当前 Provider 未配置或无法创建的模型。"""
+
 
 # batch14：teammate 系统提示词附加段；告知 worker 文本回复对其它成员不可见，
 # 需用 SendMessage 通信，且工作在隔离 worktree 中需用相对路径。
@@ -148,9 +144,9 @@ class AgentTool(Tool):
         self.team_manager = team_manager
         # query_source: None 或 FORK_QUERY_SOURCE；fork 子 Agent 标记后不能再 fork。
         self.query_source: str | None = None
-        self.model_aliases = dict(_DEFAULT_MODEL_ALIASES)
-        if model_aliases:
-            self.model_aliases.update(model_aliases)
+        self.model_aliases = {
+            alias.lower(): model for alias, model in (model_aliases or {}).items()
+        }
 
     # 执行子 Agent；按 subagent_type 分流到定义式或 Fork 路径。
     async def execute(
@@ -272,6 +268,11 @@ class AgentTool(Tool):
                 params, conversation, parent_agent, definition
             )
 
+        try:
+            client = self._select_llm(params, definition, parent_agent)
+        except ModelSelectionError as e:
+            return ToolResult(content=str(e), is_error=True)
+
         # fork 默认后台；定义式看 run_in_background / definition.background。
         is_background = is_fork or params.run_in_background or definition.background
 
@@ -287,7 +288,6 @@ class AgentTool(Tool):
             )
 
         # 子 Agent 实例化：复用父 Agent 的 protocol / work_dir / context_window。
-        client = self._select_llm(params, definition, parent_agent)
         sub_agent = self._create_sub_agent(
             client=client,
             parent_agent=parent_agent,
@@ -399,23 +399,57 @@ class AgentTool(Tool):
             hook_engine=getattr(parent_agent, "hook_engine", None),
         )
 
-    # 选择子 Agent LLM 客户端；model 别名映射或具体模型名直通；失败回退父 client。
-    def _select_llm(
-        self, params: AgentToolParams, definition: AgentDef, parent_agent: Any
-    ) -> Any:
-        # params.model 优先；definition.model 非 inherit 时次之；否则回退父 client。
-        model_override = params.model
-        if not model_override and definition.model != "inherit":
-            model_override = definition.model
+    # 解析子 Agent 的最终模型；没有显式模型时返回 None，表示复用父 client。
+    def _resolve_model_id(
+        self, params: AgentToolParams, definition: AgentDef
+    ) -> str | None:
+        call_model = params.model
+        if call_model is not None:
+            if not isinstance(call_model, str):
+                raise ModelSelectionError("Agent 调用参数 model 必须是字符串")
+            call_model = call_model.strip()
+            if call_model.lower() == "inherit":
+                return None
+
+        model_override = call_model or None
+        if model_override is None:
+            definition_model = definition.model
+            if not isinstance(definition_model, str):
+                raise ModelSelectionError("Agent 定义中的 model 必须是字符串")
+            definition_model = definition_model.strip()
+            if definition_model and definition_model.lower() != "inherit":
+                model_override = definition_model
+
         if not model_override:
-            return parent_agent.client
-
-        # 别名映射；非别名直通模型名。
-        model_id = self.model_aliases.get(
-            model_override.lower(), model_override
-        )
-
+            return None
         if self.provider_config is None:
+            raise ModelSelectionError(
+                f"子 Agent 模型未配置: {model_override}；当前没有 Provider 配置"
+            )
+
+        get_available_models = getattr(
+            self.provider_config, "get_available_models", None
+        )
+        if not callable(get_available_models):
+            raise ModelSelectionError("当前 Provider 配置不支持模型允许集合校验")
+        allowed_models = tuple(get_available_models())
+        model_id = self.model_aliases.get(model_override.lower(), model_override)
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ModelSelectionError(
+                f"子 Agent 模型别名无效: {model_override}"
+            )
+        model_id = model_id.strip()
+        if model_id not in allowed_models:
+            allowed_text = ", ".join(allowed_models) or "无"
+            raise ModelSelectionError(
+                f"子 Agent 模型未配置: {model_override}；"
+                f"当前 Provider 可用模型: {allowed_text}"
+            )
+        return model_id
+
+    # 按已校验的模型 ID 创建同一 Provider profile 的子 Agent 客户端。
+    def _create_llm_for_model(self, model_id: str | None, parent_agent: Any) -> Any:
+        if model_id is None:
             return parent_agent.client
         try:
             # 浅拷贝配置并替换 model 字段；保留 protocol/base_url/api_key。
@@ -424,9 +458,18 @@ class AgentTool(Tool):
             from seacode.client import create_client
 
             return create_client(new_cfg)
-        except Exception:
-            # 失败回退父 client，保证调用方不中断。
-            return parent_agent.client
+        except Exception as e:
+            log.warning("子 Agent 模型客户端创建失败: %s", type(e).__name__)
+            raise ModelSelectionError(
+                f"子 Agent 模型客户端创建失败: {model_id}"
+            ) from e
+
+    # 选择子 Agent LLM 客户端；显式模型失败时不静默回退父 client。
+    def _select_llm(
+        self, params: AgentToolParams, definition: AgentDef, parent_agent: Any
+    ) -> Any:
+        model_id = self._resolve_model_id(params, definition)
+        return self._create_llm_for_model(model_id, parent_agent)
 
     # 兼容基类签名；实际 execute 走三参版本。
     async def _execute(self, params: BaseModel) -> ToolResult:  # pragma: no cover
@@ -452,7 +495,7 @@ class AgentTool(Tool):
                 return candidate
             i += 1
 
-    # batch14：Teammate 路径六步——加载定义 → 建 worktree → 选 LLM → 过滤工具 →
+    # batch14：Teammate 路径六步——加载定义 → 校验模型 → 建 worktree → 过滤工具 →
     # 按后端 spawn → 注册名字与成员。in-process 长驻邮箱循环；pane 后端外进程执行。
     async def _execute_as_teammate(
         self,
@@ -497,7 +540,14 @@ class AgentTool(Tool):
                 permission_mode="bypassPermissions",
             )
 
-        # 第 2 步：创建 worktree；名称格式 team-<team>/<member>，便于清理时识别。
+        # 第 2 步：先校验模型，再创建 worktree，避免非法请求产生隔离资源。
+        try:
+            selected_model = self._resolve_model_id(params, agent_def)
+            client = self._create_llm_for_model(selected_model, parent_agent)
+        except ModelSelectionError as e:
+            return ToolResult(content=str(e), is_error=True)
+
+        # 第 3 步：创建 worktree；名称格式 team-<team>/<member>，便于清理时识别。
         teammate_name = self._unique_teammate_name(
             params.name or agent_def.agent_type, team_name
         )
@@ -508,9 +558,6 @@ class AgentTool(Tool):
             return ToolResult(
                 content=f"创建 worktree 失败: {e}", is_error=True
             )
-
-        # 第 3 步：选 LLM；按 agent_def.model 或父 Agent client。
-        client = self._select_llm(params, agent_def, parent_agent)
 
         # 第 4 步：build_teammate_tools 按后端过滤工具集并实例化绑定身份的协调工具。
         # 传入 teammate_agent 的 agent_id 与 teammate_name，让协调工具绑定正确身份。
@@ -624,11 +671,17 @@ class AgentTool(Tool):
         AgentNameRegistry.instance().register(
             teammate_name, teammate_agent.agent_id
         )
+        configured_model = getattr(self.provider_config, "model", None)
+        persisted_model = selected_model or (
+            configured_model.strip()
+            if isinstance(configured_model, str) and configured_model.strip()
+            else "inherit"
+        )
         member = TeammateInfo(
             name=teammate_name,
             agent_id=teammate_agent.agent_id,
             agent_type=agent_def.agent_type,
-            model=params.model or agent_def.model,
+            model=persisted_model,
             worktree_path=wt.path,
             backend_type=backend,
             is_active=None,
@@ -659,6 +712,10 @@ class AgentTool(Tool):
             return ToolResult(
                 content="Worktree manager 未初始化", is_error=True
             )
+        try:
+            client = self._select_llm(params, definition, parent_agent)
+        except ModelSelectionError as e:
+            return ToolResult(content=str(e), is_error=True)
         name = generate_worktree_name()
         try:
             wt = await self.worktree_manager.create(name, "HEAD")
@@ -680,7 +737,6 @@ class AgentTool(Tool):
 
             sub_registry = ToolRegistry()
 
-        client = self._select_llm(params, definition, parent_agent)
         sub_agent = self._create_sub_agent(
             client=client,
             parent_agent=parent_agent,

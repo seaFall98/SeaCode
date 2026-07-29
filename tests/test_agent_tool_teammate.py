@@ -158,6 +158,7 @@ def _make_tool(
     team_manager: Any = None,
     worktree_manager: Any = None,
     loader: Any = None,
+    provider_config: Any = None,
 ) -> AgentTool:
     return AgentTool(
         agent_loader=loader or _FakeLoader(),
@@ -165,7 +166,7 @@ def _make_tool(
         trace_manager=_FakeTraceManager(),
         parent_agent=_FakeParent(),
         enable_fork=False,
-        provider_config=None,
+        provider_config=provider_config,
         worktree_manager=worktree_manager,
         team_manager=team_manager,
     )
@@ -331,12 +332,22 @@ async def test_execute_as_teammate_in_process_full_flow(
 async def test_execute_as_teammate_records_explicit_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from seacode.config import ProviderConfig
+
     team_manager = _FakeTeamManager(
         backend=BackendType.IN_PROCESS, team=_FakeTeam()
     )
     tool = _make_tool(
         team_manager=team_manager,
         worktree_manager=_FakeWorktreeManager(),
+        provider_config=ProviderConfig(
+            name="test",
+            protocol="anthropic",
+            model="default-model",
+            base_url="https://api.example.test",
+            api_key="test-key",
+            available_models=("default-model", "sonnet"),
+        ),
     )
 
     import seacode.teams.spawn_inprocess as spawn_mod
@@ -347,6 +358,7 @@ async def test_execute_as_teammate_records_explicit_model(
     monkeypatch.setattr(
         "seacode.teams.registry.AgentNameRegistry.instance", lambda: MagicMock()
     )
+    monkeypatch.setattr("seacode.client.create_client", lambda cfg: MagicMock())
 
     result = await tool.execute(
         AgentToolParams(
@@ -362,6 +374,45 @@ async def test_execute_as_teammate_records_explicit_model(
     assert result.is_error is False
     member = team_manager.register_member_calls[0][1]
     assert member.model == "sonnet"
+
+
+# 验证 teammate 在创建 worktree 前拒绝 Provider 未配置的模型。
+# 使用真实 AgentTool 路径，断言 worktree 创建和成员注册都没有发生。
+@pytest.mark.asyncio
+async def test_execute_as_teammate_rejects_unconfigured_model_before_creation() -> None:
+    from seacode.config import ProviderConfig
+
+    team_manager = _FakeTeamManager(
+        backend=BackendType.IN_PROCESS, team=_FakeTeam()
+    )
+    worktree_manager = _FakeWorktreeManager()
+    tool = _make_tool(
+        team_manager=team_manager,
+        worktree_manager=worktree_manager,
+        provider_config=ProviderConfig(
+            name="test",
+            protocol="anthropic",
+            model="default-model",
+            base_url="https://api.example.test",
+            api_key="test-key",
+        ),
+    )
+
+    result = await tool.execute(
+        AgentToolParams(
+            team_name="demo",
+            name="alice",
+            prompt="read README.md",
+            model="unconfigured-model",
+        ),
+        conversation=None,
+        parent_agent=_FakeParent(),
+    )
+
+    assert result.is_error is True
+    assert "unconfigured-model" in result.content
+    assert worktree_manager.create_calls == []
+    assert team_manager.register_member_calls == []
 
 
 # ---------------------------------------------------------------------------

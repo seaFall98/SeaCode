@@ -212,6 +212,8 @@ async def _run_prompt(
     registry.register(agent_tool)
     registry.register(TeamCreateTool(agent, team_manager, teams_config))
     registry.register(TeamDeleteTool(agent, team_manager))
+    # AgentTool 的子 Agent 过滤需要父 Agent 的完整注册表；CLI 入口与 TUI 保持同一 wiring。
+    agent.set_full_registry(registry)
 
     # Lead 邮箱 draining：teammate 完成/空闲时通知会写入 lead mailbox，
     # agent 在每轮开始时通过 notification_fn 取出并注入为 system-reminder。
