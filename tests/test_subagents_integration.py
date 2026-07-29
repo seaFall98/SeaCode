@@ -204,8 +204,8 @@ async def test_run_to_completion_with_tool_call_continues_loop() -> None:
     assert len(client.requests) == 2
 
 
-# 验证 run_to_completion 用传入 conversation 覆盖内部默认。
-# 传入预填充 conversation，断言请求历史含预填充消息。
+# 验证 run_to_completion 复用传入 conversation 时仍注入本次非空 task。
+# 传入预填充 conversation，断言请求历史同时含原消息与一次 new task。
 async def test_run_to_completion_uses_passed_conversation() -> None:
     client = _FakeClient([_text_stream("result")])
     agent = _make_agent(client)
@@ -218,6 +218,7 @@ async def test_run_to_completion_uses_passed_conversation() -> None:
     assert len(client.requests) == 1
     # 第一条消息应是预填充的 "previous context"。
     assert client.requests[0][0].content == "previous context"
+    assert [message.content for message in client.requests[0]].count("new task") == 1
 
 
 # 验证 run_to_completion max_iterations 限制循环次数。

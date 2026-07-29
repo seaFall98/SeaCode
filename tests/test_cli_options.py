@@ -179,6 +179,7 @@ async def test_prompt_runtime_starts_team_member_with_worktree_manager(
     assert not lead.team_result.is_error
     member_tool = lead.registry.get("Agent")
     assert member_tool.worktree_manager is not None
+    assert lead.registry.get("SendMessage") is not None
     team = member_tool.team_manager.get_team("demo")
     assert team is not None
     assert [member.name for member in team.members] == ["worker"]

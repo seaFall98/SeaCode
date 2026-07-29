@@ -1507,14 +1507,14 @@ class Agent:
         conversation: Any = None,
         event_callback: Any = None,
     ) -> str:
-        # fork 路径用传入的 conversation（已含 FORK_BOILERPLATE + task user message）；
-        # 定义式路径新建 ConversationManager 并把 task 作为首条 user message。
+        # 调用方可传入已有 conversation；任何非空 task 都必须恰好一次进入最终执行的会话。
+        # Fork 已将 task 放入 conversation 时传空 task，避免重复 user message。
         if conversation is not None:
             conv = conversation
         else:
             conv = ConversationManager()
-            if task:
-                conv.add_user_message(task)
+        if task:
+            conv.add_user_message(task)
 
         # 子 Agent 系统提示词：定义式用 AgentDef.system_prompt；fork 用空串
         # （FORK_BOILERPLATE 已在 messages 中以 user message 形式注入）。

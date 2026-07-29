@@ -24,7 +24,9 @@ def test_spawn_iterm2_teammate_success() -> None:
             MagicMock(returncode=0, stdout="", stderr=""),
             MagicMock(returncode=0, stdout="session-42\n", stderr=""),
         ]
-        info = spawn_iterm2_teammate("demo", "alice", "/tmp/work")
+        info = spawn_iterm2_teammate(
+            "demo", "alice", "/tmp/work", "/project/.seacode/teams"
+        )
 
     assert isinstance(info, ITermPaneInfo)
     assert info.tab_id == "demo-alice"
@@ -39,6 +41,7 @@ def test_spawn_iterm2_teammate_success() -> None:
     assert "write text" in script_text
     assert "demo-alice" in script_text
     assert "-m seacode" in script_text
+    assert "--teams-root /project/.seacode/teams" in script_text
     # 第二次调用获取 session id。
     second_script = mock_run.call_args_list[1][0][0]
     assert "get id of current session" in second_script[2]
@@ -52,7 +55,9 @@ def test_spawn_iterm2_teammate_failure() -> None:
         return_value=MagicMock(returncode=1, stdout="", stderr="osascript error"),
     ):
         with pytest.raises(RuntimeError, match="osascript failed"):
-            spawn_iterm2_teammate("demo", "alice", "/tmp/work")
+            spawn_iterm2_teammate(
+                "demo", "alice", "/tmp/work", "/project/.seacode/teams"
+            )
 
 
 # 验证 kill_pane 调用 osascript 含 close 指令。

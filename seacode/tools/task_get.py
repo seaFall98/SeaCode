@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from seacode.teams.shared_task import TaskStoreError
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 if TYPE_CHECKING:
@@ -38,7 +39,10 @@ class TaskGetTool(Tool):
             return ToolResult(
                 content=f"任务板未找到: {self._team_name}", is_error=True
             )
-        task = store.get(tool_params.task_id)
+        try:
+            task = store.get(tool_params.task_id)
+        except TaskStoreError as e:
+            return ToolResult(content=f"任务板读取失败: {e}", is_error=True)
         if task is None:
             return ToolResult(
                 content=f"任务 '{tool_params.task_id}' 不存在", is_error=True

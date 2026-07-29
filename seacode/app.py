@@ -735,6 +735,8 @@ class SeaCodeApp(App[None]):
         enable_coordinator_mode: bool = False,
     ) -> None:
         super().__init__()
+        # 团队状态属于启动项目；后续进入 member worktree 也不能改变这个根。
+        self._startup_project_dir = Path(os.getcwd()).resolve()
         self._providers = tuple(providers)
         self._client_factory = client_factory
         self._client: LLMClient | None = None
@@ -1275,6 +1277,7 @@ class SeaCodeApp(App[None]):
             team_manager = TeamManager(
                 worktree_manager=self.worktree_manager,
                 trace_manager=self.trace_manager,
+                teams_root=self._startup_project_dir / ".seacode" / "teams",
             )
         except Exception:
             team_manager = None

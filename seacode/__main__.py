@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 from uuid import uuid4
 
 from .config import ConfigError, ProviderConfig, load_config
@@ -53,18 +54,20 @@ async def _resolve_context_windows_async(
     )
 
 
-# batch14：解析 --teammate / --team-name / --agent-name 命令行标志。
-# 返回 (is_teammate, team_name, agent_name)；缺 --team-name / --agent-name 时对应字段为空。
-def _parse_teammate_flags(argv: list[str]) -> tuple[bool, str, str]:
+# 解析 teammate worker 标志；团队根必须由 Lead 显式传入，不能从 worker worktree 推导。
+def _parse_teammate_flags(argv: list[str]) -> tuple[bool, str, str, str]:
     is_teammate = "--teammate" in argv
     team_name = ""
     agent_name = ""
+    teams_root = ""
     for i, arg in enumerate(argv):
         if arg == "--team-name" and i + 1 < len(argv):
             team_name = argv[i + 1]
         elif arg == "--agent-name" and i + 1 < len(argv):
             agent_name = argv[i + 1]
-    return (is_teammate, team_name, agent_name)
+        elif arg == "--teams-root" and i + 1 < len(argv):
+            teams_root = argv[i + 1]
+    return (is_teammate, team_name, agent_name, teams_root)
 
 
 # 非交互模式：直接执行 prompt 并把结果输出到 stdout，用于脚本化调用与 CI 集成。
@@ -176,6 +179,7 @@ async def _run_prompt(
     from .agents.trace import TraceManager
     from .teams.manager import TeamManager
     from .tools.agent_tool import AgentTool
+    from .tools.send_message import SendMessageTool
     from .tools.team_create import TeamCreateTool
     from .tools.team_delete import TeamDeleteTool
     from .tools.tool_search import ToolSearchTool
@@ -192,7 +196,9 @@ async def _run_prompt(
         symlink_directories=list(config.worktree.symlink_directories),
     )
     team_manager = TeamManager(
-        worktree_manager=worktree_manager, trace_manager=trace_manager
+        worktree_manager=worktree_manager,
+        trace_manager=trace_manager,
+        teams_root=Path(cwd) / ".seacode" / "teams",
     )
     teams_config = SimpleNamespace(
         teammate_mode="in-process",
@@ -212,6 +218,7 @@ async def _run_prompt(
     registry.register(agent_tool)
     registry.register(TeamCreateTool(agent, team_manager, teams_config))
     registry.register(TeamDeleteTool(agent, team_manager))
+    registry.register(SendMessageTool(team_manager, parent_agent=agent))
     # AgentTool 的子 Agent 过滤需要父 Agent 的完整注册表；CLI 入口与 TUI 保持同一 wiring。
     agent.set_full_registry(registry)
 
@@ -371,7 +378,9 @@ async def _run_prompt(
 
 # batch14：teammate worker 入口；加载 config → 注册 self/lead 名字 → 构造 Agent → spawn。
 # 团队不存在时记 error 退出；任一步失败不抛异常到上层，避免 worker 进程崩溃。
-async def _run_teammate(team_name: str, agent_name: str) -> None:
+async def _run_teammate(
+    team_name: str, agent_name: str, teams_root: str = ""
+) -> None:
     from .agent import Agent
     from .client import create_client
     from .teams.manager import TeamManager
@@ -397,7 +406,15 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
         log.error("create client failed: %s", error)
         return
 
-    team_manager = TeamManager(worktree_manager=None, trace_manager=None)
+    if not teams_root:
+        log.error("teammate worker requires an explicit --teams-root")
+        return
+
+    team_manager = TeamManager(
+        worktree_manager=None,
+        trace_manager=None,
+        teams_root=Path(teams_root),
+    )
     team = team_manager.get_team(team_name)
     if team is None:
         log.error("team %s not found", team_name)
@@ -461,9 +478,9 @@ def main() -> None:
 
     # batch14：teammate worker 入口；--teammate 标志触发 _run_teammate。
     # 必须在 argparse 之前拦截，走独立的 worker 分支而不是正常 TUI。
-    is_teammate, team_name, agent_name = _parse_teammate_flags(sys.argv)
+    is_teammate, team_name, agent_name, teams_root = _parse_teammate_flags(sys.argv)
     if is_teammate:
-        asyncio.run(_run_teammate(team_name, agent_name))
+        asyncio.run(_run_teammate(team_name, agent_name, teams_root))
         return
 
     from .permissions import PermissionMode

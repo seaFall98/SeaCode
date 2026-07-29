@@ -23,7 +23,9 @@ def test_spawn_tmux_teammate_success() -> None:
         "seacode.teams.spawn_tmux.subprocess.run",
         side_effect=[fake_new, fake_list],
     ) as mock_run:
-        info = spawn_tmux_teammate("demo", "alice", "/tmp/work")
+        info = spawn_tmux_teammate(
+            "demo", "alice", "/tmp/work", "/project/.seacode/teams"
+        )
 
     assert isinstance(info, TmuxPaneInfo)
     assert info.window_name == "demo-alice"
@@ -35,6 +37,7 @@ def test_spawn_tmux_teammate_success() -> None:
     assert "-d" in first_call[0][0]
     assert "-n" in first_call[0][0]
     assert "demo-alice" in first_call[0][0]
+    assert "--teams-root /project/.seacode/teams" in first_call[0][0][-1]
     # 第二次调用：list-panes -t <window> -F #{pane_id}。
     second_call = mock_run.call_args_list[1]
     assert "list-panes" in second_call[0][0]
@@ -50,7 +53,9 @@ def test_spawn_tmux_teammate_failure() -> None:
         "seacode.teams.spawn_tmux.subprocess.run", return_value=fake_fail
     ):
         with pytest.raises(RuntimeError, match="tmux new-window failed"):
-            spawn_tmux_teammate("demo", "alice", "/tmp/work")
+            spawn_tmux_teammate(
+                "demo", "alice", "/tmp/work", "/project/.seacode/teams"
+            )
 
 
 # 验证 spawn_tmux_teammate 在 list-panes 失败时回退用 window_name 作为 pane_id。
@@ -62,7 +67,9 @@ def test_spawn_tmux_teammate_list_fail_fallback() -> None:
         "seacode.teams.spawn_tmux.subprocess.run",
         side_effect=[fake_new, fake_list_fail],
     ):
-        info = spawn_tmux_teammate("demo", "alice", "/tmp/work")
+        info = spawn_tmux_teammate(
+            "demo", "alice", "/tmp/work", "/project/.seacode/teams"
+        )
     assert info.pane_id == "demo-alice"
 
 

@@ -31,10 +31,10 @@ def _run_osascript(script: str) -> str:
 
 # 在 iTerm2 新标签页中启动 teammate worker；失败抛 RuntimeError。
 def spawn_iterm2_teammate(
-    team_name: str, member_name: str, workdir: str
+    team_name: str, member_name: str, workdir: str, teams_root: str
 ) -> ITermPaneInfo:
     window_name = f"{team_name}-{member_name}"
-    cli = build_teammate_cli(team_name, member_name, workdir)
+    cli = build_teammate_cli(team_name, member_name, workdir, teams_root)
     # 转义 CLI 中的双引号，避免破坏 AppleScript 字符串。
     cli_escaped = cli.replace('"', '\\"')
     script = (

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from seacode.teams.shared_task import TaskStoreError
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 
 if TYPE_CHECKING:
@@ -62,46 +63,49 @@ class TaskUpdateTool(Tool):
         task_id = tool_params.task_id
         task = None
 
-        # 基础字段（status/assignee/description）走 update；任一非 None 时调用。
-        if (
-            tool_params.status is not None
-            or tool_params.assignee is not None
-            or tool_params.description is not None
-        ):
-            task = store.update(
-                task_id=task_id,
-                status=tool_params.status,
-                assignee=tool_params.assignee,
-                description=tool_params.description,
-            )
-            if task is None:
-                return ToolResult(
-                    content=f"任务 '{task_id}' 不存在", is_error=True
+        try:
+            # 基础字段（status/assignee/description）走 update；任一非 None 时调用。
+            if (
+                tool_params.status is not None
+                or tool_params.assignee is not None
+                or tool_params.description is not None
+            ):
+                task = store.update(
+                    task_id=task_id,
+                    status=tool_params.status,
+                    assignee=tool_params.assignee,
+                    description=tool_params.description,
                 )
+                if task is None:
+                    return ToolResult(
+                        content=f"任务 '{task_id}' 不存在", is_error=True
+                    )
 
-        # 追加 blocks 依赖；独立方法去重保证唯一。
-        if tool_params.add_blocks:
-            task = store.add_blocks(task_id, tool_params.add_blocks)
-            if task is None:
-                return ToolResult(
-                    content=f"任务 '{task_id}' 不存在", is_error=True
-                )
+            # 追加 blocks 依赖；独立方法去重保证唯一。
+            if tool_params.add_blocks:
+                task = store.add_blocks(task_id, tool_params.add_blocks)
+                if task is None:
+                    return ToolResult(
+                        content=f"任务 '{task_id}' 不存在", is_error=True
+                    )
 
-        # 追加 blocked_by 反向依赖；独立方法去重保证唯一。
-        if tool_params.add_blocked_by:
-            task = store.add_blocked_by(task_id, tool_params.add_blocked_by)
-            if task is None:
-                return ToolResult(
-                    content=f"任务 '{task_id}' 不存在", is_error=True
-                )
+            # 追加 blocked_by 反向依赖；独立方法去重保证唯一。
+            if tool_params.add_blocked_by:
+                task = store.add_blocked_by(task_id, tool_params.add_blocked_by)
+                if task is None:
+                    return ToolResult(
+                        content=f"任务 '{task_id}' 不存在", is_error=True
+                    )
 
-        # 未提供任何更新字段时，确认任务存在。
-        if task is None:
-            task = store.get(task_id)
+            # 未提供任何更新字段时，确认任务存在。
             if task is None:
-                return ToolResult(
-                    content=f"任务 '{task_id}' 不存在", is_error=True
-                )
+                task = store.get(task_id)
+                if task is None:
+                    return ToolResult(
+                        content=f"任务 '{task_id}' 不存在", is_error=True
+                    )
+        except TaskStoreError as e:
+            return ToolResult(content=f"任务板操作失败: {e}", is_error=True)
 
         changes: list[str] = []
         if tool_params.status:

@@ -175,7 +175,7 @@ async def test_spawn_inprocess_completion_marks_registered_member_idle(
 # 验证 spawn_inprocess_teammate 有 mailbox 时长驻循环：执行→idle 通知→等待→shutdown。
 # mock run_to_completion 返回 "done"，_wait_for_next_prompt_or_shutdown
 # 第一次返回普通消息、第二次 shutdown。
-# 断言 run_to_completion 调用 2 次、manager 收到 idle 收敛请求、最终 status="completed"。
+# 断言 run_to_completion 调用 2 次、每轮先 active 后 idle、最终 status="completed"。
 @pytest.mark.asyncio
 async def test_spawn_inprocess_with_mailbox_long_running(monkeypatch: pytest.MonkeyPatch) -> None:
     from pathlib import Path
@@ -220,6 +220,7 @@ async def test_spawn_inprocess_with_mailbox_long_running(monkeypatch: pytest.Mon
         # run_to_completion 应被调用 2 次（首轮 + 续派）。
         assert fake_agent.run_to_completion.call_count == 2
         assert handle.progress.status == "completed"
+        assert fake_team_manager.set_member_active.call_count == 2
         fake_team_manager.set_member_idle.assert_called()
     finally:
         # 清理测试邮箱目录。

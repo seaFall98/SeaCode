@@ -28,10 +28,10 @@ def _run_tmux(args: list[str]) -> subprocess.CompletedProcess:
 
 # 在 tmux 新窗口中启动 teammate worker；失败抛 RuntimeError。
 def spawn_tmux_teammate(
-    team_name: str, member_name: str, workdir: str
+    team_name: str, member_name: str, workdir: str, teams_root: str
 ) -> TmuxPaneInfo:
     window_name = f"{team_name}-{member_name}"
-    cli = build_teammate_cli(team_name, member_name, workdir)
+    cli = build_teammate_cli(team_name, member_name, workdir, teams_root)
     result = _run_tmux(["new-window", "-d", "-n", window_name, cli])
     if result.returncode != 0:
         raise RuntimeError(f"tmux new-window failed: {result.stderr}")
