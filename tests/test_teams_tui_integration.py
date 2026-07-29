@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -91,6 +92,24 @@ async def test_app_starts_with_team_manager_initialized() -> None:
         assert isinstance(app.team_manager, TeamManager)
 
 
+# 验证应用把启动时 cwd 固定为 TeamManager 的项目级团队根。
+# 切换到临时项目启动 TUI，断言根为该项目的 .seacode/teams 而非用户 Home。
+@pytest.mark.asyncio
+async def test_app_team_manager_uses_startup_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient([[StreamComplete()]])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+
+    async with app.run_test() as pilot:
+        await _settle(pilot)
+        assert app.team_manager is not None
+        assert app.team_manager.teams_root == (
+            tmp_path / ".seacode" / "teams"
+        ).resolve()
+
+
 # 验证 SeaCodeApp 启动时 TeammateTree widget 挂载到主 TUI。
 # compose 中创建 TeammateTree 并 yield，app.teammate_tree 应为 TeammateTree 实例。
 @pytest.mark.asyncio
@@ -177,9 +196,8 @@ async def test_run_turn_injects_team_manager_and_notification_fn() -> None:
         assert isinstance(notes, list)
 
 
-# 验证 TeamCreate / TeamDelete 工具的 _parent_agent 在 _run_turn 中刷新；
-# SendMessageTool 改为构造时绑定 from_agent_id/from_agent_name，不再走 _parent_agent 模式。
-# 发送消息触发 _run_turn 后，TeamCreate/TeamDelete 的 _parent_agent 应为当前回合 Agent。
+# 验证 TeamCreate / TeamDelete / SendMessage 的 Lead 上下文在 _run_turn 中刷新。
+# 发送消息触发 _run_turn 后，三个团队工具都应持有当前回合 Agent。
 @pytest.mark.asyncio
 async def test_run_turn_updates_team_tools_parent_agent() -> None:
     client = _FakeClient(
@@ -208,8 +226,9 @@ async def test_run_turn_updates_team_tools_parent_agent() -> None:
         assert isinstance(send_message, SendMessageTool)
         assert team_create._parent_agent is agent
         assert team_delete._parent_agent is agent
-        # SendMessageTool 不再有 _parent_agent；占位实例的 from_agent_id 为空字符串。
+        # SendMessage 占位实例不再依赖空 from_agent_id，而是在 execute 时读取当前 Lead。
         assert send_message._from_agent_id == ""
+        assert send_message._parent_agent is agent
 
 
 # ---------------------------------------------------------------------------

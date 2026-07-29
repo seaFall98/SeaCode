@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -69,6 +70,7 @@ class _FakeTeamManager:
     ) -> None:
         self._backend = backend
         self._team = team
+        self.teams_root = Path("/project/.seacode/teams")
         self.detect_calls: list[tuple[str, bool]] = []
         self.mailbox = MagicMock()
         # register_inprocess_handle / register_pane_id 改为按 agent_id 索引；
@@ -76,6 +78,7 @@ class _FakeTeamManager:
         self.register_inprocess_calls: list[tuple[str, Any]] = []
         self.register_pane_calls: list[tuple[str, str]] = []
         self.register_member_calls: list[tuple[str, TeammateInfo]] = []
+        self.rollback_member_calls: list[tuple[str, TeammateInfo]] = []
 
     def detect_backend(self, teammate_mode: str, is_interactive: bool) -> BackendType:
         self.detect_calls.append((teammate_mode, is_interactive))
@@ -97,6 +100,9 @@ class _FakeTeamManager:
         self, team_name: str, member: TeammateInfo
     ) -> None:
         self.register_member_calls.append((team_name, member))
+
+    def rollback_member(self, team_name: str, member: TeammateInfo) -> None:
+        self.rollback_member_calls.append((team_name, member))
 
 
 # 假父 Agent：提供 _full_registry、client、protocol 等属性。
@@ -231,13 +237,34 @@ async def test_execute_as_teammate_no_worktree_manager() -> None:
 @pytest.mark.asyncio
 async def test_execute_as_teammate_worktree_create_failed() -> None:
     tool = _make_tool(
-        team_manager=_FakeTeamManager(),
+        team_manager=_FakeTeamManager(team=_FakeTeam()),
         worktree_manager=_FakeWorktreeManager(raise_error=True),
     )
     params = AgentToolParams(team_name="demo", prompt="hi")
     result = await tool.execute(params, conversation=None, parent_agent=_FakeParent())
     assert result.is_error is True
     assert "worktree" in result.content
+
+
+# 验证不存在的团队会在创建 worktree 前返回错误。
+# 使用记录 create 调用的 fake manager，断言错误路径不产生隔离工作区。
+@pytest.mark.asyncio
+async def test_execute_as_teammate_rejects_unknown_team_before_worktree() -> None:
+    worktree_manager = _FakeWorktreeManager()
+    tool = _make_tool(
+        team_manager=_FakeTeamManager(team=None),
+        worktree_manager=worktree_manager,
+    )
+
+    result = await tool.execute(
+        AgentToolParams(team_name="missing", prompt="hi"),
+        conversation=None,
+        parent_agent=_FakeParent(),
+    )
+
+    assert result.is_error is True
+    assert "团队不存在" in result.content
+    assert worktree_manager.create_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +291,7 @@ async def test_execute_as_teammate_in_process_full_flow(
     spawn_calls: list[dict[str, Any]] = []
 
     def fake_spawn(agent, task, name, tm, mailbox=None, lead_agent_id=""):
+        assert len(team_manager.register_member_calls) == 1
         spawn_calls.append(
             {
                 "agent": agent,
@@ -321,9 +349,48 @@ async def test_execute_as_teammate_in_process_full_flow(
     assert member.name == "alice"
     assert member.backend_type == BackendType.IN_PROCESS
     assert member.model == "inherit"
+    assert member.is_active is True
     # 确认 AgentNameRegistry.register 调用。
     assert len(registry_calls) == 1
     assert registry_calls[0][0] == "alice"
+
+
+# 验证 in-process spawn 失败会撤销已注册成员、名字索引和关联 worktree 清理入口。
+# 让 spawn 抛异常，断言 ToolResult 失败、rollback_member 与 unregister 都被调用一次。
+@pytest.mark.asyncio
+async def test_execute_as_teammate_spawn_failure_rolls_back_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_manager = _FakeTeamManager(
+        backend=BackendType.IN_PROCESS, team=_FakeTeam()
+    )
+    tool = _make_tool(
+        team_manager=team_manager,
+        worktree_manager=_FakeWorktreeManager(),
+    )
+
+    import seacode.teams.spawn_inprocess as spawn_mod
+
+    def failing_spawn(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(spawn_mod, "spawn_inprocess_teammate", failing_spawn)
+    fake_registry = MagicMock()
+    monkeypatch.setattr(
+        "seacode.teams.registry.AgentNameRegistry.instance", lambda: fake_registry
+    )
+
+    result = await tool.execute(
+        AgentToolParams(team_name="demo", name="alice", prompt="hi"),
+        conversation=None,
+        parent_agent=_FakeParent(),
+    )
+
+    assert result.is_error
+    assert "已回滚成员状态" in result.content
+    assert len(team_manager.register_member_calls) == 1
+    assert len(team_manager.rollback_member_calls) == 1
+    fake_registry.unregister.assert_called_once_with("alice")
 
 
 # 验证队友显式模型覆盖会写入持久化成员信息。
@@ -436,10 +503,10 @@ async def test_execute_as_teammate_tmux_backend(
         worktree_manager=_FakeWorktreeManager(),
     )
 
-    tmux_calls: list[tuple[str, str, str]] = []
+    tmux_calls: list[tuple[str, str, str, str]] = []
 
-    def fake_spawn_tmux(team_name, member_name, workdir):
-        tmux_calls.append((team_name, member_name, workdir))
+    def fake_spawn_tmux(team_name, member_name, workdir, teams_root):
+        tmux_calls.append((team_name, member_name, workdir, teams_root))
         return TmuxPaneInfo(pane_id="%5", window_name="demo-alice")
 
     import seacode.teams.spawn_tmux as tmux_mod
@@ -462,6 +529,7 @@ async def test_execute_as_teammate_tmux_backend(
     assert len(tmux_calls) == 1
     assert tmux_calls[0][0] == "demo"
     assert tmux_calls[0][1] == "alice"
+    assert tmux_calls[0][3] == str(team_manager.teams_root)
     assert len(team_manager.register_pane_calls) == 1
     # register_pane_calls 现为 (agent_id, pane_id) 元组；pane_id 仍是第二个元素。
     assert team_manager.register_pane_calls[0][1] == "%5"

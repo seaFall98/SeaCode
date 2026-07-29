@@ -152,21 +152,27 @@ def _sanitize_name(name: str) -> str:
     return slug or "team"
 
 
-# 返回 ~/.seacode/teams/<slug> 的团队目录路径。
-def resolve_team_dir(team_name: str) -> Path:
+# 返回给定团队根下的 <slug> 团队目录路径；未提供根时保留旧 API 的用户级默认值。
+def resolve_team_dir(
+    team_name: str, teams_root: str | Path | None = None
+) -> Path:
     slug = _sanitize_name(team_name)
-    return Path.home() / ".seacode" / "teams" / slug
+    root = Path(teams_root) if teams_root is not None else Path.home() / ".seacode" / "teams"
+    return root / slug
 
 
-# 同名团队已存在时追加 -2 / -3 后缀；用于 create_team 防止目录覆盖。
-def unique_team_name(team_name: str) -> str:
+# 同名团队已存在时追加 -2 / -3 后缀；用于给定团队根中的 create_team 防止目录覆盖。
+def unique_team_name(
+    team_name: str, teams_root: str | Path | None = None
+) -> str:
     base = _sanitize_name(team_name)
-    team_dir = Path.home() / ".seacode" / "teams" / base
+    root = Path(teams_root) if teams_root is not None else Path.home() / ".seacode" / "teams"
+    team_dir = root / base
     if not team_dir.exists():
         return base
     i = 2
     while True:
         candidate = f"{base}-{i}"
-        if not (Path.home() / ".seacode" / "teams" / candidate).exists():
+        if not (root / candidate).exists():
             return candidate
         i += 1

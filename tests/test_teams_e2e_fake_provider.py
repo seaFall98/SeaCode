@@ -9,7 +9,6 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -133,10 +132,17 @@ async def test_send_message_to_lead_uses_team_lead_identifier(
     create_tool = TeamCreateTool(lead, manager, _make_config())
     await create_tool.execute(TeamCreateParams(team_name="demo"))
 
-    registry = MagicMock()
-    monkeypatch.setattr(
-        "seacode.tools.send_message.AgentNameRegistry.instance",
-        lambda: registry,
+    manager.register_member(
+        "demo",
+        TeammateInfo(
+            name="alice",
+            agent_id="alice-id",
+            agent_type="teammate",
+            model="test-model",
+            worktree_path="/tmp/fake-wt-alice",
+            backend_type=BackendType.IN_PROCESS,
+            is_active=False,
+        ),
     )
     tool = SendMessageTool(manager, "demo", "alice-id", "alice")
     result = await tool.execute(
@@ -148,7 +154,6 @@ async def test_send_message_to_lead_uses_team_lead_identifier(
     )
 
     assert not result.is_error
-    registry.resolve.assert_not_called()
     notes = manager.drain_lead_mailbox()
     assert len(notes) == 1
     assert "work complete" in notes[0]

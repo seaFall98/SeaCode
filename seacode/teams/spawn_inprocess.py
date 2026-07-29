@@ -195,30 +195,37 @@ def spawn_inprocess_teammate(
                 if mailbox is not None:
                     _inject_pending_messages(mailbox, agent.agent_id, conv)
 
-                # 第 2 步：执行一个完整 agent turn。
+                # 第 2 步：每一轮执行前先收敛为 active，避免 idle 续写期间状态过时。
+                if team_manager is not None and team_name:
+                    try:
+                        team_manager.set_member_active(team_name, name)
+                    except Exception as e:
+                        log.warning("failed to mark teammate %s active: %s", name, e)
+
+                # 第 3 步：执行一个完整 agent turn。
                 result = await agent.run_to_completion(
                     next_prompt, conv, event_callback=_on_event
                 )
                 handle._result = result
                 next_prompt = ""
 
-                # 第 3 步：无 mailbox 时退化为单次返回。
+                # 第 4 步：无 mailbox 时退化为单次返回。
                 if mailbox is None:
                     progress.status = "completed"
                     _mark_member_idle("completed")
                     return result
 
-                # 第 4 步：更新进度状态。
+                # 第 5 步：更新进度状态。
                 if idle_reason == "failed":
                     progress.status = "failed"
                 else:
                     progress.status = "idle"
 
-                # 第 5 步：通知 lead 本轮已完成。
+                # 第 6 步：通知 lead 本轮已完成。
                 _mark_member_idle(idle_reason)
                 idle_reason = "available"
 
-                # 第 6 步：轮询等待 lead 下发新任务或 shutdown。
+                # 第 7 步：轮询等待 lead 下发新任务或 shutdown。
                 new_prompt, shutdown = await _wait_for_next_prompt_or_shutdown(
                     mailbox, agent.agent_id
                 )

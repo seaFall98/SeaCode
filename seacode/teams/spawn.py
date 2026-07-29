@@ -17,14 +17,16 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
-# 构造 teammate worker 启动 CLI：cd <workdir> && <python> -m seacode
-# --teammate --team-name <t> --agent-name <n>。
-def build_teammate_cli(team_name: str, member_name: str, workdir: str) -> str:
+# 构造 teammate worker 启动 CLI：worker 在 worktree 中运行，但团队根由 Lead 显式传入。
+def build_teammate_cli(
+    team_name: str, member_name: str, workdir: str, teams_root: str
+) -> str:
     python = sys.executable or "python"
     cd_part = f"cd {shell_quote(workdir)}"
     cmd_part = (
         f"{shell_quote(python)} -m seacode --teammate "
         f"--team-name {shell_quote(team_name)} "
-        f"--agent-name {shell_quote(member_name)}"
+        f"--agent-name {shell_quote(member_name)} "
+        f"--teams-root {shell_quote(teams_root)}"
     )
     return f"{cd_part} && {cmd_part}"

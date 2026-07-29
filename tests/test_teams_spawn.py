@@ -21,22 +21,28 @@ def test_shell_quote_branches() -> None:
 
 
 # 验证 build_teammate_cli 产出 cd <workdir> && <python> -m seacode
-# --teammate --team-name <t> --agent-name <n>。
+# --teammate --team-name <t> --agent-name <n> --teams-root <root>。
 # 断言关键字段全部出现，且 cd 与命令之间用 && 连接。
 def test_build_teammate_cli_format() -> None:
-    cli = build_teammate_cli("demo", "alice", "/tmp/work")
+    cli = build_teammate_cli(
+        "demo", "alice", "/tmp/work", "/project/.seacode/teams"
+    )
     assert "cd /tmp/work" in cli
     assert "-m seacode" in cli
     assert "--teammate" in cli
     assert "--team-name demo" in cli
     assert "--agent-name alice" in cli
+    assert "--teams-root /project/.seacode/teams" in cli
     assert " && " in cli
 
 
 # 验证 build_teammate_cli 对含特殊字符的 workdir / team_name / member_name 正确转义。
 # 含空格的 workdir 包单引号；含 $ 的 team_name 包单引号。
 def test_build_teammate_cli_escapes_special_chars() -> None:
-    cli = build_teammate_cli("my team", "alice", "/tmp/my work")
+    cli = build_teammate_cli(
+        "my team", "alice", "/tmp/my work", "/project/my teams"
+    )
     assert "cd '/tmp/my work'" in cli
     assert "--team-name 'my team'" in cli
     assert "--agent-name alice" in cli
+    assert "--teams-root '/project/my teams'" in cli

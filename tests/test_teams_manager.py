@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,7 +62,7 @@ async def test_create_team_dedup_name(
 ) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(
-        "seacode.teams.manager.unique_team_name", lambda name: "demo-2"
+        "seacode.teams.manager.unique_team_name", lambda name, root: "demo-2"
     )
     mgr = TeamManager()
     team = await mgr.create_team("demo", "lead-1")
@@ -187,6 +188,38 @@ async def test_set_member_idle_writes_notification(
     stored_member = team.get_member("alice")
     assert stored_member is not None
     assert stored_member.is_active is False
+
+
+# 验证 set_member_active 在 idle 成员收到续写前持久化为 active。
+# 先将 alice 标记 idle，再调用 set_member_active，断言内存成员和 config.json 均为 True。
+@pytest.mark.asyncio
+async def test_set_member_active_persists_continuation_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manager = TeamManager()
+    await manager.create_team("demo", "lead-1")
+    manager.register_member(
+        "demo",
+        TeammateInfo(
+            name="alice", agent_id="a1", agent_type="t", model="m",
+            worktree_path="/wt", backend_type=BackendType.IN_PROCESS,
+            is_active=False,
+        ),
+    )
+
+    manager.set_member_active("demo", "alice")
+
+    team = manager.get_team("demo")
+    assert team is not None
+    member = team.get_member("alice")
+    assert member is not None
+    assert member.is_active is True
+    reloaded = TeamManager().get_team("demo")
+    assert reloaded is not None
+    restored_member = reloaded.get_member("alice")
+    assert restored_member is not None
+    assert restored_member.is_active is True
 
 
 # 验证 register_inprocess_handle / register_pane_id / get_pane_id 存取。
@@ -419,3 +452,92 @@ def test_cleanup_worktree_falls_back_to_rmtree(
     mgr._cleanup_worktree(str(wt))
     # rmtree 应删除目录。
     assert not wt.exists()
+
+
+# 验证 _cleanup_worktree 会删除 SeaCode 自动生成的 worktree 分支。
+# 模拟完整 Git 成功路径，断言 remove 后以 git common dir 删除 worktree-* 分支。
+def test_cleanup_worktree_deletes_generated_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from subprocess import CompletedProcess
+
+    manager = TeamManager()
+    worktree = tmp_path / "team-demo-alice"
+    worktree.mkdir()
+    common_dir = tmp_path / ".git"
+    branch = "worktree-team-demo+alice"
+    calls: list[list[str]] = []
+    results = [
+        CompletedProcess([], 0, stdout=f"{branch}\n", stderr=""),
+        CompletedProcess([], 0, stdout=f"{common_dir}\n", stderr=""),
+        CompletedProcess([], 0, stdout="", stderr=""),
+        CompletedProcess([], 0, stdout="", stderr=""),
+    ]
+
+    def fake_run(args: list[str], **kwargs: Any) -> CompletedProcess[str]:
+        del kwargs
+        calls.append(args)
+        return results.pop(0)
+
+    monkeypatch.setattr("seacode.teams.manager.subprocess.run", fake_run)
+
+    manager._cleanup_worktree(str(worktree))
+
+    assert not worktree.exists()
+    assert calls[2] == ["git", "worktree", "remove", str(worktree), "--force"]
+    assert calls[3] == [
+        "git",
+        f"--git-dir={common_dir}",
+        "branch",
+        "-D",
+        branch,
+    ]
+
+
+# 验证 TeamManager 的显式团队根自动创建项目 .seacode/teams，且不会读取遗留用户级团队。
+# 分别在 legacy 与 project 根创建团队，断言 project 只加载自身团队并保持目录隔离。
+@pytest.mark.asyncio
+async def test_team_manager_uses_explicit_project_root_and_ignores_legacy(
+    tmp_path: Path,
+) -> None:
+    legacy_root = tmp_path / "user-home" / ".seacode" / "teams"
+    legacy_manager = TeamManager(teams_root=legacy_root)
+    await legacy_manager.create_team("legacy", "legacy-lead")
+
+    project_root = tmp_path / "project" / ".seacode" / "teams"
+    manager = TeamManager(teams_root=project_root)
+    assert manager.get_team("legacy") is None
+    team = await manager.create_team("demo", "lead-1")
+
+    assert team.config_path == str(project_root / "demo" / "config.json")
+    assert (project_root / "demo" / "tasks.json").exists()
+    assert (legacy_root / "legacy" / "config.json").exists()
+    assert not (legacy_root / "demo").exists()
+
+
+# 验证两个项目可创建同名团队，重启后的 Manager 仍按自身根加载和按 Lead 查询。
+# 在两个不同根创建 demo，再新建 Manager，断言各自的 description 和 Lead 互不串扰。
+@pytest.mark.asyncio
+async def test_team_manager_isolates_same_name_teams_between_projects(
+    tmp_path: Path,
+) -> None:
+    root_a = tmp_path / "project-a" / ".seacode" / "teams"
+    root_b = tmp_path / "project-b" / ".seacode" / "teams"
+    manager_a = TeamManager(teams_root=root_a)
+    manager_b = TeamManager(teams_root=root_b)
+    await manager_a.create_team("demo", "lead-a", description="A")
+    await manager_b.create_team("demo", "lead-b", description="B")
+
+    reloaded_a = TeamManager(teams_root=root_a)
+    reloaded_b = TeamManager(teams_root=root_b)
+    team_a = reloaded_a.get_team("demo")
+    team_b = reloaded_b.get_team("demo")
+
+    assert team_a is not None
+    assert team_b is not None
+    assert team_a.description == "A"
+    assert team_b.description == "B"
+    assert [team.name for team in reloaded_a.get_teams_for_lead("lead-a")] == [
+        "demo"
+    ]
+    assert reloaded_a.get_teams_for_lead("lead-b") == []

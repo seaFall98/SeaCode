@@ -2,9 +2,47 @@
 
 from __future__ import annotations
 
+import json
+import multiprocessing as mp
+import queue
 from pathlib import Path
+from typing import Any
 
-from seacode.teams.shared_task import SharedTask, SharedTaskStore
+import pytest
+
+from seacode.teams.shared_task import (
+    SharedTask,
+    SharedTaskStore,
+    TaskStoreError,
+)
+
+
+def _create_tasks_in_worker(
+    path: str, count: int, start_event: Any, errors: Any
+) -> None:
+    try:
+        if not start_event.wait(10):
+            raise RuntimeError("worker start timeout")
+        store = SharedTaskStore(path)
+        for index in range(count):
+            store.create(title=f"worker task {index}", created_by="worker")
+    except Exception as error:
+        errors.put(repr(error))
+
+
+def _update_task_in_worker(
+    path: str, field: str, value: str, start_event: Any, errors: Any
+) -> None:
+    try:
+        if not start_event.wait(10):
+            raise RuntimeError("worker start timeout")
+        store = SharedTaskStore(path)
+        if field == "status":
+            store.update("1", status=value)
+        else:
+            store.update("1", assignee=value)
+    except Exception as error:
+        errors.put(repr(error))
 
 # ---------------------------------------------------------------------------
 # create / get
@@ -207,13 +245,16 @@ def test_init_empty_creates_file(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-# 验证 _load 在文件损坏（非法 JSON）时返回空结构，不抛异常。
-def test_load_corrupt_json_returns_empty(tmp_path: Path) -> None:
+# 验证任务板 JSON 损坏时返回可诊断错误，不会被空任务板覆盖。
+# 先写入非法 JSON，再 create，断言抛 TaskStoreError 且原始文本保持不变。
+def test_corrupt_json_raises_without_overwrite(tmp_path: Path) -> None:
     path = tmp_path / "tasks.json"
-    path.write_text("not a valid json {", encoding="utf-8")
+    original = "not a valid json {"
+    path.write_text(original, encoding="utf-8")
     store = SharedTaskStore(path)
-    # 不抛异常，返回空列表。
-    assert store.list_tasks() == []
+    with pytest.raises(TaskStoreError, match="无法读取任务板"):
+        store.create(title="must not overwrite")
+    assert path.read_text(encoding="utf-8") == original
 
 
 # 验证 SharedTask.from_dict 忽略未知键并填充默认值。
@@ -250,3 +291,91 @@ def test_to_dict_from_dict_roundtrip() -> None:
     data = original.to_dict()
     restored = SharedTask.from_dict(data)
     assert restored == original
+
+
+# 验证多个 Windows 子进程同时创建任务时 ID 唯一且任务板始终是完整 JSON。
+# 三个 spawn worker 同时各创建任务，断言全部退出、无错误、任务数和 ID 连续。
+def test_shared_task_store_multiprocess_create_is_consistent(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.json"
+    SharedTaskStore(path).init_empty()
+    context = mp.get_context("spawn")
+    start_event = context.Event()
+    errors = context.Queue()
+    processes = [
+        context.Process(
+            target=_create_tasks_in_worker,
+            args=(str(path), 8, start_event, errors),
+        )
+        for _ in range(3)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(20)
+        assert all(process.exitcode == 0 for process in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+
+    worker_errors: list[str] = []
+    while True:
+        try:
+            worker_errors.append(errors.get(timeout=0.1))
+        except queue.Empty:
+            break
+    assert worker_errors == []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert len(data["tasks"]) == 24
+    assert set(data["tasks"]) == {str(index) for index in range(1, 25)}
+    assert SharedTaskStore(path).list_tasks()
+
+
+# 验证多个子进程更新同一任务的不同字段时不会互相覆盖。
+# 两个 spawn worker 同时更新 status 和 assignee，断言最终任务同时保留两个字段。
+def test_shared_task_store_multiprocess_updates_preserve_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tasks.json"
+    store = SharedTaskStore(path)
+    store.create(title="shared")
+    context = mp.get_context("spawn")
+    start_event = context.Event()
+    errors = context.Queue()
+    processes = [
+        context.Process(
+            target=_update_task_in_worker,
+            args=(str(path), "status", "completed", start_event, errors),
+        ),
+        context.Process(
+            target=_update_task_in_worker,
+            args=(str(path), "assignee", "alice", start_event, errors),
+        ),
+    ]
+    try:
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(20)
+        assert all(process.exitcode == 0 for process in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+
+    worker_errors: list[str] = []
+    while True:
+        try:
+            worker_errors.append(errors.get(timeout=0.1))
+        except queue.Empty:
+            break
+    assert worker_errors == []
+    updated = SharedTaskStore(path).get("1")
+    assert updated is not None
+    assert updated.status == "completed"
+    assert updated.assignee == "alice"

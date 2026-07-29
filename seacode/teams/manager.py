@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from seacode.teams.backend_detect import detect_backend
@@ -31,9 +32,17 @@ class TeamError(Exception):
 
 class TeamManager:
     # 管理多个团队的内存缓存与磁盘持久化；worktree_manager 与 trace_manager 由 app 注入。
-    def __init__(self, worktree_manager: Any = None, trace_manager: Any = None) -> None:
+    def __init__(
+        self,
+        worktree_manager: Any = None,
+        trace_manager: Any = None,
+        teams_root: str | Path | None = None,
+    ) -> None:
         self._worktree_manager = worktree_manager
         self._trace_manager = trace_manager
+        # 产品入口始终传入启动项目的团队根；默认值仅保留给直接使用旧 API 的调用方。
+        default_root = Path.home() / ".seacode" / "teams"
+        self._teams_root = Path(teams_root or default_root).resolve()
         self._teams: dict[str, AgentTeam] = {}
         self._task_stores: dict[str, SharedTaskStore] = {}
         self._mailboxes: dict[str, Mailbox] = {}
@@ -43,6 +52,30 @@ class TeamManager:
         self._pane_ids: dict[str, str] = {}
         self._teammate_team_map: dict[str, str] = {}
         self._detected_backend: BackendType | None = None
+
+    @property
+    def teams_root(self) -> Path:
+        """返回此 TeamManager 固定使用的团队状态根。"""
+        return self._teams_root
+
+    def _team_dir(self, name: str) -> Path:
+        # 所有团队持久化路径都从构造时固定的根解析，不能由当前 cwd 推导。
+        return resolve_team_dir(name, self._teams_root)
+
+    def _load_persisted_teams(self) -> None:
+        # 发现当前项目根中已存在的团队，供重启后的 Lead 路由和 list_teams 使用。
+        try:
+            config_paths = self._teams_root.glob("*/config.json")
+        except OSError as e:
+            log.warning("failed to scan team root %s: %s", self._teams_root, e)
+            return
+        for config_path in config_paths:
+            team = AgentTeam.load(config_path)
+            if team is None:
+                continue
+            self._teams.setdefault(team.name, team)
+            for member in team.members:
+                self._teammate_team_map.setdefault(member.agent_id, team.name)
 
     # 检测 spawn 后端；首次调用后缓存，避免重复 env / 平台检测。
     def detect_backend(self, teammate_mode: str, is_interactive: bool) -> BackendType:
@@ -61,19 +94,26 @@ class TeamManager:
     ) -> AgentTeam:
         # 触发后端检测以缓存结果（即便本团队用 in-process，后续 spawn 也需统一后端）。
         self.detect_backend(teammate_mode, is_interactive)
-        unique = unique_team_name(name)
-        team_dir = resolve_team_dir(unique)
-        team_dir.mkdir(parents=True, exist_ok=True)
+        unique = unique_team_name(name, self._teams_root)
+        team_dir = self._team_dir(unique)
+        try:
+            team_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise TeamError(f"无法创建项目团队目录 {team_dir}: {e}") from e
         team = AgentTeam(
             name=unique,
             lead_agent_id=lead_agent_id,
             config_path=str(team_dir / "config.json"),
             description=description,
         )
-        team.save()
-        task_store = SharedTaskStore(team_dir / "tasks.json")
-        task_store.init_empty()
-        mailbox = Mailbox(team_dir / "mailbox")
+        try:
+            team.save()
+            task_store = SharedTaskStore(team_dir / "tasks.json")
+            task_store.init_empty()
+            mailbox = Mailbox(team_dir / "mailbox")
+        except OSError as e:
+            self._remove_dir(str(team_dir))
+            raise TeamError(f"无法初始化团队 {unique}: {e}") from e
         self._teams[unique] = team
         self._task_stores[unique] = task_store
         self._mailboxes[unique] = mailbox
@@ -83,7 +123,7 @@ class TeamManager:
     def get_team(self, name: str) -> AgentTeam | None:
         if name in self._teams:
             return self._teams[name]
-        team_dir = resolve_team_dir(name)
+        team_dir = self._team_dir(name)
         team = AgentTeam.load(team_dir / "config.json")
         if team is not None:
             self._teams[name] = team
@@ -93,7 +133,7 @@ class TeamManager:
     def get_task_store(self, name: str) -> SharedTaskStore:
         if name in self._task_stores:
             return self._task_stores[name]
-        team_dir = resolve_team_dir(name)
+        team_dir = self._team_dir(name)
         store = SharedTaskStore(team_dir / "tasks.json")
         self._task_stores[name] = store
         return store
@@ -102,7 +142,7 @@ class TeamManager:
     def get_mailbox(self, name: str) -> Mailbox:
         if name in self._mailboxes:
             return self._mailboxes[name]
-        team_dir = resolve_team_dir(name)
+        team_dir = self._team_dir(name)
         mailbox = Mailbox(team_dir / "mailbox")
         self._mailboxes[name] = mailbox
         return mailbox
@@ -119,6 +159,27 @@ class TeamManager:
             member.progress = handle.progress
         team.save()
         self._teammate_team_map[member.agent_id] = team_name
+
+    # 回滚一个尚未稳定运行的成员；只清理该成员自己的运行时索引、持久化记录和 worktree。
+    def rollback_member(self, team_name: str, member: TeammateInfo) -> None:
+        handle = self._inprocess_handles.pop(member.agent_id, None)
+        if handle is not None:
+            try:
+                handle.cancel()
+            except Exception as e:
+                log.warning("cancel rollback handle %s failed: %s", member.name, e)
+        self._pane_ids.pop(member.agent_id, None)
+        if self._teammate_team_map.get(member.agent_id) == team_name:
+            self._teammate_team_map.pop(member.agent_id, None)
+        team = self.get_team(team_name)
+        if team is not None:
+            team.remove_member(member.name)
+            try:
+                team.save()
+            except OSError as e:
+                log.warning("rollback member %s persistence failed: %s", member.name, e)
+        if member.worktree_path:
+            self._cleanup_worktree(member.worktree_path)
 
     # 标记成员 idle 并向该团队保存的 Lead 邮箱写 idle 通知。
     def set_member_idle(self, team_name: str, member_name: str, reason: str) -> None:
@@ -138,6 +199,14 @@ class TeamManager:
                 summary="idle",
             ),
         )
+
+    # 标记成员进入新一轮工作；续写前持久化 active，避免 TUI 在执行期间仍显示 idle。
+    def set_member_active(self, team_name: str, member_name: str) -> None:
+        team = self.get_team(team_name)
+        if team is None:
+            return
+        team.set_member_active(member_name, True)
+        team.save()
 
     # 注册 in-process handle；按 agent_id 索引，便于跨模块按身份唤醒或附加 progress。
     def register_inprocess_handle(
@@ -206,7 +275,7 @@ class TeamManager:
         mailbox.cleanup_all()
 
         # 第 6 步：删除团队目录。
-        team_dir = resolve_team_dir(name)
+        team_dir = self._team_dir(name)
         self._remove_dir(str(team_dir))
 
         # 清理内存缓存。
@@ -216,12 +285,26 @@ class TeamManager:
         for m in team.members:
             self._teammate_team_map.pop(m.agent_id, None)
 
-    # 返回当前内存中所有团队名。
+    # 返回当前项目根中的所有团队名，包含本进程尚未触碰的已持久化团队。
     def list_teams(self) -> list[str]:
+        self._load_persisted_teams()
         return list(self._teams.keys())
+
+    # 返回由指定 Lead 拥有的团队；多团队 SendMessage 路由以此决定是否存在歧义。
+    def get_teams_for_lead(self, lead_agent_id: str) -> list[AgentTeam]:
+        self._load_persisted_teams()
+        return [
+            team
+            for team in self._teams.values()
+            if team.lead_agent_id == lead_agent_id
+        ]
 
     # 按 agent_id 反查所属团队名；用于跨模块按身份定位 team。
     def get_team_for_teammate(self, agent_id: str) -> str | None:
+        team_name = self._teammate_team_map.get(agent_id)
+        if team_name is not None:
+            return team_name
+        self._load_persisted_teams()
         return self._teammate_team_map.get(agent_id)
 
     # 消费每个团队保存的 Lead 邮箱，拼成 <team-notification> XML 列表。
@@ -264,16 +347,64 @@ class TeamManager:
         except Exception as e:
             log.warning("failed to kill pane %s: %s", pane_id, e)
 
-    # 清理 worktree：先 git worktree remove，失败回退 shutil.rmtree。
+    # 清理 worktree：移除自动生成的 worktree 分支，失败时回退删除目录。
     def _cleanup_worktree(self, worktree_path: str) -> None:
+        branch = ""
+        git_common_dir = ""
         try:
-            subprocess.run(
-                ["git", "worktree", "remove", worktree_path, "--force"],
+            branch_result = subprocess.run(
+                ["git", "-C", worktree_path, "branch", "--show-current"],
                 capture_output=True,
+                text=True,
                 timeout=10,
             )
+            if branch_result.returncode == 0:
+                branch = branch_result.stdout.strip()
+            common_dir_result = subprocess.run(
+                ["git", "-C", worktree_path, "rev-parse", "--git-common-dir"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if common_dir_result.returncode == 0:
+                git_common_dir = common_dir_result.stdout.strip()
+                if git_common_dir and not Path(git_common_dir).is_absolute():
+                    git_common_dir = str(
+                        (Path(worktree_path) / git_common_dir).resolve()
+                    )
+            remove_result = subprocess.run(
+                ["git", "worktree", "remove", worktree_path, "--force"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if remove_result.returncode != 0:
+                log.warning(
+                    "git worktree remove failed for %s: %s",
+                    worktree_path,
+                    remove_result.stderr.strip(),
+                )
+            elif branch.startswith("worktree-") and git_common_dir:
+                delete_result = subprocess.run(
+                    [
+                        "git",
+                        f"--git-dir={git_common_dir}",
+                        "branch",
+                        "-D",
+                        branch,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if delete_result.returncode != 0:
+                    log.warning(
+                        "git branch delete failed for %s: %s",
+                        branch,
+                        delete_result.stderr.strip(),
+                    )
         except (subprocess.SubprocessError, OSError) as e:
-            log.warning("git worktree remove failed: %s", e)
+            log.warning("git worktree cleanup failed for %s: %s", worktree_path, e)
         try:
             shutil.rmtree(worktree_path, ignore_errors=True)
         except OSError as e:

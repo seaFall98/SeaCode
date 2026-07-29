@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,60 +14,73 @@ from seacode.__main__ import _parse_teammate_flags, _run_teammate
 # ---------------------------------------------------------------------------
 
 
-# 验证 _parse_teammate_flags 无任何标志时返回 (False, "", "")。
-# 传入空 argv，断言三个字段都为默认值。
+# 验证 _parse_teammate_flags 无任何标志时返回四个默认字段。
+# 传入空 argv，断言 teammate、团队、成员和团队根都为空。
 def test_parse_teammate_flags_no_flags() -> None:
-    is_teammate, team_name, agent_name = _parse_teammate_flags([])
+    is_teammate, team_name, agent_name, teams_root = _parse_teammate_flags([])
     assert is_teammate is False
     assert team_name == ""
     assert agent_name == ""
+    assert teams_root == ""
 
 
-# 验证 _parse_teammate_flags 仅 --teammate 时返回 (True, "", "")。
-# 缺 --team-name / --agent-name 时对应字段为空。
+# 验证 _parse_teammate_flags 仅 --teammate 时返回空团队、成员和团队根。
+# 缺 --team-name / --agent-name / --teams-root 时对应字段为空。
 def test_parse_teammate_flags_only_teammate() -> None:
-    is_teammate, team_name, agent_name = _parse_teammate_flags(["--teammate"])
+    is_teammate, team_name, agent_name, teams_root = _parse_teammate_flags(["--teammate"])
     assert is_teammate is True
     assert team_name == ""
     assert agent_name == ""
+    assert teams_root == ""
 
 
-# 验证 _parse_teammate_flags 完整三标志时返回 (True, team, agent)。
+# 验证 _parse_teammate_flags 完整四标志时返回 team、agent 和 Lead 团队根。
+# 传入 --teams-root，断言其与其它 teammate 字段一起被解析。
 def test_parse_teammate_flags_full() -> None:
-    argv = ["--teammate", "--team-name", "demo", "--agent-name", "alice"]
-    is_teammate, team_name, agent_name = _parse_teammate_flags(argv)
+    argv = [
+        "--teammate", "--team-name", "demo", "--agent-name", "alice",
+        "--teams-root", "C:/project/.seacode/teams",
+    ]
+    is_teammate, team_name, agent_name, teams_root = _parse_teammate_flags(argv)
     assert is_teammate is True
     assert team_name == "demo"
     assert agent_name == "alice"
+    assert teams_root == "C:/project/.seacode/teams"
 
 
 # 验证 _parse_teammate_flags 在 --team-name 为最后一个参数时不越界。
 # --team-name 后无值，team_name 保持空。
 def test_parse_teammate_flags_team_name_no_value() -> None:
     argv = ["--teammate", "--team-name"]
-    is_teammate, team_name, agent_name = _parse_teammate_flags(argv)
+    is_teammate, team_name, agent_name, teams_root = _parse_teammate_flags(argv)
     assert is_teammate is True
     assert team_name == ""
     assert agent_name == ""
+    assert teams_root == ""
 
 
 # 验证 _parse_teammate_flags 在 --agent-name 为最后一个参数时不越界。
 def test_parse_teammate_flags_agent_name_no_value() -> None:
     argv = ["--teammate", "--agent-name"]
-    is_teammate, team_name, agent_name = _parse_teammate_flags(argv)
+    is_teammate, team_name, agent_name, teams_root = _parse_teammate_flags(argv)
     assert is_teammate is True
     assert team_name == ""
     assert agent_name == ""
+    assert teams_root == ""
 
 
 # 验证 _parse_teammate_flags 不受其它参数影响。
 # 混入 sea / --foo 等参数，--teammate 相关字段仍正确解析。
 def test_parse_teammate_flags_ignores_other_args() -> None:
-    argv = ["sea", "--foo", "bar", "--teammate", "--team-name", "t1", "--agent-name", "a1"]
-    is_teammate, team_name, agent_name = _parse_teammate_flags(argv)
+    argv = [
+        "sea", "--foo", "bar", "--teammate", "--team-name", "t1",
+        "--agent-name", "a1", "--teams-root", "C:/project/.seacode/teams",
+    ]
+    is_teammate, team_name, agent_name, teams_root = _parse_teammate_flags(argv)
     assert is_teammate is True
     assert team_name == "t1"
     assert agent_name == "a1"
+    assert teams_root == "C:/project/.seacode/teams"
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +152,7 @@ async def test_run_teammate_create_client_failure_returns_early(
 # mock TeamManager.get_team 返回 None，断言 Agent 未构造、spawn 未调用。
 @pytest.mark.asyncio
 async def test_run_teammate_team_not_found_returns_early(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_config = MagicMock()
     fake_provider = MagicMock()
@@ -158,10 +172,33 @@ async def test_run_teammate_team_not_found_returns_early(
 
     with patch("seacode.agent.Agent") as mock_agent_cls, \
          patch("seacode.teams.spawn_inprocess.spawn_inprocess_teammate") as mock_spawn:
-        await _run_teammate("missing", "alice")
+        await _run_teammate(
+            "missing", "alice", str(tmp_path / ".seacode" / "teams")
+        )
 
     mock_agent_cls.assert_not_called()
     mock_spawn.assert_not_called()
+
+
+# 验证 worker 缺少显式团队根时停止，不会从 worktree 当前目录构造 TeamManager。
+# 配置与 client 均有效但不传 teams_root，断言 TeamManager 和 Agent 都不被创建。
+@pytest.mark.asyncio
+async def test_run_teammate_requires_explicit_teams_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_config = MagicMock()
+    fake_provider = MagicMock()
+    fake_provider.protocol = "anthropic"
+    fake_config.providers = (fake_provider,)
+    monkeypatch.setattr("seacode.__main__.load_config", lambda: fake_config)
+    monkeypatch.setattr("seacode.client.create_client", lambda p: MagicMock())
+
+    with patch("seacode.teams.manager.TeamManager") as mock_tm_cls, \
+         patch("seacode.agent.Agent") as mock_agent_cls:
+        await _run_teammate("demo", "alice")
+
+    mock_tm_cls.assert_not_called()
+    mock_agent_cls.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

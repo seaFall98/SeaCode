@@ -319,7 +319,8 @@ class AgentTool(Tool):
         if not is_background:
             try:
                 result_text = await sub_agent.run_to_completion(
-                    params.prompt, conversation=fork_conversation
+                    "" if is_fork else params.prompt,
+                    conversation=fork_conversation,
                 )
             except Exception as e:
                 log.error("子 Agent 执行失败: %s", e)
@@ -519,6 +520,12 @@ class AgentTool(Tool):
             return ToolResult(content="team_manager 未初始化", is_error=True)
         if self.worktree_manager is None:
             return ToolResult(content="worktree manager 未初始化", is_error=True)
+        # 团队必须在创建 worktree 和 mailbox 前存在，避免无效请求遗留隔离资源。
+        team = self.team_manager.get_team(team_name)
+        if team is None:
+            return ToolResult(
+                content=f"团队不存在: {team_name}", is_error=True
+            )
 
         # 第 1 步：加载 AgentDef；无 subagent_type 时构造默认 teammate 定义。
         if params.subagent_type:
@@ -608,69 +615,9 @@ class AgentTool(Tool):
         teammate_agent._current_definition = teammate_def
 
         mailbox = self.team_manager.get_mailbox(team_name)
-        team = self.team_manager.get_team(team_name)
-        if team is None:
-            return ToolResult(
-                content=f"团队不存在: {team_name}", is_error=True
-            )
 
-        if backend == BackendType.IN_PROCESS:
-            handle = spawn_inprocess_teammate(
-                teammate_agent,
-                params.prompt,
-                teammate_name,
-                self.team_manager,
-                mailbox=mailbox,
-                lead_agent_id=team.lead_agent_id,
-            )
-            self.team_manager.register_inprocess_handle(
-                teammate_agent_id, handle
-            )
-        elif backend in (BackendType.TMUX, BackendType.ITERM2):
-            # pane 后端：spawn 前先把初始任务投进队友邮箱，
-            # 新进程启动后第一次空闲轮询就能看到工作。
-            if mailbox is not None and params.prompt:
-                from seacode.teams.mailbox import create_message
-                from seacode.teams.spawn_inprocess import LEAD_NAME
-
-                mailbox.write(
-                    teammate_name,
-                    create_message(
-                        from_agent=LEAD_NAME,
-                        to_agent=teammate_name,
-                        content=params.prompt,
-                        summary="initial task",
-                    ),
-                )
-            try:
-                if backend == BackendType.TMUX:
-                    tmux_pane = spawn_tmux_teammate(
-                        team_name, teammate_name, wt.path
-                    )
-                    self.team_manager.register_pane_id(
-                        teammate_agent_id, tmux_pane.pane_id
-                    )
-                else:  # BackendType.ITERM2
-                    iterm_pane = spawn_iterm2_teammate(
-                        team_name, teammate_name, wt.path
-                    )
-                    self.team_manager.register_pane_id(
-                        teammate_agent_id, iterm_pane.session_id
-                    )
-            except Exception as e:
-                log.warning("pane spawn 失败: %s", e)
-                return ToolResult(
-                    content=(
-                        f"pane spawn 失败 ({e})，teammate 未启动。"
-                        "可重试或将 teammate_mode 设为 in-process。"
-                    ),
-                    is_error=True,
-                )
-
-        # 第 6 步：注册名字到 AgentNameRegistry 并持久化成员到团队 config。
-        AgentNameRegistry.instance().register(
-            teammate_name, teammate_agent.agent_id
-        )
+        # 第 6 步：先持久化成员与 agent_id→team 映射，再启动 worker。
+        # in-process task 一旦完成就会回调 TeamManager，映射必须在 create_task 前存在。
         configured_model = getattr(self.provider_config, "model", None)
         persisted_model = selected_model or (
             configured_model.strip()
@@ -684,9 +631,83 @@ class AgentTool(Tool):
             model=persisted_model,
             worktree_path=wt.path,
             backend_type=backend,
-            is_active=None,
+            is_active=True,
         )
-        self.team_manager.register_member(team_name, member)
+        registry_inst = AgentNameRegistry.instance()
+        try:
+            registry_inst.register(teammate_name, teammate_agent.agent_id)
+            self.team_manager.register_member(team_name, member)
+        except Exception as e:
+            registry_inst.unregister(teammate_name)
+            rollback_member = getattr(self.team_manager, "rollback_member", None)
+            if callable(rollback_member):
+                rollback_member(team_name, member)
+            return ToolResult(
+                content=f"注册 teammate 失败: {e}", is_error=True
+            )
+
+        try:
+            if backend == BackendType.IN_PROCESS:
+                handle = spawn_inprocess_teammate(
+                    teammate_agent,
+                    params.prompt,
+                    teammate_name,
+                    self.team_manager,
+                    mailbox=mailbox,
+                    lead_agent_id=team.lead_agent_id,
+                )
+                self.team_manager.register_inprocess_handle(
+                    teammate_agent_id, handle
+                )
+            elif backend in (BackendType.TMUX, BackendType.ITERM2):
+                # pane 后端：spawn 前先把初始任务投进队友邮箱，
+                # 新进程启动后第一次空闲轮询就能看到工作。
+                if mailbox is not None and params.prompt:
+                    from seacode.teams.mailbox import create_message
+                    from seacode.teams.spawn_inprocess import LEAD_NAME
+
+                    mailbox.write(
+                        teammate_name,
+                        create_message(
+                            from_agent=LEAD_NAME,
+                            to_agent=teammate_name,
+                            content=params.prompt,
+                            summary="initial task",
+                        ),
+                    )
+                if backend == BackendType.TMUX:
+                    tmux_pane = spawn_tmux_teammate(
+                        team_name,
+                        teammate_name,
+                        wt.path,
+                        str(self.team_manager.teams_root),
+                    )
+                    self.team_manager.register_pane_id(
+                        teammate_agent_id, tmux_pane.pane_id
+                    )
+                else:  # BackendType.ITERM2
+                    iterm_pane = spawn_iterm2_teammate(
+                        team_name,
+                        teammate_name,
+                        wt.path,
+                        str(self.team_manager.teams_root),
+                    )
+                    self.team_manager.register_pane_id(
+                        teammate_agent_id, iterm_pane.session_id
+                    )
+        except Exception as e:
+            log.warning("teammate spawn 失败: %s", e)
+            registry_inst.unregister(teammate_name)
+            rollback_member = getattr(self.team_manager, "rollback_member", None)
+            if callable(rollback_member):
+                rollback_member(team_name, member)
+            return ToolResult(
+                content=(
+                    f"teammate 启动失败 ({e})，已回滚成员状态。"
+                    "可重试或检查后端配置。"
+                ),
+                is_error=True,
+            )
 
         return ToolResult(
             content=(
