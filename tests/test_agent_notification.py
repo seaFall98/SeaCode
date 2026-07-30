@@ -101,6 +101,15 @@ def test_format_task_notification_contains_tokens() -> None:
     assert "↓50" in notification
 
 
+# 验证取消任务的通知明确禁止主 Agent 自动重试。
+# 构造 cancelled task，断言通知包含用户取消事实与禁止重新发起的动作约束。
+def test_format_task_notification_cancelled_instructs_no_retry() -> None:
+    task = _make_task(status="cancelled")
+    notification = format_task_notification(task)
+    assert "cancelled by the user" in notification
+    assert "Do not retry" in notification
+
+
 # 验证 format_task_notification end_time 为 None 时使用当前时间。
 # 构造 end_time=None 的 task，断言不抛异常且输出含 Elapsed。
 def test_format_task_notification_with_null_end_time() -> None:

@@ -21,6 +21,10 @@ from seacode.teammate_tree import TeammateTree
 from seacode.teams.manager import TeamManager
 from seacode.teams.progress import TeammateProgress
 from seacode.tools.send_message import SendMessageTool
+from seacode.tools.task_create import TaskCreateTool
+from seacode.tools.task_get import TaskGetTool
+from seacode.tools.task_list import TaskListTool
+from seacode.tools.task_update import TaskUpdateTool
 from seacode.tools.team_create import TeamCreateTool
 from seacode.tools.team_delete import TeamDeleteTool
 
@@ -123,8 +127,8 @@ async def test_teammate_tree_mounted_on_app_start() -> None:
         assert isinstance(app.teammate_tree, TeammateTree)
 
 
-# 验证 TeamCreate / TeamDelete / SendMessage 工具注册到 Lead 工具集。
-# _assemble_teams_system 注册三个团队工具，registry.get 应能按名查到。
+# 验证团队生命周期、消息和任务板工具注册到 Lead 工具集。
+# _assemble_teams_system 注册全部 Lead 协调工具，registry.get 应能按名查到。
 @pytest.mark.asyncio
 async def test_team_tools_registered_in_registry() -> None:
     client = _FakeClient([[StreamComplete()]])
@@ -136,6 +140,10 @@ async def test_team_tools_registered_in_registry() -> None:
         assert registry.get("TeamCreate") is not None
         assert registry.get("TeamDelete") is not None
         assert registry.get("SendMessage") is not None
+        assert registry.get("TaskCreate") is not None
+        assert registry.get("TaskGet") is not None
+        assert registry.get("TaskList") is not None
+        assert registry.get("TaskUpdate") is not None
 
 
 # 验证周期刷新 task 启动。
@@ -196,8 +204,8 @@ async def test_run_turn_injects_team_manager_and_notification_fn() -> None:
         assert isinstance(notes, list)
 
 
-# 验证 TeamCreate / TeamDelete / SendMessage 的 Lead 上下文在 _run_turn 中刷新。
-# 发送消息触发 _run_turn 后，三个团队工具都应持有当前回合 Agent。
+# 验证团队工具的 Lead 上下文在 _run_turn 中刷新。
+# 发送消息触发 _run_turn 后，团队工具都应持有当前回合 Agent。
 @pytest.mark.asyncio
 async def test_run_turn_updates_team_tools_parent_agent() -> None:
     client = _FakeClient(
@@ -218,17 +226,33 @@ async def test_run_turn_updates_team_tools_parent_agent() -> None:
         team_create = app._tool_registry.get("TeamCreate")
         team_delete = app._tool_registry.get("TeamDelete")
         send_message = app._tool_registry.get("SendMessage")
+        task_create = app._tool_registry.get("TaskCreate")
+        task_get = app._tool_registry.get("TaskGet")
+        task_list = app._tool_registry.get("TaskList")
+        task_update = app._tool_registry.get("TaskUpdate")
         assert team_create is not None
         assert team_delete is not None
         assert send_message is not None
+        assert task_create is not None
+        assert task_get is not None
+        assert task_list is not None
+        assert task_update is not None
         assert isinstance(team_create, TeamCreateTool)
         assert isinstance(team_delete, TeamDeleteTool)
         assert isinstance(send_message, SendMessageTool)
+        assert isinstance(task_create, TaskCreateTool)
+        assert isinstance(task_get, TaskGetTool)
+        assert isinstance(task_list, TaskListTool)
+        assert isinstance(task_update, TaskUpdateTool)
         assert team_create._parent_agent is agent
         assert team_delete._parent_agent is agent
         # SendMessage 占位实例不再依赖空 from_agent_id，而是在 execute 时读取当前 Lead。
         assert send_message._from_agent_id == ""
         assert send_message._parent_agent is agent
+        assert task_create._parent_agent is agent
+        assert task_get._parent_agent is agent
+        assert task_list._parent_agent is agent
+        assert task_update._parent_agent is agent
 
 
 # ---------------------------------------------------------------------------

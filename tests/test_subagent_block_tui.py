@@ -563,3 +563,38 @@ async def test_app_process_notifications_injects_notification() -> None:
             if "<task-notification>" in m.content
         ]
         assert len(notification_msgs) >= 1
+
+
+# 验证取消后台任务只注入通知，不重新启动主 Agent Loop。
+# 构造 cancelled task，调用轮询处理后断言对话收到通知且没有新的 streaming 回合。
+async def test_app_process_cancelled_notification_does_not_restart_loop() -> None:
+    from seacode.agents.task_manager import BackgroundTask
+
+    client = _FakeClient()
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    async with app.run_test() as pilot:
+        await _settle(pilot)
+        assert app.task_manager is not None
+        bg = BackgroundTask(
+            id="cancelled1",
+            name="Explore",
+            agent=None,
+            task="test",
+            status="cancelled",
+            result="",
+        )
+        app.task_manager._tasks[bg.id] = bg
+        app.task_manager._notify_queue.put_nowait(bg.id)
+
+        await app._process_task_notifications()
+        await _settle(pilot)
+
+        assert app._streaming is False
+        assert app._agent_task is None
+        notification_msgs = [
+            m
+            for m in app._conversation.messages
+            if "<task-notification>" in m.content
+        ]
+        assert len(notification_msgs) >= 1
+        assert "Do not retry" in notification_msgs[-1].content

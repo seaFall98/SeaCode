@@ -3,7 +3,7 @@
 后台任务通过 ``asyncio.create_task`` 执行 ``run_to_completion``，完成后入
 ``_notify_queue: asyncio.Queue[str]``；``app.py`` 每 2 秒轮询一次，调用
 ``inject_task_notifications`` 把 ``<task-notification>`` XML 块以 user message
-形式注入主对话，并触发新一轮 LLM 调用。
+形式注入主对话；完成/失败会触发新一轮 LLM 调用，取消-only 通知不会重启回合。
 
 状态机：``running → completed``（正常完成）/ ``failed``（捕获 Exception）/
 ``cancelled``（捕获 CancelledError）。``_notify_queue.put`` 在 finally 中执行，
