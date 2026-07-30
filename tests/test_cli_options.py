@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from seacode import __version__
 from seacode.__main__ import _run_prompt, main
 from seacode.agent import LoopComplete
 from seacode.client import LLMClient, StreamComplete, StreamEvent, TextDelta
@@ -374,6 +375,19 @@ def test_main_rejects_invalid_permission_mode(
 
     with pytest.raises(SystemExit, match="2"):
         main()
+
+
+# 验证 --version 输出当前包版本并在解析阶段退出。
+# 使用真实 argparse 入口，断言不加载配置、不启动 TUI 且 stdout 含 sea 与版本号。
+def test_main_prints_version(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["sea", "--version"])
+
+    with pytest.raises(SystemExit, match="0"):
+        main()
+
+    assert capsys.readouterr().out.strip() == f"sea {__version__}"
 
 
 # 验证 --remote 在非交互入口启动浏览器服务而不是终端 TUI。

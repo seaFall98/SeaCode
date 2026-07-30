@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
-from seacode.tools.base import Tool, ToolCategory, ToolResult
+from seacode.tools.base import Tool, ToolCategory, ToolResult, resolve_tool_path
 
 if TYPE_CHECKING:
     from seacode.tools.file_state_cache import FileStateCache
@@ -42,12 +42,14 @@ class WriteFile(Tool):
         self.file_history = file_history
         self._state_cache = file_state_cache
 
-    async def execute(self, params: Params) -> ToolResult:  # type: ignore[override]
+    async def execute(  # type: ignore[override]
+        self, params: Params, *, work_dir: str | Path | None = None
+    ) -> ToolResult:
+        path = resolve_tool_path(params.file_path, work_dir)
         # 第 13 步 worktree changes 会填充 file_history；本步不消费。
         if self.file_history is not None:
-            self.file_history.track_edit(params.file_path)
-
-        path = Path(params.file_path)
+            track_path = path if work_dir is not None else params.file_path
+            self.file_history.track_edit(track_path)
 
         # 已存在文件必须先被读过且未被外部修改。
         if self._state_cache and path.exists():

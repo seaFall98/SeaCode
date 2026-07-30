@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -15,6 +16,16 @@ SKIP_DIRS: frozenset[str] = frozenset(
 
 # 工具输出截断阈值常量；本步不消费，保留供后续上下文治理步骤使用。
 MAX_OUTPUT_CHARS: int = 10000
+
+
+def resolve_tool_path(
+    raw_path: str, work_dir: str | Path | None = None
+) -> Path:
+    """按工具调用的工作目录解析相对路径，保留绝对路径语义。"""
+    path = Path(raw_path)
+    if work_dir is not None and not path.is_absolute():
+        return Path(work_dir) / path
+    return path
 
 
 class ToolCategory(StrEnum):

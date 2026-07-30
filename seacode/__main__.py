@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
+from . import __version__
 from .config import ConfigError, ProviderConfig, load_config
 from .hooks import HookConfigError, HookEngine, load_hooks
 
@@ -487,6 +488,12 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="sea", description="SeaCode AI coding assistant"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show the SeaCode version and exit",
     )
     parser.add_argument(
         "--mode",

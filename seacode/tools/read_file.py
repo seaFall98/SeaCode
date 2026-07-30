@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from seacode.tools.base import Tool, ToolCategory, ToolResult
+from seacode.tools.base import Tool, ToolCategory, ToolResult, resolve_tool_path
 
 if TYPE_CHECKING:
     from seacode.tools.file_state_cache import FileStateCache
@@ -34,8 +34,10 @@ class ReadFile(Tool):
     def __init__(self, file_state_cache: FileStateCache | None = None) -> None:
         self._state_cache = file_state_cache
 
-    async def execute(self, params: Params) -> ToolResult:  # type: ignore[override]
-        path = Path(params.file_path)
+    async def execute(  # type: ignore[override]
+        self, params: Params, *, work_dir: str | Path | None = None
+    ) -> ToolResult:
+        path = resolve_tool_path(params.file_path, work_dir)
         if not path.exists():
             return ToolResult(content=f"Error: file not found: {params.file_path}", is_error=True)
         if not path.is_file():
