@@ -37,13 +37,13 @@ class _DeferredTool(Tool):
 def _registry_with_deferred() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
-        _DeferredTool("mcp_fs_read", "Read a file from the filesystem server")
+        _DeferredTool("mcp__fs__read", "Read a file from the filesystem server")
     )
     registry.register(
-        _DeferredTool("mcp_fs_write", "Write a file to the filesystem server")
+        _DeferredTool("mcp__fs__write", "Write a file to the filesystem server")
     )
     registry.register(
-        _DeferredTool("mcp_git_commit", "Create a git commit via the git server")
+        _DeferredTool("mcp__git__commit", "Create a git commit via the git server")
     )
     # 非延迟工具应永远可见且不进入 ToolSearch 结果。
     registry.register(_DeferredTool("ReadFile", "Built-in read", defer=False))
@@ -74,17 +74,17 @@ async def test_select_prefix_loads_named_deferred_tools() -> None:
     tool = ToolSearchTool(registry=registry, protocol="anthropic")
 
     result = await tool.execute(
-        ToolSearchParams(query="select:mcp_fs_read,mcp_git_commit")
+        ToolSearchParams(query="select:mcp__fs__read,mcp__git__commit")
     )
 
     assert "Found 2 tool(s)" in result.content
     assert not result.is_error
     # 标记为已发现后应出现在 get_all_schemas 中。
     schemas = {s["name"] for s in registry.get_all_schemas("anthropic")}
-    assert "mcp_fs_read" in schemas
-    assert "mcp_git_commit" in schemas
+    assert "mcp__fs__read" in schemas
+    assert "mcp__git__commit" in schemas
     # 未 select 的延迟工具仍未发现。
-    assert "mcp_fs_write" not in schemas
+    assert "mcp__fs__write" not in schemas
 
 
 # 验证 select: 前缀忽略未注册名与非延迟工具名，只返回合法命中。
@@ -95,11 +95,11 @@ async def test_select_prefix_ignores_unknown_and_non_deferred_names() -> None:
 
     # 包含未知名、非延迟工具名与一个合法延迟工具名。
     result = await tool.execute(
-        ToolSearchParams(query="select:NonExistent,ReadFile,mcp_fs_read")
+        ToolSearchParams(query="select:NonExistent,ReadFile,mcp__fs__read")
     )
 
     assert "Found 1 tool(s)" in result.content
-    assert registry.is_discovered("mcp_fs_read")
+    assert registry.is_discovered("mcp__fs__read")
 
 
 # 验证关键词搜索按评分排序返回，名称整串匹配得分最高。
@@ -108,15 +108,15 @@ async def test_keyword_search_ranks_by_score() -> None:
     registry = _registry_with_deferred()
     tool = ToolSearchTool(registry=registry, protocol="anthropic")
 
-    # "mcp_fs" 同时出现在两个工具名中，应都命中。
-    result = await tool.execute(ToolSearchParams(query="mcp_fs", max_results=5))
+    # "mcp__fs__" 同时出现在两个工具名中，应都命中。
+    result = await tool.execute(ToolSearchParams(query="mcp__fs__", max_results=5))
 
     payload = json.loads(result.content.split("\n\n", 1)[1])
     names = [s["name"] for s in payload]
-    assert "mcp_fs_read" in names
-    assert "mcp_fs_write" in names
+    assert "mcp__fs__read" in names
+    assert "mcp__fs__write" in names
     # git 相关工具不应出现在 fs 搜索结果中。
-    assert "mcp_git_commit" not in names
+    assert "mcp__git__commit" not in names
 
 
 # 验证关键词搜索遵守 max_results 上限。
@@ -140,9 +140,9 @@ async def test_no_match_returns_available_deferred_names() -> None:
     result = await tool.execute(ToolSearchParams(query="nonexistent_query"))
 
     assert "No matching deferred tools" in result.content
-    assert "mcp_fs_read" in result.content
-    assert "mcp_fs_write" in result.content
-    assert "mcp_git_commit" in result.content
+    assert "mcp__fs__read" in result.content
+    assert "mcp__fs__write" in result.content
+    assert "mcp__git__commit" in result.content
     # 非延迟工具不应出现在可用列表中。
     assert "ReadFile" not in result.content
 
@@ -153,9 +153,9 @@ async def test_mark_discovered_removes_from_deferred_list() -> None:
     registry = _registry_with_deferred()
     tool = ToolSearchTool(registry=registry, protocol="anthropic")
 
-    assert "mcp_fs_read" in registry.get_deferred_tool_names()
-    await tool.execute(ToolSearchParams(query="select:mcp_fs_read"))
-    assert "mcp_fs_read" not in registry.get_deferred_tool_names()
+    assert "mcp__fs__read" in registry.get_deferred_tool_names()
+    await tool.execute(ToolSearchParams(query="select:mcp__fs__read"))
+    assert "mcp__fs__read" not in registry.get_deferred_tool_names()
 
 
 # 验证 OpenAI 协议下 ToolSearch 返回的 Schema 用 parameters 键而非 input_schema。
@@ -164,7 +164,7 @@ async def test_select_returns_openai_schema_format() -> None:
     registry = _registry_with_deferred()
     tool = ToolSearchTool(registry=registry, protocol="openai")
 
-    result = await tool.execute(ToolSearchParams(query="select:mcp_fs_read"))
+    result = await tool.execute(ToolSearchParams(query="select:mcp__fs__read"))
 
     payload = json.loads(result.content.split("\n\n", 1)[1])
     assert payload[0]["type"] == "function"

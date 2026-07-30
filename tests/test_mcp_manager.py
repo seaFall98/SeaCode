@@ -231,8 +231,8 @@ async def test_register_all_tools_registers_to_registry() -> None:
         result = await manager.register_all_tools(registry)
 
     assert len(result.tools) == 2
-    assert registry.get("mcp_fs_read") is not None
-    assert registry.get("mcp_fs_write") is not None
+    assert registry.get("mcp__fs__read") is not None
+    assert registry.get("mcp__fs__write") is not None
     servers = manager.list_servers()
     assert [(s.name, s.tool_count, s.status) for s in servers] == [
         ("fs", 2, "connected")
@@ -275,7 +275,7 @@ async def test_register_all_tools_reuses_initialized_result() -> None:
     assert first is second
     assert manager.is_initialized is True
     assert mock_client_cls.call_count == 1
-    assert registry.get("mcp_fs_read") is not None
+    assert registry.get("mcp__fs__read") is not None
 
 
 # ---------------------------------------------------------------------------
