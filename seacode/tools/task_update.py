@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
 from seacode.teams.shared_task import TaskStoreError
 from seacode.tools.base import Tool, ToolCategory, ToolResult
+from seacode.tools.task_context import resolve_task_context
 
 if TYPE_CHECKING:
     from seacode.teams.manager import TeamManager
@@ -25,23 +26,32 @@ class TaskUpdateParams(BaseModel):
     description: str | None = None
     add_blocks: list[str] | None = None
     add_blocked_by: list[str] | None = None
+    # Lead 多团队时显式选择目标任务板。
+    team_name: str | None = None
 
 
 class TaskUpdateTool(Tool):
-    # 共享任务更新工具；SharedTaskStore.update 处理基础字段，
+    # 共享任务更新工具；teammate 绑定团队，Lead 在执行时解析团队上下文；
+    # SharedTaskStore.update 处理基础字段，
     # add_blocks/add_blocked_by 走独立方法追加依赖。
     name = "TaskUpdate"
     description = (
         "更新共享任务的状态、负责人、描述或依赖；"
-        "用 add_blocks/add_blocked_by 追加依赖关系"
+        "用 add_blocks/add_blocked_by 追加依赖关系；Lead 多团队时用 team_name"
     )
     params_model = TaskUpdateParams
     category = ToolCategory.COMMAND
     is_concurrency_safe = True
 
-    def __init__(self, team_manager: TeamManager, team_name: str) -> None:
+    def __init__(
+        self,
+        team_manager: TeamManager,
+        team_name: str = "",
+        parent_agent: Any = None,
+    ) -> None:
         self._team_manager = team_manager
         self._team_name = team_name
+        self._parent_agent = parent_agent
 
     async def execute(self, params: BaseModel) -> ToolResult:
         tool_params: TaskUpdateParams = params  # type: ignore[assignment]
@@ -55,11 +65,17 @@ class TaskUpdateTool(Tool):
                 is_error=True,
             )
 
-        store = self._team_manager.get_task_store(self._team_name)
-        if store is None:
-            return ToolResult(
-                content=f"任务板未找到: {self._team_name}", is_error=True
-            )
+        context, context_error = resolve_task_context(
+            self._team_manager,
+            self._team_name,
+            "",
+            self._parent_agent,
+            tool_params.team_name,
+        )
+        if context_error is not None:
+            return ToolResult(content=context_error, is_error=True)
+        assert context is not None
+        store = self._team_manager.get_task_store(context.team_name)
         task_id = tool_params.task_id
         task = None
 

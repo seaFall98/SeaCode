@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from seacode.agents.fork import FORK_QUERY_SOURCE, ForkError
 from seacode.agents.parser import AgentDef
+from seacode.conversation import ConversationManager
 from seacode.tools import ToolRegistry
 from seacode.tools.agent_tool import (
     AgentTool,
@@ -349,8 +350,6 @@ async def test_fork_path_default_background_returns_task_id() -> None:
     task_manager = _FakeTaskManager(task_id="fork1234")
     tool.task_manager = task_manager
     # 构造合法 conversation 供 build_forked_messages 使用。
-    from seacode.conversation import ConversationManager
-
     conv = ConversationManager()
     conv.add_user_message("hello")
     conv.add_assistant_message("hi")
@@ -363,7 +362,11 @@ async def test_fork_path_default_background_returns_task_id() -> None:
     assert len(task_manager.launch_calls) == 1
     # fork 路径 launch 传 task="" 与 fork_conversation。
     assert task_manager.launch_calls[0]["task"] == ""
-    assert task_manager.launch_calls[0]["fork_conversation"] is not None
+    fork_conversation = task_manager.launch_calls[0]["fork_conversation"]
+    assert isinstance(fork_conversation, ConversationManager)
+    assert [message.content for message in fork_conversation.messages][-1].startswith(
+        "<fork_boilerplate>"
+    )
 
 
 # 验证 fork 子 Agent 继承 replacement_state。
@@ -371,8 +374,6 @@ async def test_fork_path_default_background_returns_task_id() -> None:
 async def test_fork_path_inherits_replacement_state() -> None:
     parent = _FakeParent(replacement_state={"key": "value"})
     tool, fake_sub = _make_tool(parent=parent, enable_fork=True)
-    from seacode.conversation import ConversationManager
-
     conv = ConversationManager()
     conv.add_user_message("hello")
     conv.add_assistant_message("hi")

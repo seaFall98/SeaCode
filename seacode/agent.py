@@ -62,7 +62,7 @@ from .prompts import (
     build_system_prompt,
 )
 from .tools import ToolRegistry
-from .tools.base import MAX_OUTPUT_CHARS, ToolResult
+from .tools.base import MAX_OUTPUT_CHARS, ToolResult, resolve_tool_path
 from .tools.tool_search import ToolSearchTool
 
 # ---------------------------------------------------------------------------
@@ -673,6 +673,22 @@ class Agent:
         params = sig.parameters
         return "conversation" in params and "parent_agent" in params
 
+    # 根据工具签名注入运行时上下文，避免通过修改共享工具实例传递工作目录。
+    def _tool_call_kwargs(self, tool: Any, conversation: Any) -> dict[str, Any]:
+        import inspect
+
+        try:
+            params = inspect.signature(tool.execute).parameters
+        except (ValueError, TypeError):
+            return {}
+
+        kwargs: dict[str, Any] = {}
+        if "conversation" in params and "parent_agent" in params:
+            kwargs.update(conversation=conversation, parent_agent=self)
+        if "work_dir" in params:
+            kwargs["work_dir"] = self.work_dir
+        return kwargs
+
     # 构造 HookContext；event 标识事件名，其余字段按场景传入。
     def _build_hook_context(self, event: str, **kwargs: Any) -> HookContext:
         return HookContext(event_name=event, **kwargs)
@@ -1273,14 +1289,10 @@ class Agent:
 
         try:
             params = tool.params_model.model_validate(tc.arguments)
-            # batch12：扩展签名工具（AgentTool/AskUserTool）传入 conversation 与 parent_agent。
-            # 基类 execute 只声明 params；通过 _tool_accepts_context 门控后传扩展参数。
-            if self._tool_accepts_context(tool):
-                result = await tool.execute(
-                    params, conversation=conversation, parent_agent=self  # type: ignore[call-arg]
-                )
-            else:
-                result = await tool.execute(params)
+            # 按工具签名注入 conversation、parent_agent 与 work_dir。
+            result = await tool.execute(
+                params, **self._tool_call_kwargs(tool, conversation)
+            )
         except ValidationError as e:
             result = ToolResult(
                 content=f"Parameter validation error: {e}", is_error=True
@@ -1361,13 +1373,10 @@ class Agent:
 
         try:
             params = tool.params_model.model_validate(tc.arguments)
-            # batch12：支持扩展签名的工具传入 conversation 与 parent_agent。
-            if self._tool_accepts_context(tool):
-                result = await tool.execute(
-                    params, conversation=conversation, parent_agent=self  # type: ignore[call-arg]
-                )
-            else:
-                result = await tool.execute(params)
+            # 按工具签名注入 conversation、parent_agent 与 work_dir。
+            result = await tool.execute(
+                params, **self._tool_call_kwargs(tool, conversation)
+            )
         except ValidationError as e:
             result = ToolResult(
                 content=f"Parameter validation error: {e}", is_error=True
@@ -1387,11 +1396,12 @@ class Agent:
         file_path = tc.arguments.get("file_path")
         if not isinstance(file_path, str) or not file_path:
             return
+        path = resolve_tool_path(file_path, self.work_dir)
         try:
-            content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return
-        self.recovery_state.record_file_read(file_path, content)
+        self.recovery_state.record_file_read(str(path), content)
 
     # 并发执行一批工具调用；第 06 步 MCP 延迟工具的并发路径会消费。
     async def _execute_batch_parallel(

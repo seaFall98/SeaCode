@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -112,8 +113,11 @@ class Bash(Tool):
     sandbox: Sandbox | None = None
     sandbox_config: SandboxConfig | None = None
 
-    async def execute(self, params: Params) -> ToolResult:  # type: ignore[override]
+    async def execute(  # type: ignore[override]
+        self, params: Params, *, work_dir: str | Path | None = None
+    ) -> ToolResult:
         timeout = min(params.timeout, MAX_TIMEOUT)
+        effective_work_dir = work_dir if work_dir is not None else self.work_dir
 
         # 三条件守卫：sandbox / sandbox_config / available 任一为 None/False 时直接执行原命令。
         actual_command = params.command
@@ -125,7 +129,7 @@ class Bash(Tool):
                 actual_command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,  # 合并 stderr 到 stdout
-                cwd=self.work_dir,
+                cwd=effective_work_dir,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:

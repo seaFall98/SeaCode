@@ -6,7 +6,13 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from seacode.tools.base import SKIP_DIRS, Tool, ToolCategory, ToolResult
+from seacode.tools.base import (
+    SKIP_DIRS,
+    Tool,
+    ToolCategory,
+    ToolResult,
+    resolve_tool_path,
+)
 
 
 class Params(BaseModel):
@@ -25,8 +31,10 @@ class Glob(Tool):
     category = ToolCategory.READ
     is_concurrency_safe = True
 
-    async def execute(self, params: Params) -> ToolResult:  # type: ignore[override]
-        base = Path(params.path)
+    async def execute(  # type: ignore[override]
+        self, params: Params, *, work_dir: str | Path | None = None
+    ) -> ToolResult:
+        base = resolve_tool_path(params.path, work_dir)
         if not base.exists():
             return ToolResult(content=f"Error: path not found: {params.path}", is_error=True)
 

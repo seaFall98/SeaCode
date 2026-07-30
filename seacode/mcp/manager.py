@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 
@@ -12,6 +13,18 @@ from seacode.tools import ToolRegistry
 from seacode.tools.base import Tool
 
 logger = logging.getLogger(__name__)
+
+
+async def _close_failed_client(client: MCPClient | None) -> None:
+    """清理连接失败的 client，避免失败分支遗留 transport 生命周期任务。"""
+    if client is None:
+        return
+    try:
+        await client.close()
+    except asyncio.CancelledError:
+        logger.debug("MCP client cancellation while cleaning up failed connection")
+    except Exception:  # noqa: BLE001 — 清理失败不应覆盖原始连接错误
+        logger.debug("Error cleaning up failed MCP client", exc_info=True)
 
 
 @dataclass
@@ -78,12 +91,12 @@ class MCPManager:
     async def connect_all(self) -> ConnectResult:
         result = ConnectResult()
         for name, config in self._configs.items():
+            client: MCPClient | None = None
             try:
                 client = MCPClient(config)
                 await client.connect()
-                self._clients[name] = client
-
                 tools = await client.list_tools()
+                self._clients[name] = client
                 # 从 InitializeResult 提取 instructions，并记录服务器工具数量。
                 info = ServerInfo(
                     name=name,
@@ -95,8 +108,20 @@ class MCPManager:
                     wrapper = MCPToolWrapper(name, tool_def, client)
                     result.tools.append(wrapper)
                     logger.info("Registered MCP tool: %s", wrapper.name)
+            except asyncio.CancelledError as e:
+                # 真实 MCPClient 的内部生命周期取消会以 CancelledError 报告连接失败；
+                # 只有当前 connect_all 任务本身被取消时才继续向上传播取消。
+                current = asyncio.current_task()
+                await _close_failed_client(client)
+                if current is not None and current.cancelling():
+                    raise
+                detail = str(e) or type(e).__name__
+                msg = f"MCP server '{name}': {detail}"
+                logger.warning(msg)
+                result.errors.append(msg)
             except Exception as e:
                 # 失败隔离：错误脱敏为字符串后收集，不阻断其它 Server。
+                await _close_failed_client(client)
                 msg = f"MCP server '{name}': {e}"
                 logger.warning(msg)
                 result.errors.append(msg)

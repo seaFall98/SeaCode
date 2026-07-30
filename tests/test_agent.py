@@ -1402,7 +1402,7 @@ class _FakeMCPManager(MCPManager):
 
 # 带 should_defer=True 的测试工具，用于验证延迟工具 reminder 注入。
 class _DeferredTool(Tool):
-    name = "mcp_fake_search"
+    name = "mcp__fake__search"
     description = "Deferred MCP tool for agent tests."
     params_model = _MockParams
     category = ToolCategory.SYSTEM
@@ -1522,7 +1522,7 @@ async def test_deferred_tool_reminder_injected() -> None:
         if "deferred tools are available" in m.content
     ]
     assert len(reminder_msgs) >= 1
-    assert "mcp_fake_search" in reminder_msgs[0].content
+    assert "mcp__fake__search" in reminder_msgs[0].content
 
 
 # 验证系统提示词在 MCP 启用时包含 ToolSearch 段落。

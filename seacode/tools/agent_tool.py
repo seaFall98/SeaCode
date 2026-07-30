@@ -29,6 +29,7 @@ from seacode.agents.tool_filter import (
     clone_registry_for_fork,
     resolve_agent_tools,
 )
+from seacode.conversation import ConversationManager
 from seacode.tools.base import Tool, ToolCategory, ToolResult
 from seacode.worktree.integration import build_worktree_notice, generate_worktree_name
 from seacode.worktree.manager import WorktreeError, WorktreeManager
@@ -217,6 +218,10 @@ class AgentTool(Tool):
         except ForkError as e:
             return ToolResult(content=str(e), is_error=True)
 
+        # run_to_completion 需要 ConversationManager，而不是裸消息列表。
+        fork_conversation = ConversationManager()
+        fork_conversation.replace_history(fork_messages)
+
         fork_registry = clone_registry_for_fork(parent._full_registry)
         # fork 子 Agent 默认 bypassPermissions，max_turns 继承父 Agent。
         fork_def = AgentDef(
@@ -231,7 +236,7 @@ class AgentTool(Tool):
             conversation,
             parent,
             is_fork=True,
-            fork_conversation=fork_messages,
+            fork_conversation=fork_conversation,
             fork_def=fork_def,
             fork_registry=fork_registry,
         )

@@ -117,8 +117,12 @@ from .tools.exit_worktree import ExitWorktreeTool
 from .tools.install_skill import InstallSkill
 from .tools.load_skill import LoadSkill
 
-# batch14：团队协调工具；TeamCreate/TeamDelete/SendMessage 在装配阶段注册到 Lead 工具集。
+# batch14：团队协调工具；团队生命周期、消息与任务板工具在装配阶段注册到 Lead 工具集。
 from .tools.send_message import SendMessageTool
+from .tools.task_create import TaskCreateTool
+from .tools.task_get import TaskGetTool
+from .tools.task_list import TaskListTool
+from .tools.task_update import TaskUpdateTool
 from .tools.team_create import TeamCreateTool
 from .tools.team_delete import TeamDeleteTool
 from .worktree.cleanup import start_stale_cleanup_task
@@ -1048,7 +1052,7 @@ class SeaCodeApp(App[None]):
         # 自动回收 stale worktree。失败不阻断启动——worktree 能力降级为不可用。
         self._assemble_worktree_system(work_dir)
         # batch14：装配团队协调系统。TeamManager 依赖 worktree_manager 与 trace_manager，
-        # 任一为 None 时仍可工作（路径降级）。TeamCreate/TeamDelete/SendMessage 工具注册到
+        # 任一为 None 时仍可工作（路径降级）。团队生命周期、消息和任务板工具注册到
         # Lead 工具集；长生命周期 Lead Agent 在此处绑定这些依赖。
         # 周期刷新 task 每秒拉取 teammates progress 并刷新 TeammateTree。失败不阻断启动。
         self._assemble_teams_system()
@@ -1269,7 +1273,7 @@ class SeaCodeApp(App[None]):
 
     # batch14：装配 TeamManager 与团队协调工具，并启动 TeammateTree 周期刷新 task。
     # 任一步失败静默降级，不阻断 Provider 选择主流程；team_manager 为 None 时
-    # TeamCreate/TeamDelete/SendMessage 工具不注册，Lead 不会进入 Coordinator 模式。
+    # 团队工具不注册，Lead 不会进入 Coordinator 模式。
     # Lead Agent 的 _team_manager / notification_fn 在 _run_turn 创建 Agent 后注入，
     # 因为 agent 在每个回合重建，且 notification_fn 需绑定当回合 agent_id 作为 lead_agent_id。
     def _assemble_teams_system(self) -> None:
@@ -1289,9 +1293,10 @@ class SeaCodeApp(App[None]):
             # 注入 TeamManager 到 AgentTool 让 _execute_as_teammate 路径可用。
             if self._agent_tool is not None:
                 self._agent_tool.set_team_manager(team_manager)
-            # 注册 TeamCreate / TeamDelete / SendMessage 工具。
+            # 注册团队生命周期、消息和共享任务板工具。
             # TeamCreate/TeamDelete 的 parent_agent 在 _run_turn 中刷新为当前回合 Agent；
-            # SendMessage 占位传空字符串，teammate 由 build_teammate_tools 重新实例化。
+            # SendMessage 与 Task* 占位实例也在每回合刷新 parent_agent；
+            # teammate 由 build_teammate_tools 重新实例化并绑定固定团队。
             self._tool_registry.register(
                 TeamCreateTool(None, team_manager, self._teams_config)
             )
@@ -1301,6 +1306,10 @@ class SeaCodeApp(App[None]):
             self._tool_registry.register(
                 SendMessageTool(team_manager, "", "", "")
             )
+            self._tool_registry.register(TaskCreateTool(team_manager))
+            self._tool_registry.register(TaskGetTool(team_manager))
+            self._tool_registry.register(TaskListTool(team_manager))
+            self._tool_registry.register(TaskUpdateTool(team_manager))
         except Exception:
             # 工具注册失败不撤销 team_manager；Lead 仍可消费邮箱，只是无法新建团队。
             pass
@@ -2407,7 +2416,7 @@ class SeaCodeApp(App[None]):
 
     # 后台任务通知轮询循环：每 2 秒检查一次是否有已完成的后台任务。
     # 流式回合期间跳过避免与活动 Agent Loop 竞争对话历史；
-    # 检测到完成任务时注入 <task-notification> 并触发新一轮 Agent Loop。
+    # 检测到任务终态时注入 <task-notification>；取消-only 通知不触发新回合。
     async def _start_notification_polling(self) -> None:
         try:
             while True:
@@ -2422,8 +2431,8 @@ class SeaCodeApp(App[None]):
             # on_unmount 取消时静默退出。
             return
 
-    # 处理已完成的后台任务：注入 <task-notification> 到主对话，
-    # 渲染状态行提示用户，并触发新一轮 Agent Loop 让模型基于通知回复。
+    # 处理已结束的后台任务：注入 <task-notification> 到主对话，
+    # 渲染状态行提示用户，并按终态决定是否触发新一轮 Agent Loop。
     async def _process_task_notifications(self) -> None:
         if self.task_manager is None:
             return
@@ -2432,13 +2441,17 @@ class SeaCodeApp(App[None]):
             return
         # 把 <task-notification> XML 块以 user message 注入主对话。
         inject_task_notifications(self._conversation, completed)
-        # 在对话区渲染状态行提示用户后台任务完成。
+        # 在对话区渲染状态行提示用户后台任务结束。
         for task in completed:
             icon = "✓" if task.status == "completed" else "✗"
             await self._show_system_message(
-                f"{icon} 后台任务完成: [{task.id}] {task.name} — {task.status}"
+                f"{icon} 后台任务结束: [{task.id}] {task.name} — {task.status}"
             )
-        # 触发新一轮 Agent Loop 让模型基于通知回复；
+        # 取消是用户的终止指令；仅取消任务的通知不能再次唤醒 Agent Loop，
+        # 否则主 Agent 可能把刚取消的任务重新发起，抵消 /tasks cancel 的意义。
+        if all(task.status == "cancelled" for task in completed):
+            return
+        # 其它终态触发新一轮 Agent Loop 让模型基于通知回复；
         # 用空 user message 占位（实际通知已注入到对话历史）。
         if self._client is not None and not self._streaming:
             self._streaming = True

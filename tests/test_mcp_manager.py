@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -40,7 +41,7 @@ class _FakeClient(MCPClient):
         self,
         tools: list[mcp_types.Tool] | None = None,
         instructions: str = "",
-        connect_error: Exception | None = None,
+        connect_error: BaseException | None = None,
         close_error: Exception | None = None,
     ) -> None:
         super().__init__(_stdio_config("fake"))
@@ -153,6 +154,53 @@ async def test_connect_all_isolates_failure() -> None:
     assert len(result.tools) == 1
 
 
+# 验证单个 MCP 内部 CancelledError 被视为该 Server 的连接失败并继续后续 Server。
+# 用未处于取消状态的当前任务模拟生命周期内部取消，断言错误收集且正常 Server 仍注册。
+@pytest.mark.asyncio
+async def test_connect_all_isolates_internal_cancelled_error() -> None:
+    manager = MCPManager()
+    manager.load_configs([_stdio_config("cancelled"), _stdio_config("ok")])
+
+    fake_cancelled = _FakeClient(connect_error=asyncio.CancelledError())
+    fake_ok = _FakeClient(tools=[_tool_def("search")])
+
+    with patch("seacode.mcp.manager.MCPClient") as mock_client_cls:
+        mock_client_cls.side_effect = [fake_cancelled, fake_ok]
+        result = await manager.connect_all()
+
+    assert len(result.errors) == 1
+    assert "cancelled" in result.errors[0]
+    assert "CancelledError" in result.errors[0]
+    assert fake_cancelled.closed is True
+    assert [server.name for server in result.servers] == ["ok"]
+    assert len(result.tools) == 1
+
+
+# 验证用户取消整个 connect_all 时 CancelledError 仍向上传播，不被失败隔离吞掉。
+# 阻塞第一个 Server 的 connect，取消外层任务后断言抛出 CancelledError 且连接被清理。
+@pytest.mark.asyncio
+async def test_connect_all_propagates_external_cancellation() -> None:
+    manager = MCPManager()
+    manager.load_configs([_stdio_config("blocked")])
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+
+    class _BlockingClient(_FakeClient):
+        async def connect(self) -> None:
+            started.set()
+            await blocker.wait()
+
+    fake_blocked = _BlockingClient()
+    with patch("seacode.mcp.manager.MCPClient", return_value=fake_blocked):
+        task = asyncio.create_task(manager.connect_all())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert fake_blocked.closed is True
+
+
 # 验证 connect_all 无配置时返回空结果。
 @pytest.mark.asyncio
 async def test_connect_all_no_configs_returns_empty() -> None:
@@ -183,8 +231,8 @@ async def test_register_all_tools_registers_to_registry() -> None:
         result = await manager.register_all_tools(registry)
 
     assert len(result.tools) == 2
-    assert registry.get("mcp_fs_read") is not None
-    assert registry.get("mcp_fs_write") is not None
+    assert registry.get("mcp__fs__read") is not None
+    assert registry.get("mcp__fs__write") is not None
     servers = manager.list_servers()
     assert [(s.name, s.tool_count, s.status) for s in servers] == [
         ("fs", 2, "connected")
@@ -227,7 +275,7 @@ async def test_register_all_tools_reuses_initialized_result() -> None:
     assert first is second
     assert manager.is_initialized is True
     assert mock_client_cls.call_count == 1
-    assert registry.get("mcp_fs_read") is not None
+    assert registry.get("mcp__fs__read") is not None
 
 
 # ---------------------------------------------------------------------------

@@ -186,12 +186,13 @@ def test_extract_text_empty_list_returns_no_output() -> None:
 # ---------------------------------------------------------------------------
 
 
-# 验证 wrapper 名称加 mcp_{server}_{tool} 前缀，分类为 SYSTEM 且 should_defer=True。
+# 验证 wrapper 使用 AgentTeam 统一的 mcp__{server}__{tool} 名称，
+# 分类为 SYSTEM 且 should_defer=True。
 def test_wrapper_name_prefixing_and_category() -> None:
     tool_def = _make_tool_def(name="search", description="Search files")
     wrapper = MCPToolWrapper("fs", tool_def, _FakeClient())
 
-    assert wrapper.name == "mcp_fs_search"
+    assert wrapper.name == "mcp__fs__search"
     assert wrapper.description == "Search files"
     assert wrapper.category == ToolCategory.SYSTEM
     assert wrapper.should_defer is True
@@ -222,7 +223,7 @@ def test_wrapper_get_schema_passes_through_input_schema() -> None:
     wrapper = MCPToolWrapper("fs", tool_def, _FakeClient())
 
     result = wrapper.get_schema()
-    assert result["name"] == "mcp_fs_search"
+    assert result["name"] == "mcp__fs__search"
     # Pydantic 模型可能复制 dict，比较内容而非引用身份。
     assert result["input_schema"] == schema
 

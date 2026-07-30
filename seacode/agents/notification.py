@@ -1,4 +1,4 @@
-"""任务完成通知：``<task-notification>`` XML 格式与注入。
+"""后台任务终态通知：``<task-notification>`` XML 格式与注入。
 
 通知以 user message 形式注入主对话（system message 不被模型视为可消费内容），
 让模型在下一轮看到并基于通知回复。结果超 5000 字符截断；elapsed 格式为
@@ -28,6 +28,13 @@ def format_task_notification(task: BackgroundTask) -> str:
     if len(result) > _NOTIFICATION_RESULT_LIMIT:
         result = result[:_NOTIFICATION_RESULT_LIMIT] + "...[truncated]"
 
+    cancellation_note = ""
+    if task.status == "cancelled":
+        cancellation_note = (
+            "Action: This task was cancelled by the user. "
+            "Do not retry or launch another task unless explicitly requested.\n"
+        )
+
     return (
         "<task-notification>\n"
         f"Task ID: {task.id}\n"
@@ -35,6 +42,7 @@ def format_task_notification(task: BackgroundTask) -> str:
         f"Status: {task.status}\n"
         f"Elapsed: {elapsed_str}\n"
         f"Tokens: ↑{task.progress.input_tokens} ↓{task.progress.output_tokens}\n"
+        f"{cancellation_note}"
         "Result:\n"
         f"{result}\n"
         "</task-notification>"

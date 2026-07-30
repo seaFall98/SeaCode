@@ -62,7 +62,7 @@ def _extract_text(content: list[Any]) -> str:
 class MCPToolWrapper(Tool):
     """把单个 MCP 工具适配为 SeaCode Tool 接口。
 
-    - name 采用 mcp_{server}_{tool} 命名空间隔离，避免与内置工具或其它 Server 冲突；
+    - name 采用 mcp__{server}__{tool} 命名空间隔离，与 AgentTeam 工具筛选契约一致；
     - category 设为 command 让第 05 步权限链对外部工具同样适用；
     - should_defer=True 让初始 Schema 跳过，模型经 ToolSearch 发现后再纳入；
     - execute 调用前检查 is_alive，断开则重连，调用异常置 _alive=False 触发下次重连。
@@ -77,7 +77,7 @@ class MCPToolWrapper(Tool):
         self._server_name = server_name
         self._tool_def = tool_def
         self._client = client
-        self.name = f"mcp_{server_name}_{tool_def.name}"
+        self.name = f"mcp__{server_name}__{tool_def.name}"
         self.description = tool_def.description or tool_def.name
         self.category = ToolCategory.SYSTEM
         self.is_concurrency_safe = False
