@@ -220,6 +220,65 @@ GitHub Actions 在 Pull Request 和 `main` 相关变更上执行质量检查。�
 
 14 步路线从多 Provider 对话开始，依次建立工具、Agent Loop、提示词、权限、MCP、上下文、会话、命令、Skill、Hook、SubAgent、Worktree 和 Agent Teams。实现顺序与依赖关系见 [工程路线图](./docs-zh/project_roadmap.md)，每一步的设计蓝图见 [Design-SeaCode.md](./docs-zh/Design-SeaCode.md)。
 
+## 截图演示
+
+### SeaCode部分功能演示截图
+
+#### 工具调用
+
+![image (1)](./assets/demo/image%20%281%29.png)
+
+#### 计划模式
+
+![image (2)](./assets/demo/image%20%282%29.png)
+
+#### 提示词
+
+![image (3)](./assets/demo/image%20%283%29.png)
+
+#### 权限模式
+
+![image (4)](./assets/demo/image%20%284%29.png)
+
+#### MCP
+
+![image (5)](./assets/demo/image%20%285%29.png)
+
+#### 上下文治理
+
+![image (6)](./assets/demo/image%20%286%29.png)
+
+#### 记忆系统
+
+![image (8)](./assets/demo/image%20%288%29.png)
+
+#### skill
+
+![image (9)](./assets/demo/image%20%289%29.png)
+
+#### 结果1
+
+<video controls src="./assets/demo/seacode-test.mp4"></video>
+
+[打开结果1视频](./assets/demo/seacode-test.mp4)
+
+#### 结果2
+
+<video controls src="./assets/demo/seacode-test2.mp4"></video>
+
+[打开结果2视频](./assets/demo/seacode-test2.mp4)
+
+#### Agent Team
+
+![image (11)](./assets/demo/image%20%2811%29.png)
+
+![image (10)](./assets/demo/image%20%2810%29.png)
+
+#### Remote模式
+
+![image (12)](./assets/demo/image%20%2812%29.png)
+
+
 ## 许可证
 
 [MIT License](./LICENSE) · Copyright (c) 2026 seaFall98
