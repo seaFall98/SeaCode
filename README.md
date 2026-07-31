@@ -6,16 +6,17 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
 [![CI](https://img.shields.io/github/actions/workflow/status/seaFall98/SeaCode/ci.yml?branch=main&label=CI)](https://github.com/seaFall98/SeaCode/actions/workflows/ci.yml)
 
-SeaCode 运行在开发者自己的机器和项目目录中。它把模型接入真实代码，让 Agent 能够理解项目、调用工具、修改文件、运行验证、管理长任务并协调多个执行者；权限、上下文、会话、工作区和事件状态由本地运行时负责。
+SeaCode 是一款本地终端 AI 编程 Agent。基于五层分层架构设计（交互-引擎-工具-记忆-安全）、高内聚、低耦合的搭积木式设计理念开发。用户通过自然语言描述任务，Agent 可在项目工作区内完成代码检索、文件读写、Shell 命令执行及测试验证等多轮操作，并实时展示模型流式输出、工具调用、权限审批与任务状态。系统支持多协议接入，并提供上下文压缩、会话持久化、跨会话记忆、MCP 、Skill、Hook、SubAgent/ 多Agent 协作及 Git Worktree 隔离能力。
 
-SeaCode 关注的是完整工程闭环，而不是一次回答：用户提交意图，模型提出下一步行动，运行时检查边界并执行，结果回到上下文，用户可以观察、干预、恢复并继续工作。
+## 技术栈
 
-## 适合谁
-
-- 想在本地配置中切换 Anthropic、OpenAI 和 OpenAI-compatible 模型端点的开发者；
-- 希望看到每一次文件读写、命令、工具调用和权限决策的工程团队；
-- 需要会话恢复、长期记忆、上下文治理和可回滚工作区的使用者；
-- 需要让多个 Agent 在隔离 Git Worktree 中并行工作并保持协作状态的维护者。
+- **Python 3.12+**：运行时和类型系统基础；
+- **uv**：环境、依赖和可编辑安装；
+- **Textual + Rich**：终端 TUI 和富文本呈现；
+- **anthropic / openai**：Anthropic 与 OpenAI 协议家族客户端；
+- **mcp**：Model Context Protocol 工具生态；
+- **pytest / Ruff / mypy**：测试、静态检查和类型检查；
+- **WebSocket + embedded web content**：Browser Remote 事件与控制入口。
 
 ## 整体架构概览
 
@@ -184,16 +185,6 @@ Prompt CLI 支持 `--mode` 和 `--output-format text|json|stream-json`。Browser
 | [系统设计](./docs-zh/Design-SeaCode.md) | [Design](./docs-en/Design-SeaCode.md) |
 | [使用手册](./docs-zh/Manual-SeaCode.md) | [Manual](./docs-en/Manual-SeaCode.md) |
 | [工程路线图](./docs-zh/project_roadmap.md) | [Roadmap](./docs-en/project_roadmap.md) |
-
-## 技术栈
-
-- **Python 3.12+**：运行时和类型系统基础；
-- **uv**：环境、依赖和可编辑安装；
-- **Textual + Rich**：终端 TUI 和富文本呈现；
-- **anthropic / openai**：Anthropic 与 OpenAI 协议家族客户端；
-- **mcp**：Model Context Protocol 工具生态；
-- **pytest / Ruff / mypy**：测试、静态检查和类型检查；
-- **WebSocket + embedded web content**：Browser Remote 事件与控制入口。
 
 ## 质量门禁
 
