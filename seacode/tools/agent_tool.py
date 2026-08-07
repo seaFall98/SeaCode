@@ -161,6 +161,13 @@ class AgentTool(Tool):
         # 优先使用传入 parent_agent，回退到构造时保存的引用。
         parent = parent_agent if parent_agent is not None else self.parent_agent
 
+        # Fork 注册表保留本工具仅为给出稳定拒绝，禁止所有二次 Agent 调度入口。
+        if self.query_source == FORK_QUERY_SOURCE:
+            return ToolResult(
+                content="fork 子 Agent 不能再次 fork 或调用 Agent 工具",
+                is_error=True,
+            )
+
         # batch14：team_name 非空走 Teammate 路径（与 SubAgent / Fork 互斥）。
         if getattr(tool_params, "team_name", None):
             return await self._execute_as_teammate(
@@ -208,10 +215,6 @@ class AgentTool(Tool):
             return ToolResult(
                 content="fork 未启用，请在配置中开启 enable_fork",
                 is_error=True,
-            )
-        if self.query_source == FORK_QUERY_SOURCE:
-            return ToolResult(
-                content="fork 子 Agent 不能再次 fork", is_error=True
             )
         try:
             fork_messages = build_forked_messages(conversation, tool_params.prompt)

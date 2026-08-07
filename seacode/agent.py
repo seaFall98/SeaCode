@@ -1196,14 +1196,15 @@ class Agent:
 
             tool_results = _order_tool_results(tool_results, response.tool_calls)
 
+            # 即使达到未知工具上限，也先闭合 tool use/result 配对，保证会话可恢复。
+            conversation.add_tool_results_message(tool_results)
+
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
                 yield ErrorEvent(
                     message="Agent terminated: too many consecutive unknown tool calls"
                 )
                 break
-
-            conversation.add_tool_results_message(tool_results)
 
             # 召回不会阻塞主请求；仅消费已经完成的预取结果，失败保持静默。
             if self.memory_recall_task is not None and not self._memory_recall_consumed:
@@ -1665,11 +1666,12 @@ class Agent:
 
             tool_results = _order_tool_results(tool_results, response.tool_calls)
 
+            # 后台路径同样先回灌结果，避免退出时留下孤立的 tool use。
+            conv.add_tool_results_message(tool_results)
+
             # 停止条件 3：连续未知工具调用达到上限。
             if consecutive_unknown >= _CONSECUTIVE_UNKNOWN_LIMIT:
                 break
-
-            conv.add_tool_results_message(tool_results)
 
         return self.last_output
 

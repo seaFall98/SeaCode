@@ -322,6 +322,42 @@ async def test_fork_path_query_source_rejects_refork() -> None:
     assert "不能再次 fork" in result.content
 
 
+# 验证 Fork 来源的 Agent 工具拒绝定义式、Team 与 Worktree 等所有二次调度入口。
+# 各路径在公共入口短路，断言不创建子 Agent、任务或 Trace。
+@pytest.mark.parametrize(
+    "params",
+    [
+        AgentToolParams(subagent_type="", prompt="fork again"),
+        AgentToolParams(subagent_type="Explore", prompt="defined agent"),
+        AgentToolParams(team_name="demo", name="member", prompt="team agent"),
+        AgentToolParams(isolation="worktree", prompt="worktree agent"),
+    ],
+    ids=["fork", "defined", "team", "worktree"],
+)
+async def test_fork_path_rejects_all_agent_dispatch_entries(
+    params: AgentToolParams,
+) -> None:
+    loader = _FakeLoader(agent_def=_make_def())
+    task_manager = _FakeTaskManager()
+    trace_manager = _FakeTraceManager()
+    tool, fake_sub = _make_tool(
+        loader=loader,
+        task_manager=task_manager,
+        trace_manager=trace_manager,
+        enable_fork=True,
+    )
+    tool.query_source = FORK_QUERY_SOURCE
+
+    result = await tool.execute(params, conversation=None, parent_agent=tool.parent_agent)
+
+    assert result.is_error is True
+    assert "不能再次 fork" in result.content
+    assert loader.get_calls == []
+    assert fake_sub.run_calls == []
+    assert task_manager.launch_calls == []
+    assert trace_manager.create_calls == []
+
+
 # 验证 fork 路径 build_forked_messages 抛 ForkError 返回错误。
 # 用 monkeypatch 让 build_forked_messages 抛 ForkError，断言 is_error=True 且 output 含错误信息。
 async def test_fork_path_fork_error_returns_error(

@@ -686,7 +686,7 @@ async def test_max_iterations_limit_emits_error_event() -> None:
 
 
 # 验证连续 3 次未知工具调用触发 ErrorEvent 并停止循环。
-# 三轮均调用未注册工具名，断言第 3 轮回灌前停止并发射错误。
+# 三轮均调用未注册工具名，断言终止前每个 tool use 都已回灌错误结果。
 @pytest.mark.asyncio
 async def test_consecutive_unknown_tools_stops_loop() -> None:
     tool = _MockTool(name="MockTool")
@@ -708,6 +708,41 @@ async def test_consecutive_unknown_tools_stops_loop() -> None:
     assert len(error_events) == 1
     assert "too many consecutive unknown" in error_events[0].message
     assert len(client.requests) == 3
+    result_ids = [
+        result.tool_use_id
+        for message in conversation.messages
+        for result in message.tool_results
+    ]
+    assert result_ids == ["c1", "c2", "c3"]
+
+
+# 验证后台 run_to_completion 在未知工具终止前同样闭合所有 tool use/result 配对。
+# 连续三次未知调用后继续一次文本请求，断言后续请求带有完整的工具结果历史。
+@pytest.mark.asyncio
+async def test_run_to_completion_records_unknown_results_before_stopping() -> None:
+    registry = ToolRegistry()
+    client = _FakeClient(
+        [
+            _tool_call_stream("c1", "UnknownA", {}),
+            _tool_call_stream("c2", "UnknownB", {}),
+            _tool_call_stream("c3", "UnknownC", {}),
+            _text_stream("Recovered"),
+        ]
+    )
+    agent = Agent(client=client, registry=registry, protocol="anthropic")
+    conversation = ConversationManager()
+
+    await agent.run_to_completion("Call unknowns", conversation)
+    output = await agent.run_to_completion("", conversation)
+
+    result_ids = [
+        result.tool_use_id
+        for message in conversation.messages
+        for result in message.tool_results
+    ]
+    assert result_ids == ["c1", "c2", "c3"]
+    assert output == "Recovered"
+    assert any(message.tool_results for message in client.requests[-1])
 
 
 # ---------------------------------------------------------------------------

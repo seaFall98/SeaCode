@@ -78,6 +78,7 @@ from .commands.handlers.worktree import create_worktree_command
 from .config import MCPServerConfig, ProviderConfig, SandboxAppConfig, WorktreeConfig
 from .context import CompactCircuitBreaker, RecoveryState, create_replacement_state
 from .conversation import ConversationManager, ConversationSnapshot, Message
+from .diagnostics import write_runtime_diagnostic
 from .filehistory.history import FileHistory
 from .hooks import HookContext, HookEngine
 from .mcp import MCPManager
@@ -827,6 +828,8 @@ class SeaCodeApp(App[None]):
         register_all_commands(self._command_registry)
         self._completion_popup = CompletionPopup()
         self._agent: Agent | None = None
+        # /session resume 的编号仅在当前应用进程内有效，不能落入会话或配置。
+        self._resume_candidates: list[str] = []
         # batch10：Skill 系统。loader 两级搜索项目级与用户级 skills 目录；
         # executor 持有当前回合 Agent 引用（_run_turn 中刷新），inline/fork 执行 Skill。
         # load_skill/install_skill 工具注入到 ToolRegistry，/skill 命令注册到 CommandRegistry。
@@ -1218,10 +1221,16 @@ class SeaCodeApp(App[None]):
                 self._agent_tool.set_worktree_manager(self.worktree_manager)
             # 注册 EnterWorktree / ExitWorktree 工具。
             self._tool_registry.register(
-                EnterWorktreeTool(self.worktree_manager)
+                EnterWorktreeTool(
+                    self.worktree_manager,
+                    on_work_dir_changed=self._set_agent_work_dir,
+                )
             )
             self._tool_registry.register(
-                ExitWorktreeTool(self.worktree_manager)
+                ExitWorktreeTool(
+                    self.worktree_manager,
+                    on_work_dir_changed=self._set_agent_work_dir,
+                )
             )
             # 注册 /worktree 命令；/rewind 已在 register_all_commands 中无条件注册。
             self._command_registry.register_sync(
@@ -1469,6 +1478,9 @@ class SeaCodeApp(App[None]):
                 "set_conversation": self._set_conversation,
                 "switch_session": self._switch_session,
                 "clear_chat": self._clear_chat,
+                "get_resume_candidates": self._get_resume_candidates,
+                "set_resume_candidates": self._set_resume_candidates,
+                "set_work_dir": self._set_agent_work_dir,
                 "render_restored": lambda msgs: asyncio.create_task(
                     self._render_restored_messages(msgs)
                 ),
@@ -1565,6 +1577,19 @@ class SeaCodeApp(App[None]):
     # 会话状态回调：供 /session resume 替换当前对话历史。
     def _set_conversation(self, conversation: ConversationManager) -> None:
         self._conversation = conversation
+
+    # /session resume 候选由 App 持有，避免每次命令 context 重建后丢失。
+    def _get_resume_candidates(self) -> list[str]:
+        return list(self._resume_candidates)
+
+    # 仅保留当前命令进程中的候选 ID；不写入 Session JSONL 或 Provider 上下文。
+    def _set_resume_candidates(self, candidates: list[str]) -> None:
+        self._resume_candidates = list(candidates)
+
+    # Worktree 工具和命令成功后统一更新长生命周期 Agent 的显式工作目录。
+    def _set_agent_work_dir(self, work_dir: str) -> None:
+        if self._agent is not None:
+            self._agent.work_dir = work_dir
 
     # 会话状态回调：清空对话区；历史由统一 session transition 负责替换。
     def _clear_chat(self) -> None:
@@ -2114,6 +2139,12 @@ class SeaCodeApp(App[None]):
             self._set_status("Ready")
         except Exception as error:
             diagnostic_id = create_diagnostic_id()
+            write_runtime_diagnostic(
+                diagnostic_id,
+                error,
+                phase="tui_turn",
+                tool_activity=tool_activity,
+            )
             log.error(
                 "SeaCode turn failed diagnostic_id=%s exception_type=%s tool_activity=%s",
                 diagnostic_id,

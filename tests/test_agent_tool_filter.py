@@ -12,6 +12,7 @@ from seacode.agents.tool_filter import (
     ALL_AGENT_DISALLOWED_TOOLS,
     ASYNC_AGENT_ALLOWED_TOOLS,
     CUSTOM_AGENT_DISALLOWED_TOOLS,
+    FORK_DISALLOWED_TOOLS,
     clone_registry_for_fork,
     resolve_agent_tools,
 )
@@ -235,14 +236,16 @@ def test_resolve_agent_tools_returns_new_registry() -> None:
 # ------------------------------------------------------------------
 
 
-# 验证 clone_registry_for_fork 复制全部工具不过滤。
-# 父注册表含 ReadFile / Agent / Bash，clone 后断言全部存在。
-def test_clone_registry_for_fork_copies_all_tools() -> None:
-    reg = _make_parent_registry(["ReadFile", "Agent", "Bash"])
+# 验证 Fork 注册表剥离主界面交互控制工具，并保留普通读写工具。
+# 父注册表含全局控制工具与普通工具，clone 后断言控制工具全部不可见。
+def test_clone_registry_for_fork_filters_interactive_controls() -> None:
+    controls = sorted(FORK_DISALLOWED_TOOLS | {"Agent"})
+    reg = _make_parent_registry(["ReadFile", "Bash", *controls])
     new_reg = clone_registry_for_fork(reg)
     assert new_reg.get("ReadFile") is not None
-    assert new_reg.get("Agent") is not None
     assert new_reg.get("Bash") is not None
+    for name in controls:
+        assert new_reg.get(name) is None
 
 
 # 验证 clone_registry_for_fork 把 AgentTool 实例标记 FORK_QUERY_SOURCE。

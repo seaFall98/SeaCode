@@ -185,6 +185,23 @@ async def test_enter_switches_work_dir() -> None:
     assert any("已进入 worktree" in m for m in ui.messages)
 
 
+# 验证命令路径优先通过 App 注入的工作目录回调更新长期 Agent。
+# enter 成功后断言回调接收 worktree 路径，独立 ctx 的 fallback Agent 不被直接改写。
+async def test_enter_uses_injected_work_dir_callback() -> None:
+    manager = WorktreeManager("/repo")
+    session = _make_session("feat-x")
+    manager.enter = AsyncMock(return_value=session)  # type: ignore[method-assign]
+    agent = _FakeAgent(work_dir="/repo")
+    cmd, ctx, _ = _make_command_and_ctx(manager, "enter feat-x", agent=agent)
+    changed_work_dirs: list[str] = []
+    ctx.config["set_work_dir"] = changed_work_dirs.append
+
+    await cmd.handler(ctx)
+
+    assert changed_work_dirs == ["/wt/feat-x"]
+    assert agent.work_dir == "/repo"
+
+
 # 验证 /worktree enter 失败时显示错误。
 # mock enter 抛 WorktreeError，断言 ui.messages 含 "进入失败"。
 async def test_enter_failure_shows_error() -> None:

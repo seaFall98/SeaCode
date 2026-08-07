@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -30,8 +31,13 @@ class ExitWorktreeTool(Tool):
     category = ToolCategory.SYSTEM
     should_defer = True
 
-    def __init__(self, manager: WorktreeManager) -> None:
+    def __init__(
+        self,
+        manager: WorktreeManager,
+        on_work_dir_changed: Callable[[str], None] | None = None,
+    ) -> None:
         self._manager = manager
+        self._on_work_dir_changed = on_work_dir_changed
 
     async def execute(self, params: BaseModel) -> ToolResult:
         tool_params: ExitWorktreeParams = params  # type: ignore[assignment]
@@ -64,6 +70,8 @@ class ExitWorktreeTool(Tool):
                 action=tool_params.action,
                 discard_changes=tool_params.discard_changes,
             )
+            if self._on_work_dir_changed is not None:
+                self._on_work_dir_changed(session.original_cwd)
             return ToolResult(
                 content=f"已退出 worktree (action={tool_params.action})",
                 is_error=False,

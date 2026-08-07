@@ -69,10 +69,23 @@ async def handle_session(ctx: CommandContext) -> None:
                     f"  {i}. [{m.id[:8]}]  {title}  ({m.message_count} msgs, {ts})"
                 )
             ctx.ui.add_system_message("\n".join(lines))
-            ctx.config["_resume_candidates"] = [m.id for m in metas[:15]]
+            candidates = [m.id for m in metas[:15]]
+            set_candidates = ctx.config.get("set_resume_candidates")
+            if callable(set_candidates):
+                set_candidates(candidates)
+            else:
+                # 保留非 TUI 调用与既有测试的短期 context 兼容路径。
+                ctx.config["_resume_candidates"] = candidates
             return
         # 支持用序号恢复；从 _resume_candidates 缓存中按序号查 ID。
-        candidates = ctx.config.get("_resume_candidates", [])
+        get_candidates = ctx.config.get("get_resume_candidates")
+        candidates = (
+            get_candidates()
+            if callable(get_candidates)
+            else ctx.config.get("_resume_candidates", [])
+        )
+        if not isinstance(candidates, list):
+            candidates = []
         session_id = arg
         if arg.isdigit() and candidates:
             idx = int(arg) - 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 
 from pydantic import BaseModel, Field
 
@@ -29,8 +30,13 @@ class EnterWorktreeTool(Tool):
     category = ToolCategory.SYSTEM
     should_defer = True
 
-    def __init__(self, manager: WorktreeManager) -> None:
+    def __init__(
+        self,
+        manager: WorktreeManager,
+        on_work_dir_changed: Callable[[str], None] | None = None,
+    ) -> None:
         self._manager = manager
+        self._on_work_dir_changed = on_work_dir_changed
 
     async def execute(self, params: BaseModel) -> ToolResult:
         # 基类签名是 BaseModel，运行时由 params_model 校验为 EnterWorktreeParams。
@@ -49,7 +55,9 @@ class EnterWorktreeTool(Tool):
             )
         try:
             wt = await self._manager.create(name)
-            await self._manager.enter(name)
+            session = await self._manager.enter(name)
+            if self._on_work_dir_changed is not None:
+                self._on_work_dir_changed(session.worktree_path)
             return ToolResult(
                 content=(
                     f"已创建并进入 worktree: name={wt.name}, "

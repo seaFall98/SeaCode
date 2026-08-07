@@ -4,7 +4,9 @@ import asyncio
 import os
 import re
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -368,7 +370,22 @@ async def test_stream_error_recovers_without_polluting_conversation_history() ->
 # 验证未知运行时异常不会被误报为模型配置错误。
 # 让真实 App 回合收到非 LLMError 异常，断言界面给出内部错误和诊断标识。
 @pytest.mark.asyncio
-async def test_unexpected_turn_error_has_internal_diagnostic() -> None:
+async def test_unexpected_turn_error_has_internal_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[tuple[str, BaseException, str, bool]] = []
+
+    def record_diagnostic(
+        diagnostic_id: str,
+        error: BaseException,
+        *,
+        phase: str,
+        tool_activity: bool,
+    ) -> bool:
+        recorded.append((diagnostic_id, error, phase, tool_activity))
+        return True
+
+    monkeypatch.setattr("seacode.app.write_runtime_diagnostic", record_diagnostic)
     client = _FakeClient([RuntimeError("secret provider response")])
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
 
@@ -383,12 +400,25 @@ async def test_unexpected_turn_error_has_internal_diagnostic() -> None:
         assert "model configuration" not in error_text.lower()
         assert "Diagnostic ID:" in error_text
         assert "secret provider response" not in error_text
+        assert len(recorded) == 1
+        assert recorded[0][2:] == ("tui_turn", False)
+        assert isinstance(recorded[0][1], RuntimeError)
 
 
 # 验证 LLMError 也携带可关联诊断标识，并保留网络类别提示。
 # 使一次网络错误结束回合，断言 TUI 展示类别和稳定的诊断字段。
 @pytest.mark.asyncio
-async def test_llm_error_has_diagnostic_id() -> None:
+async def test_llm_error_has_diagnostic_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[str] = []
+
+    def record_diagnostic(*args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        recorded.append("called")
+        return True
+
+    monkeypatch.setattr("seacode.app.write_runtime_diagnostic", record_diagnostic)
     client = _FakeClient([NetworkError("connection detail")])
     app = SeaCodeApp([_provider()], client_factory=lambda _: client)
 
@@ -401,6 +431,7 @@ async def test_llm_error_has_diagnostic_id() -> None:
         error_text = "\n".join(str(message.render()) for message in app.query(".error-message"))
         assert "provider could not be reached" in error_text.lower()
         assert "Diagnostic ID:" in error_text
+        assert recorded == []
 
 
 # 验证工具已经执行后 Provider 失败会明确提示可能存在工作区结果。
@@ -1394,6 +1425,63 @@ async def test_dispatch_session_without_args_shows_no_active_session(
         assert ok
         text = "\n".join(str(m.render()) for m in app.query(".system-message"))
         assert "参数不足" not in text
+
+
+# 验证连续命令分发可保留 /session resume 的编号候选。
+# 首条命令生成候选、第二条命令使用新 context 恢复第 2 个候选，不依赖测试预填缓存。
+@pytest.mark.asyncio
+async def test_dispatch_session_resume_index_uses_app_owned_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    first_meta = SimpleNamespace(
+        id="sess-aaa11111",
+        title="项目A",
+        message_count=3,
+        total_tokens=0,
+        last_active=datetime.now(UTC),
+    )
+    second_meta = SimpleNamespace(
+        id="sess-bbb22222",
+        title="项目B",
+        message_count=7,
+        total_tokens=0,
+        last_active=datetime.now(UTC),
+    )
+    class _ResumedSession:
+        def __init__(self) -> None:
+            self.session_id = "sess-bbb22222"
+            self.meta = second_meta
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    resumed_session = _ResumedSession()
+
+    class _ResumeManager:
+        def __init__(self) -> None:
+            self.resume_calls: list[str] = []
+
+        def list(self) -> list[Any]:
+            return [first_meta, second_meta]
+
+        def resume(self, session_id: str) -> Any:
+            self.resume_calls.append(session_id)
+            return SimpleNamespace(session=resumed_session, messages=[])
+
+    client = _FakeClient([])
+    app = SeaCodeApp([_provider()], client_factory=lambda _: client)
+    manager: Any = _ResumeManager()
+    async with app.run_test() as pilot:
+        app._session_manager = manager
+        assert await app._dispatch_command("/session resume") is True
+        assert await app._dispatch_command("/session resume 2") is True
+        await pilot.pause()
+
+        assert app._get_resume_candidates() == ["sess-aaa11111", "sess-bbb22222"]
+        assert manager.resume_calls == ["sess-bbb22222"]
+        assert app._session is resumed_session
 
 
 # 验证带 argument hint 的命令无参数时仍会进入 handler。
