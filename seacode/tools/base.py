@@ -44,6 +44,8 @@ class ToolResult(BaseModel):
     tool_use_id: str = ""
     content: str
     is_error: bool = False
+    # 仅记录实际 ask 权限确认的用户选择，供本地会话历史呈现。
+    permission_decision: str | None = None
 
 
 class Tool(ABC):

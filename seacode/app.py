@@ -328,28 +328,48 @@ def _format_detail(tool_name: str, arguments: dict[str, Any], output: str) -> st
 class ToolCallBlock(Static, can_focus=True):
     """展示单次工具调用 loading/成功/失败状态及可展开详情的块。"""
 
-    def __init__(self, tool_name: str, arguments: dict[str, Any], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        historical: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.tool_name = tool_name
         self._arguments = arguments
         self._title = _tool_title(tool_name, arguments)
         self._full_output = ""
         self._is_error = False
-        self._elapsed = 0.0
+        self._elapsed: float | None = None
+        self._permission_decision: str | None = None
         self._collapsed = True
-        self._loading = True
-        self._render_loading()
+        self._loading = not historical
+        if historical:
+            self._render_history_pending()
+        else:
+            self._render_loading()
 
     # loading 态显示品牌色圆点与标题。
     def _render_loading(self) -> None:
         self.update(f"  ● {self._title} …")
         self.add_class("tool-block-loading")
 
+    # 历史记录缺少结果时只标记其来源，不把它呈现为仍在执行。
+    def _render_history_pending(self) -> None:
+        self.update(f"  ● {self._title} (recorded; result unavailable)")
+
     # 接收工具结果后切换到成功或失败态，EditFile 成功默认展开。
-    def set_result(self, result: ToolResult, elapsed: float) -> None:
+    def set_result(
+        self,
+        result: ToolResult,
+        elapsed: float | None,
+        permission_decision: str | None = None,
+    ) -> None:
         self._full_output = result.content
         self._is_error = result.is_error
         self._elapsed = elapsed
+        self._permission_decision = permission_decision or result.permission_decision
         self._loading = False
         self.remove_class("tool-block-loading")
         if self._is_error:
@@ -362,21 +382,45 @@ class ToolCallBlock(Static, can_focus=True):
             self._collapsed = True
             self._render_collapsed()
 
+    # 仅对真实运行结果显示耗时；历史会话未保存耗时则不推测。
+    def _elapsed_summary(self) -> str:
+        if self._elapsed is None:
+            return ""
+        return f" ({self._elapsed:.1f}s)"
+
+    # 权限结论只来自实际 ask 交互，未知或旧记录不显示猜测性标签。
+    def _permission_summary(self) -> str:
+        if self._permission_decision is None:
+            return ""
+        labels = {
+            "allow": "Permission: allowed once",
+            "allow_always": "Permission: allowed and saved",
+            "deny": "Permission: denied",
+        }
+        label = labels.get(self._permission_decision)
+        return f"\n  ↳ {label}" if label else ""
+
     # 折叠态只显示状态符号、标题与耗时。
     def _render_collapsed(self) -> None:
         if self._is_error:
-            self.update(f"  ✗ {self._title} ({self._elapsed:.1f}s)")
+            self.update(
+                f"  ✗ {self._title}{self._elapsed_summary()}"
+                f"{self._permission_summary()}"
+            )
         else:
-            self.update(f"  ✓ {self._title} ({self._elapsed:.1f}s)")
+            self.update(
+                f"  ✓ {self._title}{self._elapsed_summary()}"
+                f"{self._permission_summary()}"
+            )
 
     # 展开态在标题下附加格式化详情。
     def _render_expanded(self) -> None:
         if self._is_error:
-            header = f"  ✗ {self._title} ({self._elapsed:.1f}s)"
+            header = f"  ✗ {self._title}{self._elapsed_summary()}"
         else:
-            header = f"  ✓ {self._title} ({self._elapsed:.1f}s)"
+            header = f"  ✓ {self._title}{self._elapsed_summary()}"
         detail = _format_detail(self.tool_name, self._arguments, self._full_output)
-        self.update(f"{header}\n{detail}")
+        self.update(f"{header}{self._permission_summary()}\n{detail}")
 
     # 点击切换展开/折叠，loading 态不响应。
     def on_click(self) -> None:
@@ -436,7 +480,11 @@ class SubAgentBlock(Static, can_focus=True):
     _PREVIEW_LIMIT: int = 300
 
     def __init__(
-        self, agent_type: str, description: str, **kwargs: Any
+        self,
+        agent_type: str,
+        description: str,
+        historical: bool = False,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._agent_type = agent_type
@@ -444,11 +492,14 @@ class SubAgentBlock(Static, can_focus=True):
         self._description = description[: self._DESC_LIMIT]
         self._output = ""
         self._is_error = False
-        self._elapsed = 0.0
+        self._elapsed: float | None = None
         self._tool_count = 0
         self._collapsed = True
-        self._loading = True
-        self._render_running()
+        self._loading = not historical
+        if historical:
+            self._render_history_pending()
+        else:
+            self._render_running()
 
     # 运行中态：品牌色圆点 + agent_type + description + "Running…"。
     def _render_running(self) -> None:
@@ -459,8 +510,15 @@ class SubAgentBlock(Static, can_focus=True):
         self.update(line)
         self.add_class("tool-block-loading")
 
+    # 历史子 Agent 缺少结果时只显示已记录状态，避免误导为运行中。
+    def _render_history_pending(self) -> None:
+        line = f"  ● {self._agent_type}"
+        if self._description:
+            line += f" — {self._description}"
+        self.update(f"{line}  (recorded; result unavailable)")
+
     # 接收子 Agent 执行结果；解析工具数并切换到完成态。
-    def set_result(self, output: str, is_error: bool, elapsed: float) -> None:
+    def set_result(self, output: str, is_error: bool, elapsed: float | None) -> None:
         self._output = output
         self._is_error = is_error
         self._elapsed = elapsed
@@ -493,7 +551,8 @@ class SubAgentBlock(Static, can_focus=True):
         parts: list[str] = []
         if self._tool_count > 0:
             parts.append(f"{self._tool_count} tool uses")
-        parts.append(f"{self._elapsed:.1f}s")
+        if self._elapsed is not None:
+            parts.append(f"{self._elapsed:.1f}s")
         stats = " · ".join(parts)
         line = f"  {symbol}  Done ({stats})  (ctrl+o to expand)"
         self.update(line)
@@ -507,7 +566,8 @@ class SubAgentBlock(Static, can_focus=True):
         parts: list[str] = []
         if self._tool_count > 0:
             parts.append(f"{self._tool_count} tool uses")
-        parts.append(f"{self._elapsed:.1f}s")
+        if self._elapsed is not None:
+            parts.append(f"{self._elapsed:.1f}s")
         stats = " · ".join(parts)
         header = f"  {symbol}  Done ({stats})"
         preview = self._output[: self._PREVIEW_LIMIT]
@@ -2002,9 +2062,12 @@ class SeaCodeApp(App[None]):
                         else:
                             result_block.set_result(
                                 ToolResult(
-                                    content=event.output, is_error=event.is_error
+                                    content=event.output,
+                                    is_error=event.is_error,
+                                    permission_decision=event.permission_decision,
                                 ),
                                 event.elapsed,
+                                event.permission_decision,
                             )
                     chat.scroll_end(animate=False)
                     # batch12：AskUserTool 执行后检查 _pending_event 挂起 InlineAskUserWidget。
@@ -2068,7 +2131,7 @@ class SeaCodeApp(App[None]):
                         and not blk._loading
                     ]
                     if len(collapsible) >= 2:
-                        total_elapsed = sum(blk._elapsed for _, blk in collapsible)
+                        total_elapsed = sum(blk._elapsed or 0.0 for _, blk in collapsible)
                         summary = ToolGroupSummary(len(collapsible), total_elapsed)
                         for _, blk in collapsible:
                             blk.display = False
@@ -2365,23 +2428,69 @@ class SeaCodeApp(App[None]):
             f"已恢复会话 {result.session.session_id}（{len(result.messages)} 条消息）"
         )
 
-    # 把恢复的消息渲染到 chat-area；先清空旧内容再按角色挂载用户/助手行。
-    # tool_results 与空内容消息跳过，避免渲染工具调用回灌噪音。
+    # 把恢复的消息渲染到 chat-area；按 tool_use_id 重建历史工具块与结果。
     async def _render_restored_messages(self, messages: list[Message]) -> None:
         chat = self.query_one("#chat-area", VerticalScroll)
         await chat.remove_children()
+        history_blocks: dict[str, ToolCallBlock | SubAgentBlock] = {}
         for msg in messages:
-            if msg.tool_results or not msg.content:
-                continue
             if msg.role == "user":
-                user_message = Text()
-                user_message.append("❯ ", style="bold #71b8bc")
-                user_message.append(msg.content, style="bold #f2f5f5")
-                await chat.mount(Static(user_message, classes="message user-message"))
+                if msg.content:
+                    user_message = Text()
+                    user_message.append("❯ ", style="bold #71b8bc")
+                    user_message.append(msg.content, style="bold #f2f5f5")
+                    await chat.mount(
+                        Static(user_message, classes="message user-message")
+                    )
             elif msg.role == "assistant":
-                await chat.mount(
-                    Markdown(msg.content, classes="message assistant-markdown")
-                )
+                if not msg.tool_uses:
+                    if msg.content:
+                        await chat.mount(
+                            Markdown(msg.content, classes="message assistant-markdown")
+                        )
+                    continue
+                ai_row = Vertical(classes="ai-row")
+                await chat.mount(ai_row)
+                if msg.content:
+                    await ai_row.mount(
+                        Markdown(msg.content, classes="message assistant-markdown")
+                    )
+                for tool_use in msg.tool_uses:
+                    if tool_use.tool_name == "Agent":
+                        block: ToolCallBlock | SubAgentBlock = SubAgentBlock(
+                            agent_type=tool_use.arguments.get("agent_type", "Agent"),
+                            description=tool_use.arguments.get("description", ""),
+                            historical=True,
+                        )
+                    else:
+                        block = ToolCallBlock(
+                            tool_use.tool_name,
+                            tool_use.arguments,
+                            historical=True,
+                        )
+                    history_blocks[tool_use.tool_use_id] = block
+                    await ai_row.mount(block)
+
+            for tool_result in msg.tool_results:
+                history_block = history_blocks.pop(tool_result.tool_use_id, None)
+                if history_block is None:
+                    continue
+                if isinstance(history_block, SubAgentBlock):
+                    history_block.set_result(
+                        output=tool_result.content,
+                        is_error=tool_result.is_error,
+                        elapsed=None,
+                    )
+                else:
+                    history_block.set_result(
+                        ToolResult(
+                            content=tool_result.content,
+                            is_error=tool_result.is_error,
+                            permission_decision=tool_result.permission_decision,
+                        ),
+                        elapsed=None,
+                        permission_decision=tool_result.permission_decision,
+                    )
         chat.scroll_end(animate=False)
 
     # 应用退出时关闭当前 session 文件句柄，避免句柄泄露。

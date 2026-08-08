@@ -28,6 +28,8 @@ class ToolResultBlock:
     tool_use_id: str
     content: str
     is_error: bool = False
+    # 实际 ask 权限确认的结果；缺失表示未经过交互式确认或旧会话记录。
+    permission_decision: str | None = None
 
 
 @dataclass(frozen=True)

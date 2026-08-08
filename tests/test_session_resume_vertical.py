@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from seacode.app import ChatInput, SeaCodeApp
+from seacode.app import ChatInput, SeaCodeApp, ToolCallBlock
 from seacode.client import (
     LLMClient,
     NetworkError,
@@ -186,7 +186,11 @@ def test_session_roundtrip_preserves_thinking_signature_and_tools(tmp_path: Path
     session.append(
         Message(
             role="user",
-            tool_results=[ToolResultBlock("tool-1", "file contents")],
+            tool_results=[
+                ToolResultBlock(
+                    "tool-1", "file contents", permission_decision="allow"
+                )
+            ],
         )
     )
     session.close()
@@ -200,6 +204,7 @@ def test_session_roundtrip_preserves_thinking_signature_and_tools(tmp_path: Path
     ]
     assert assistant.tool_uses[0].tool_use_id == "tool-1"
     assert result.messages[2].tool_results[0].content == "file contents"
+    assert result.messages[2].tool_results[0].permission_decision == "allow"
     result.session.close()
 
 
@@ -309,6 +314,66 @@ async def test_ctrl_r_resume_continues_previous_conversation(
         Message(role="assistant", content="Saved answer"),
         Message(role="user", content="Continue from Ctrl+R"),
     ]
+
+
+# 验证 Ctrl+R 与命令恢复均重建工具块和审批结论，而非退化为纯 Markdown。
+# 对同一持久化会话分别走两条入口，断言工具状态和只读审批文本相同。
+@pytest.mark.asyncio
+async def test_resume_paths_render_structured_tool_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    manager = SessionManager(str(tmp_path))
+    session = manager.create()
+    session_id = session.session_id
+    session.append(Message(role="user", content="Update the file"))
+    session.append(
+        Message(
+            role="assistant",
+            content="I will update it.",
+            tool_uses=[
+                ToolUseBlock(
+                    tool_use_id="write-1",
+                    tool_name="WriteFile",
+                    arguments={"file_path": "demo.txt", "content": "done"},
+                )
+            ],
+        )
+    )
+    session.append(
+        Message(
+            role="user",
+            tool_results=[
+                ToolResultBlock(
+                    "write-1",
+                    "written",
+                    permission_decision="allow_always",
+                )
+            ],
+        )
+    )
+    session.append(Message(role="assistant", content="Finished."))
+    session.close()
+
+    ctrl_r_app = SeaCodeApp([_provider()], client_factory=lambda _: _ScriptedClient([]))
+    async with ctrl_r_app.run_test() as pilot:
+        await ctrl_r_app.on_inline_resume_widget_selected(
+            InlineResumeWidget.Selected(session_id)
+        )
+        await pilot.pause()
+        ctrl_r_block = ctrl_r_app.query_one(ToolCallBlock)
+        assert "Permission: allowed and saved" in str(ctrl_r_block.render())
+        assert "0.0s" not in str(ctrl_r_block.render())
+        assert ctrl_r_block._loading is False
+
+    command_app = SeaCodeApp([_provider()], client_factory=lambda _: _ScriptedClient([]))
+    async with command_app.run_test() as pilot:
+        assert await command_app._dispatch_command(f"/session resume {session_id}")
+        await pilot.pause()
+        command_block = command_app.query_one(ToolCallBlock)
+        assert "Permission: allowed and saved" in str(command_block.render())
+        assert "0.0s" not in str(command_block.render())
+        assert command_block._loading is False
 
 
 # 验证真实 TUI 恢复入口可以用方向键浏览超过首个可视窗口的 session。

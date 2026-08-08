@@ -1180,6 +1180,7 @@ async def test_permission_deny_returns_error_result(tmp_path: Path) -> None:
     assert len(result_events) == 1
     assert result_events[0].is_error is True
     assert "Permission denied" in result_events[0].output
+    assert result_events[0].permission_decision is None
     assert isinstance(events[-1], LoopComplete)
 
 
@@ -1212,6 +1213,9 @@ async def test_permission_ask_allow_executes_tool(tmp_path: Path) -> None:
     assert len(result_events) == 1
     assert result_events[0].is_error is False
     assert "wrote" in result_events[0].output
+    assert result_events[0].permission_decision == PermissionResponse.ALLOW.value
+    tool_result_message = next(message for message in conversation.messages if message.tool_results)
+    assert tool_result_message.tool_results[0].permission_decision == "allow"
     assert isinstance(events[-1], LoopComplete)
 
 
@@ -1245,6 +1249,7 @@ async def test_permission_ask_deny_returns_error(tmp_path: Path) -> None:
     assert len(result_events) == 1
     assert result_events[0].is_error is True
     assert "Permission denied" in result_events[0].output
+    assert result_events[0].permission_decision == PermissionResponse.DENY.value
     assert isinstance(events[-1], LoopComplete)
 
 
@@ -1284,6 +1289,7 @@ async def test_permission_allow_always_writes_rule_and_session_allow(
     result_events = [e for e in events if isinstance(e, ToolResultEvent)]
     assert len(result_events) == 1
     assert result_events[0].is_error is False
+    assert result_events[0].permission_decision == PermissionResponse.ALLOW_ALWAYS.value
 
     # 本地规则文件已写入。
     assert local_path.is_file()

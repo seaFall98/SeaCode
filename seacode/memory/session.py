@@ -60,6 +60,7 @@ class SessionRecord:
     timestamp: datetime
     tool_use_id: str | None = None
     is_error: bool = False
+    permission_decision: str | None = None
 
     # 序列化为 JSONL 行；条件写入 tool_use_id 与 is_error，保留 unicode 与紧凑分隔符。
     def to_jsonl(self) -> str:
@@ -72,6 +73,8 @@ class SessionRecord:
             data["tool_use_id"] = self.tool_use_id
         if self.type == RecordType.TOOL_RESULT:
             data["is_error"] = self.is_error
+            if self.permission_decision is not None:
+                data["permission_decision"] = self.permission_decision
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     # 反序列化一行 JSONL；损坏行返回 None 而非抛异常，保证 resume 跳过坏行。
@@ -85,6 +88,7 @@ class SessionRecord:
                 timestamp=datetime.fromisoformat(data["timestamp"]),
                 tool_use_id=data.get("tool_use_id"),
                 is_error=data.get("is_error", False),
+                permission_decision=data.get("permission_decision"),
             )
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
@@ -107,6 +111,7 @@ class SessionRecord:
                         timestamp=now,
                         tool_use_id=tr.tool_use_id,
                         is_error=tr.is_error,
+                        permission_decision=tr.permission_decision,
                     )
                 )
         elif message.role == "assistant":
@@ -165,6 +170,8 @@ def _message_to_record_dicts(message: Message) -> list[dict[str, Any]]:
             data["tool_use_id"] = rec.tool_use_id
         if rec.type == RecordType.TOOL_RESULT:
             data["is_error"] = rec.is_error
+            if rec.permission_decision is not None:
+                data["permission_decision"] = rec.permission_decision
         dicts.append(data)
     return dicts
 
@@ -210,6 +217,7 @@ def parse_compact_boundary(record: SessionRecord) -> tuple[str, list[Message]]:
                     timestamp=record.timestamp,
                     tool_use_id=item.get("tool_use_id"),
                     is_error=item.get("is_error", False),
+                    permission_decision=item.get("permission_decision"),
                 )
             )
         except ValueError:
@@ -260,6 +268,7 @@ def records_to_messages(records: list[SessionRecord]) -> list[Message]:
                         else json.dumps(record.content)
                     ),
                     is_error=record.is_error,
+                    permission_decision=record.permission_decision,
                 )
             )
             continue

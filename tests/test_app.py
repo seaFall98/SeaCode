@@ -19,6 +19,7 @@ from seacode.app import (
     MAX_AT_REF_BYTES,
     ChatInput,
     SeaCodeApp,
+    ToolCallBlock,
     ToolGroupSummary,
     expand_at_refs,
     scan_files_for_at,
@@ -37,7 +38,7 @@ from seacode.client import (
 from seacode.commands.registry import Command, CommandContext, CommandType
 from seacode.config import ProviderConfig
 from seacode.context import build_recovery_attachment
-from seacode.conversation import Message
+from seacode.conversation import Message, ToolResultBlock, ToolUseBlock
 from seacode.mcp.manager import ConnectResult, MCPManager, ServerInfo
 from seacode.permission_dialog import InlinePermissionWidget
 from seacode.permissions import PermissionMode, RuleEngine
@@ -1182,6 +1183,8 @@ async def test_permission_dialog_enter_allows_tool_execution() -> None:
         # 工具执行成功：无错误样式块，对话框已移除。
         assert not app.query(".tool-block-error")
         assert not _has_permission_dialog(app)
+        block = app.query_one(ToolCallBlock)
+        assert "Permission: allowed once" in str(block.render())
 
 
 # 验证权限对话框通过键盘导航到 No 选项后 Enter 拒绝工具执行。
@@ -1208,6 +1211,7 @@ async def test_permission_dialog_navigate_to_no_and_deny_tool() -> None:
         error_blocks = app.query(".tool-block-error")
         assert len(error_blocks) == 1
         assert not _has_permission_dialog(app)
+        assert "Permission: denied" in str(error_blocks[0].render())
 
 
 # 验证权限对话框方向键导航到第 2 项后 Enter 触发 ALLOW_ALWAYS。
@@ -1232,6 +1236,8 @@ async def test_permission_dialog_down_then_enter_allow_always() -> None:
 
         assert not app.query(".tool-block-error")
         assert not _has_permission_dialog(app)
+        block = app.query_one(ToolCallBlock)
+        assert "Permission: allowed and saved" in str(block.render())
 
 
 # 验证 BYPASS 模式下 WriteFile 自动放行，不触发权限对话框。
@@ -1259,6 +1265,66 @@ async def test_bypass_mode_skips_permission_dialog() -> None:
         assert app._pending_permission is None
         assert not _has_permission_dialog(app)
         assert not app.query(".tool-block-error")
+        assert "Permission:" not in "\n".join(
+            str(block.render()) for block in app.query(ToolCallBlock)
+        )
+
+
+# 验证恢复渲染按 tool_use_id 配对多个工具结果，并保留审批与错误状态。
+# 结果故意按相反顺序提供，断言每个历史块显示自己的结果且不出现虚构耗时。
+@pytest.mark.asyncio
+async def test_render_restored_messages_preserves_structured_tool_history() -> None:
+    app = SeaCodeApp([_provider()], client_factory=lambda _: _FakeClient([]))
+    messages = [
+        Message(role="user", content="Inspect and update the project"),
+        Message(
+            role="assistant",
+            content="I will inspect both files.",
+            tool_uses=[
+                ToolUseBlock("read-1", "ReadFile", {"file_path": "one.txt"}),
+                ToolUseBlock("bash-1", "Bash", {"command": "false"}),
+                ToolUseBlock("glob-1", "Glob", {"pattern": "*.py"}),
+            ],
+        ),
+        Message(
+            role="user",
+            tool_results=[
+                ToolResultBlock(
+                    "bash-1",
+                    "command failed",
+                    is_error=True,
+                    permission_decision="deny",
+                ),
+                ToolResultBlock(
+                    "glob-1",
+                    "app.py",
+                ),
+                ToolResultBlock(
+                    "read-1",
+                    "file contents",
+                    permission_decision="allow",
+                ),
+            ],
+        ),
+        Message(role="assistant", content="Finished."),
+    ]
+
+    async with app.run_test() as pilot:
+        await app._render_restored_messages(messages)
+        await pilot.pause()
+        blocks = {block.tool_name: block for block in app.query(ToolCallBlock)}
+
+        assert set(blocks) == {"ReadFile", "Bash", "Glob"}
+        assert "Permission: allowed once" in str(blocks["ReadFile"].render())
+        assert "Permission: denied" in str(blocks["Bash"].render())
+        assert blocks["Bash"].has_class("tool-block-error")
+        assert "Permission:" not in str(blocks["Glob"].render())
+        assert all(block._loading is False for block in blocks.values())
+        assert all("0.0s" not in str(block.render()) for block in blocks.values())
+
+        blocks["ReadFile"].on_click()
+        await pilot.pause()
+        assert "file contents" in str(blocks["ReadFile"].render())
 
 
 # ---------------------------------------------------------------------------
