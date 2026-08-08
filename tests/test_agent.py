@@ -686,7 +686,7 @@ async def test_max_iterations_limit_emits_error_event() -> None:
 
 
 # 验证连续 3 次未知工具调用触发 ErrorEvent 并停止循环。
-# 三轮均调用未注册工具名，断言终止前每个 tool use 都已回灌错误结果。
+# 三轮均调用未注册工具名，断言终止前每个 tool use 都已写入会话历史。
 @pytest.mark.asyncio
 async def test_consecutive_unknown_tools_stops_loop() -> None:
     tool = _MockTool(name="MockTool")

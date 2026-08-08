@@ -1666,7 +1666,7 @@ class Agent:
 
             tool_results = _order_tool_results(tool_results, response.tool_calls)
 
-            # 后台路径同样先回灌结果，避免退出时留下孤立的 tool use。
+            # 后台路径同样先将结果写入会话历史，避免退出时留下孤立的 tool use。
             conv.add_tool_results_message(tool_results)
 
             # 停止条件 3：连续未知工具调用达到上限。
