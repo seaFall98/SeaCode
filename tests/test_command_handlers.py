@@ -739,6 +739,46 @@ async def test_session_resume_by_index() -> None:
     assert cb.render_restored_calls == [restored_msgs]
 
 
+# 验证 /session resume 的候选通过 App 回调跨两个独立 command context 保留。
+# 先无参列出候选，再使用新 context 按序号恢复，断言恢复第 2 个会话。
+async def test_session_resume_candidates_survive_separate_contexts() -> None:
+    metas = [
+        _FakeMeta("sess-aaa11111", "项目A", 3, 500),
+        _FakeMeta("sess-bbb22222", "项目B", 7, 800),
+    ]
+    restored_session = _FakeSession("sess-bbb22222", "项目B", 7)
+    sm = _FakeSessionManager(
+        metas=metas,
+        resume_result=_FakeResumeResult(session=restored_session, messages=[]),
+    )
+    cb = _FakeCallbacks()
+    candidates: list[str] = []
+
+    def get_candidates() -> list[str]:
+        return list(candidates)
+
+    def set_candidates(values: list[str]) -> None:
+        candidates[:] = values
+
+    first_config = _config(cb)
+    first_config["get_resume_candidates"] = get_candidates
+    first_config["set_resume_candidates"] = set_candidates
+    first_ctx = _make_ctx(
+        args="resume", session_manager=sm, ui=_FakeUI(), config=first_config
+    )
+    await handle_session(first_ctx)
+
+    second_config = _config(cb)
+    second_config["get_resume_candidates"] = get_candidates
+    second_ctx = _make_ctx(
+        args="resume 2", session_manager=sm, ui=_FakeUI(), config=second_config
+    )
+    await handle_session(second_ctx)
+
+    assert candidates == ["sess-aaa11111", "sess-bbb22222"]
+    assert sm.resume_calls == ["sess-bbb22222"]
+
+
 # 验证 /session resume 直接按 ID 恢复。
 # 传 args="resume session_xxx"，断言 resume 收到该 ID 且 set_session 被调用。
 async def test_session_resume_by_id() -> None:

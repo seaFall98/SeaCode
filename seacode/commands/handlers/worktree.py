@@ -17,6 +17,15 @@ _EXIT_REMOVE_FLAGS = {"--remove", "-r"}
 _EXIT_DISCARD_FLAGS = {"--discard", "-d"}
 
 
+# 优先走 App 注入的长期 Agent 回调；独立 handler 调用仍兼容直接注入的 Agent。
+def _update_agent_work_dir(ctx: CommandContext, work_dir: str) -> None:
+    set_work_dir = ctx.config.get("set_work_dir")
+    if callable(set_work_dir):
+        set_work_dir(work_dir)
+    elif ctx.agent is not None:
+        ctx.agent.work_dir = work_dir
+
+
 # 构造 /worktree handler；闭包捕获 worktree_manager。
 def create_worktree_handler(manager: WorktreeManager) -> Any:
     async def handler(ctx: CommandContext) -> None:
@@ -63,8 +72,7 @@ async def _handle_create(
         wt = await manager.create(name, base_branch)
         session = await manager.enter(name)
         # 切换 agent 工作目录到 worktree 路径，让后续工具调用在隔离环境内执行。
-        if ctx.agent is not None:
-            ctx.agent.work_dir = session.worktree_path
+        _update_agent_work_dir(ctx, session.worktree_path)
         ctx.ui.add_system_message(
             f"已创建并进入 worktree: {wt.name} ({wt.path})\n"
             f"分支: {wt.branch}"
@@ -99,8 +107,7 @@ async def _handle_enter(
     name = rest[0]
     try:
         session = await manager.enter(name)
-        if ctx.agent is not None:
-            ctx.agent.work_dir = session.worktree_path
+        _update_agent_work_dir(ctx, session.worktree_path)
         ctx.ui.add_system_message(f"已进入 worktree: {name} ({session.worktree_path})")
     except WorktreeError as e:
         ctx.ui.add_system_message(f"进入失败: {e}")
@@ -123,8 +130,7 @@ async def _handle_exit(
             discard_changes=discard,
         )
         # 恢复 agent 工作目录到进入 worktree 前的原始路径。
-        if ctx.agent is not None:
-            ctx.agent.work_dir = session.original_cwd
+        _update_agent_work_dir(ctx, session.original_cwd)
         action_str = "removed" if remove else "kept"
         ctx.ui.add_system_message(f"已退出 worktree ({action_str})")
     except WorktreeError as e:

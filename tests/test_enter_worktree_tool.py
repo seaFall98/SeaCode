@@ -89,7 +89,8 @@ async def test_create_and_enter_success_returns_worktree_info() -> None:
     wt = _make_worktree(name="feat-x")
     manager.create = AsyncMock(return_value=wt)  # type: ignore[method-assign]
     manager.enter = AsyncMock(return_value=_make_session())  # type: ignore[method-assign]
-    tool = EnterWorktreeTool(manager)
+    changed_work_dirs: list[str] = []
+    tool = EnterWorktreeTool(manager, on_work_dir_changed=changed_work_dirs.append)
     params = EnterWorktreeParams(name="feat-x")
 
     result = await tool.execute(params)
@@ -98,6 +99,7 @@ async def test_create_and_enter_success_returns_worktree_info() -> None:
     assert "feat-x" in result.content
     assert "/wt/feat-x" in result.content
     assert "worktree-feat-x" in result.content
+    assert changed_work_dirs == ["/wt/feat-x"]
 
 
 # 验证 manager.create 抛 WorktreeError 时返回 is_error=True。
@@ -120,10 +122,12 @@ async def test_enter_raises_worktree_error_returns_error() -> None:
     manager = WorktreeManager("/repo")
     manager.create = AsyncMock(return_value=_make_worktree())  # type: ignore[method-assign]
     manager.enter = AsyncMock(side_effect=WorktreeError("enter failed"))  # type: ignore[method-assign]
-    tool = EnterWorktreeTool(manager)
+    changed_work_dirs: list[str] = []
+    tool = EnterWorktreeTool(manager, on_work_dir_changed=changed_work_dirs.append)
     params = EnterWorktreeParams(name="feat-x")
 
     result = await tool.execute(params)
 
     assert result.is_error is True
     assert "enter failed" in result.content
+    assert changed_work_dirs == []

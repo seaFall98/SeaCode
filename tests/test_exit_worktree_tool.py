@@ -77,7 +77,8 @@ async def test_keep_action_returns_success() -> None:
     manager = WorktreeManager("/repo")
     manager.current_session = _make_session()
     manager.exit = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    tool = ExitWorktreeTool(manager)
+    changed_work_dirs: list[str] = []
+    tool = ExitWorktreeTool(manager, on_work_dir_changed=changed_work_dirs.append)
     params = ExitWorktreeParams(action="keep")
 
     result = await tool.execute(params)
@@ -87,6 +88,7 @@ async def test_keep_action_returns_success() -> None:
     manager.exit.assert_awaited_once_with(
         "feat-x", action="keep", discard_changes=False
     )
+    assert changed_work_dirs == ["/repo"]
 
 
 # 验证 action=remove discard=True 返回删除信息并调用 manager.exit(action="remove")。
@@ -132,10 +134,12 @@ async def test_exit_raises_worktree_error_returns_error() -> None:
     manager = WorktreeManager("/repo")
     manager.current_session = _make_session()
     manager.exit = AsyncMock(side_effect=WorktreeError("exit failed"))  # type: ignore[method-assign]
-    tool = ExitWorktreeTool(manager)
+    changed_work_dirs: list[str] = []
+    tool = ExitWorktreeTool(manager, on_work_dir_changed=changed_work_dirs.append)
     params = ExitWorktreeParams(action="keep")
 
     result = await tool.execute(params)
 
     assert result.is_error is True
     assert "exit failed" in result.content
+    assert changed_work_dirs == []

@@ -3,8 +3,8 @@
 五层过滤顺序固定：(0) MCP 工具始终放行 → (1) 全局禁用 → (2) 自定义 agent 来源
 额外禁用 → (3) 后台白名单收拢 → (4) 定义层 disallowedTools / tools 应用。
 
-``clone_registry_for_fork`` 不做任何过滤，复制父注册表全部工具；遇到 AgentTool
-实例时浅复制并标记 ``FORK_QUERY_SOURCE``，保持工具定义字节一致以命中 prompt cache。
+``clone_registry_for_fork`` 会剥离主界面交互控制工具；仅保留真实 AgentTool 的
+浅复制以返回稳定拒绝，其余允许工具保持原定义，避免改变 prompt cache 的工具描述。
 """
 
 from __future__ import annotations
@@ -38,6 +38,9 @@ CUSTOM_AGENT_DISALLOWED_TOOLS: set[str] = {
     "TaskStop",
     "Workflow",
 }
+
+# Fork 没有主界面交互能力，不能继承控制工具；真实 AgentTool 单独保留为拒绝入口。
+FORK_DISALLOWED_TOOLS: set[str] = ALL_AGENT_DISALLOWED_TOOLS - {"Agent"}
 
 # 后台任务允许的工具白名单；包含 v1 既定的全部工具名。
 # 列表中部分工具（如 NotebookEdit / Skill / SyntheticOutput 等）本步可能尚未实现，
@@ -144,8 +147,7 @@ def resolve_agent_tools(
     return new_registry
 
 
-# 复制父注册表全部工具不过滤；AgentTool 实例浅复制并标记 FORK_QUERY_SOURCE。
-# 保持工具定义字节一致以命中 prompt cache；fork 子 Agent 不能再次 fork。
+# 复制 Fork 可用工具并剥离交互控制项；真实 AgentTool 浅复制用于稳定拒绝。
 def clone_registry_for_fork(parent_registry: ToolRegistry) -> ToolRegistry:
     # 延迟导入避免循环：AgentTool 引用本模块，本模块引用 FORK_QUERY_SOURCE 已无循环。
     from seacode.tools.agent_tool import AgentTool
@@ -156,7 +158,7 @@ def clone_registry_for_fork(parent_registry: ToolRegistry) -> ToolRegistry:
             fork_tool = copy.copy(tool)
             fork_tool.query_source = FORK_QUERY_SOURCE
             new_registry.register(fork_tool)
-        else:
+        elif tool.name not in FORK_DISALLOWED_TOOLS and tool.name != "Agent":
             new_registry.register(tool)
     return new_registry
 

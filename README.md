@@ -270,6 +270,54 @@ GitHub Actions 在 Pull Request 和 `main` 相关变更上执行质量检查。�
 ![image (12)](./assets/demo/image%20%2812%29.png)
 
 
+
+## Agent Eval评估报告
+
+### 评估概述
+
+SeaCode 完成了一次基于 [SWE-bench-Live](https://github.com/microsoft/SWE-bench-Live) 的受控端到端编码评估。本次评估衡量当前 SeaCode 与配置 Provider 组合在真实开源仓库问题上的任务完成能力，并由独立的官方 Docker evaluator 判定补丁正确性；Agent 自身的“完成”状态不作为正确性的最终依据。
+
+评估采用五个通过环境资格检查的 Python `lite` 实例。每个实例先使用官方 gold patch 验证数据、构建与测试环境；只有 gold patch 通过的实例才进入结果统计。运行时冻结了 SeaCode、数据集、Harness、仓库基线、模型配置和资源预算，避免在评测过程中改变实验条件。
+
+### 实验协议
+
+| 项目 | 配置 |
+| --- | --- |
+| SeaCode revision | `246c778a6c492f222f75c3e324a414e2f7b06036` |
+| 数据集 | `SWE-bench-Live/SWE-bench-Live`，`lite` split，revision `a637bd46829f3132e12938c8a0ca93173a977b8e` |
+| Evaluator | SWE-bench-Live Python-only harness `ad79b850f15e33992e96f03f6e97f05ddf9aa0be` |
+| 执行环境 | Linux Docker，串行 `workers=1` |
+| SeaCode Provider | `deepseek-v4-flash`，OpenAI-compatible 协议 |
+| Agent 预算 | `SEA_MAX_STEPS=100`，单题 1800 秒，4 CPU，5 GiB 内存 |
+
+每个 Agent 仅接触 issue 与对应仓库的冻结源码；工作区重新初始化 Git，不保留原始历史。gold patch、测试 patch 和 evaluator 产物始终留在评测侧，不进入 Agent 上下文。SeaCode 与参考对照分别在独立工作区完成任务，随后仅导出生产代码补丁；测试文件和运行时产物不计入提交补丁。
+
+除 SeaCode 外，本次还以独立 Codex subagent 作为端到端参考对照。该对照用于帮助发现差异，不是同模型、同 Prompt 或同运行时的严格 A/B 比较。
+
+### 评测结果
+
+`F2P` 表示目标修复测试（Fail-to-Pass），`P2P` 表示既有回归测试（Pass-to-Pass）。
+
+| 实例 | Gold 准入 | SeaCode | F2P | P2P | Codex 参考对照 |
+| --- | --- | --- | --- | --- | --- |
+| `amoffat__sh-744` | 通过 | 通过 | `1/1` | `178/178` | 通过 |
+| `dynaconf__dynaconf-1241` | 通过 | 通过 | `1/1` | `27/27` | 通过 |
+| `jazzband__tablib-613` | 通过 | 通过 | `1/1` | `163/163` | 通过 |
+| `pallets__flask-5637` | 通过 | 未解决 | `0/1` | `488/488` | 通过 |
+| `python-babel__babel-1141` | 通过 | 通过 | `1/1` | `7101/7101` | 通过 |
+
+SeaCode 在五个有效实例中解决 `4/5`，通过 `4/5` 个目标修复测试，并通过全部 `7957/7957` 个既有回归测试。五次 SeaCode rollout 均正常完成，补丁可被官方 evaluator 应用，未出现进程崩溃、超时或卡死。
+
+未解决的 Flask 实例同样正常完成并通过 `488/488` 个既有回归测试，但没有满足一个目标功能条件，因此被官方 evaluator 判定为未解决。这说明运行稳定性、补丁可应用性和回归测试通过并不等价于完整的功能验收；外部目标测试仍是最终质量门槛。
+
+### 结果解读与后续计划
+
+本次结果证明 SeaCode 已能够在受控环境中稳定执行真实仓库任务、生成可评测的代码补丁，并解决多数独立验证的问题。五题样本用于工程诊断，不代表完整排行榜分数；Codex 对照也不用于推断单独的模型或运行时因果差异。
+
+后续将围绕可验证的改进假设继续推进：在任务完成前要求 Agent 生成并执行行为级验收探针，补充内容安全的运行观测输出；随后在相同的 Provider、预算和五题集合上复测，并使用预先冻结的留出实例检查改进是否具有泛化性。
+
+
+
 ## 许可证
 
 [MIT License](./LICENSE) · Copyright (c) 2026 seaFall98
