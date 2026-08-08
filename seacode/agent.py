@@ -110,6 +110,8 @@ class ToolResultEvent:
     output: str
     is_error: bool
     elapsed: float
+    # 仅在实际 ask 权限确认完成后携带用户选择。
+    permission_decision: str | None = None
 
 
 @dataclass
@@ -1113,6 +1115,7 @@ class Agent:
                         tool_use_id=br.tool_id,
                         content=content,
                         is_error=br.result.is_error,
+                        permission_decision=br.result.permission_decision,
                     )
                 )
                 yield ToolResultEvent(
@@ -1121,6 +1124,7 @@ class Agent:
                     output=br.result.content,
                     is_error=br.result.is_error,
                     elapsed=br.elapsed,
+                    permission_decision=br.result.permission_decision,
                 )
                 if br.tool_name == "ExitPlanMode" and not br.result.is_error:
                     exit_plan_succeeded = True
@@ -1169,6 +1173,7 @@ class Agent:
                         tool_use_id=tc.tool_id,
                         content=content,
                         is_error=result.is_error,
+                        permission_decision=result.permission_decision,
                     )
                 )
                 yield ToolResultEvent(
@@ -1177,6 +1182,7 @@ class Agent:
                     output=result.content,
                     is_error=result.is_error,
                     elapsed=elapsed,
+                    permission_decision=result.permission_decision,
                 )
                 if tc.tool_name == "ExitPlanMode" and not result.is_error:
                     exit_plan_succeeded = True
@@ -1320,6 +1326,7 @@ class Agent:
     ) -> AsyncIterator[PermissionRequest | tuple[ToolResult, float, bool]]:
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
+        permission_decision: str | None = None
 
         if tool is None:
             yield ToolResult(
@@ -1352,11 +1359,13 @@ class Agent:
                     future=future,
                 )
                 response = await future
+                permission_decision = response.value
 
                 if response == PermissionResponse.DENY:
                     yield ToolResult(
                         content="Permission denied: 用户拒绝了此操作",
                         is_error=True,
+                        permission_decision=permission_decision,
                     ), time.monotonic() - start, False
                     return
 
@@ -1385,6 +1394,8 @@ class Agent:
         except Exception as e:
             result = ToolResult(content=f"Tool execution error: {e}", is_error=True)
 
+        if permission_decision is not None:
+            result.permission_decision = permission_decision
         self._snapshot_file_read_for_recovery(tc, result)
         yield result, time.monotonic() - start, False
 

@@ -183,7 +183,7 @@ def test_load_instructions_returns_empty_when_no_files(
 
 
 # 验证 SessionRecord.to_jsonl / from_jsonl 的往返一致性。
-# timestamp、type、content、tool_use_id、is_error 五个字段都能无损还原。
+# timestamp、type、content、tool_use_id、is_error 与审批结论都能无损还原。
 def test_session_record_jsonl_roundtrip() -> None:
     record = SessionRecord(
         type=RecordType.TOOL_RESULT,
@@ -191,6 +191,7 @@ def test_session_record_jsonl_roundtrip() -> None:
         timestamp=datetime(2026, 7, 25, 12, 0, 0, tzinfo=UTC),
         tool_use_id="tool_123",
         is_error=True,
+        permission_decision="deny",
     )
     line = record.to_jsonl()
     restored = SessionRecord.from_jsonl(line)
@@ -199,7 +200,20 @@ def test_session_record_jsonl_roundtrip() -> None:
     assert restored.content == "some output"
     assert restored.tool_use_id == "tool_123"
     assert restored.is_error is True
+    assert restored.permission_decision == "deny"
     assert restored.timestamp == record.timestamp
+
+
+# 验证旧 JSONL 缺少审批结论时按缺失字段兼容，不伪造用户选择。
+# 直接解析未包含 permission_decision 的历史 tool_result，断言结果为 None。
+def test_session_record_legacy_tool_result_has_no_permission_decision() -> None:
+    restored = SessionRecord.from_jsonl(
+        '{"type":"tool_result","content":"old output",'
+        '"timestamp":"2026-07-25T12:00:00+00:00",'
+        '"tool_use_id":"old-tool","is_error":false}'
+    )
+    assert restored is not None
+    assert restored.permission_decision is None
 
 
 # 验证损坏的 JSONL 行返回 None 而非抛异常。
@@ -246,7 +260,9 @@ def test_session_record_from_message_tool_results() -> None:
         role="user",
         content="",
         tool_results=[
-            ToolResultBlock(tool_use_id="t1", content="result1"),
+            ToolResultBlock(
+                tool_use_id="t1", content="result1", permission_decision="allow"
+            ),
             ToolResultBlock(tool_use_id="t2", content="result2", is_error=True),
         ],
     )
@@ -255,6 +271,7 @@ def test_session_record_from_message_tool_results() -> None:
     assert all(r.type == RecordType.TOOL_RESULT for r in records)
     assert records[0].tool_use_id == "t1"
     assert records[0].content == "result1"
+    assert records[0].permission_decision == "allow"
     assert records[1].tool_use_id == "t2"
     assert records[1].is_error is True
 
@@ -276,7 +293,13 @@ def test_records_to_messages_roundtrip_preserves_tool_pairing() -> None:
         Message(
             role="user",
             content="",
-            tool_results=[ToolResultBlock(tool_use_id="t1", content="file content")],
+            tool_results=[
+                ToolResultBlock(
+                    tool_use_id="t1",
+                    content="file content",
+                    permission_decision="allow_always",
+                )
+            ],
         ),
         Message(role="assistant", content="done"),
     ]
@@ -295,6 +318,7 @@ def test_records_to_messages_roundtrip_preserves_tool_pairing() -> None:
     assert len(restored[2].tool_results) == 1
     assert restored[2].tool_results[0].tool_use_id == "t1"
     assert restored[2].tool_results[0].content == "file content"
+    assert restored[2].tool_results[0].permission_decision == "allow_always"
     assert restored[3].role == "assistant"
     assert restored[3].content == "done"
 
@@ -364,6 +388,32 @@ def test_compact_boundary_roundtrip_preserves_summary_and_keep() -> None:
     assert len(keep_messages) == 2
     assert keep_messages[0].content == "recent question"
     assert keep_messages[1].content == "recent answer"
+
+
+# 验证 compact boundary 内联工具结果保留审批结论。
+# 构造工具调用与 allow 结果后往返，断言恢复的结果字段未丢失。
+def test_compact_boundary_preserves_tool_permission_decision() -> None:
+    keep = [
+        Message(
+            role="assistant",
+            tool_uses=[ToolUseBlock("tool-1", "WriteFile", {"file_path": "a.txt"})],
+        ),
+        Message(
+            role="user",
+            tool_results=[
+                ToolResultBlock(
+                    tool_use_id="tool-1",
+                    content="written",
+                    permission_decision="allow",
+                )
+            ],
+        ),
+    ]
+    _, keep_messages = parse_compact_boundary(
+        make_compact_boundary(summary="summary", keep=keep)
+    )
+
+    assert keep_messages[1].tool_results[0].permission_decision == "allow"
 
 
 # 验证格式异常的 boundary payload 降级返回 ("", [])，不抛异常。

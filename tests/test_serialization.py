@@ -27,7 +27,10 @@ def _round_trip_messages() -> list[Message]:
             role="user",
             tool_results=[
                 ToolResultBlock(
-                    tool_use_id="call-1", content="file body", is_error=False
+                    tool_use_id="call-1",
+                    content="file body",
+                    is_error=False,
+                    permission_decision="allow",
                 )
             ],
         ),
